@@ -1,4 +1,7 @@
-# ConfigBox
+<div align="center">
+  <img src="logo.png" alt="nanobot" width="500">
+  <h1>ConfigBox: 服务器上的Code Agent配置可视化管理工具</h1>
+</div>
 
 ConfigBox 是一个 Docker 化 Web 管理工具，用于可视化管理 Linux 用户空间里的两个 AI 工具配置文件：
 
@@ -86,13 +89,7 @@ EOF
 生成登录密码哈希和 Session Secret：
 
 ```bash
-docker run --rm -it <ConfigBox镜像名> python -m app.password_hash
-```
-
-例如，如果维护者发布的镜像名是 `ghcr.io/example/configbox:latest`，则运行：
-
-```bash
-docker run --rm -it ghcr.io/example/configbox:latest python -m app.password_hash
+docker run --rm -it cloudcollector/configbox:latest python -m app.password_hash
 ```
 
 命令会提示输入两次登录密码，然后输出：
@@ -113,7 +110,7 @@ APP_PASSWORD=
 ```yaml
 services:
   configbox:
-    image: <ConfigBox镜像名>
+    image: cloudcollector/configbox:latest
     container_name: configbox
     restart: unless-stopped
     ports:
@@ -136,8 +133,6 @@ services:
       - ${HOME}/.codex:/config/codex
       - ${HOME}/.ai-config-manager:/data
 ```
-
-请把其中的 `<ConfigBox镜像名>` 替换为实际镜像名。
 
 启动：
 
