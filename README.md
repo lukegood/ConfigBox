@@ -112,9 +112,9 @@ APP_PASSWORD=
 
 ```yaml
 services:
-  ai-config-manager:
+  configbox:
     image: <ConfigBox镜像名>
-    container_name: ai-config-manager
+    container_name: configbox
     restart: unless-stopped
     ports:
       - "8787:8787"
@@ -192,7 +192,7 @@ docker-compose build
 生成登录密码哈希和 Session Secret：
 
 ```bash
-docker run --rm -it ai-config-manager_ai-config-manager:latest python -m app.password_hash
+docker run --rm -it configbox:latest python -m app.password_hash
 ```
 
 把输出的 `APP_PASSWORD_HASH=...` 和 `SESSION_SECRET=...` 填入 `.env`，并保持：
@@ -407,13 +407,13 @@ npm run build
 查看容器日志：
 
 ```bash
-docker logs --tail 100 ai-config-manager
+docker logs --tail 100 configbox
 ```
 
 查看容器状态：
 
 ```bash
-docker ps --filter name=ai-config-manager
+docker ps --filter name=configbox
 ```
 
 如果容器反复重启并提示 `/data` 权限错误，检查 `.env` 中的 UID/GID 是否与当前用户一致：
