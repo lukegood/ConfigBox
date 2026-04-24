@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="logo.png" alt="nanobot" width="500">
+  <img src="logo.png" alt="configbox" width="500">
   <h1>ConfigBox: 服务器上的Code Agent配置可视化管理工具</h1>
 </div>
 
