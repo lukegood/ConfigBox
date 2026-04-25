@@ -1,7 +1,4 @@
-<div align="center">
-  <img src="logo_nwe.png" alt="configbox" width="500">
-  <h1>ConfigBox: 服务器上的Code Agent配置可视化管理工具</h1>
-</div>
+
 
 ConfigBox 是一个 Docker 化 Web 管理工具，用于可视化管理 Linux 用户空间里的两个 AI 工具配置文件：
 
