@@ -82,6 +82,7 @@ services:
     image: cloudcollector/configbox:latest
     container_name: configbox
     restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
     ports:
       - "8787:8787"
     environment:
