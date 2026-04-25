@@ -27,4 +27,4 @@ services:
     volumes:
       - ${HOME}/.claude:/config/claude
       - ${HOME}/.codex:/config/codex
-      - ${HOME}/.ai-config-manager:/data
+      - ${HOME}/.configbox:/data

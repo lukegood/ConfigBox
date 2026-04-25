@@ -324,7 +324,7 @@ function App() {
       <main className={`login-shell theme-${theme}`}>
         <form className="login-panel" onSubmit={handleLogin}>
           <div>
-            <p className="eyebrow">AI Config Manager</p>
+            <p className="eyebrow">ConfigBox</p>
             <h1>ConfigBox</h1>
             <p className="login-copy">Claude settings 与 Codex auth 的安全配置台</p>
           </div>
