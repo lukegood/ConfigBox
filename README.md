@@ -12,6 +12,9 @@ ConfigBox是一个Docker化Web管理工具，用于可视化管理Linux服务器
 - Claude Code：`${HOME}/.claude/settings.json`
 - Codex：`${HOME}/.codex/auth.json` + `${HOME}/.codex/config.toml`
 
+## 最近更新
+2026.05.06  优化了codex的配置方式
+
 ## 项目截图
   <img src="yanshi.png" alt="configbox" width="800">
 
