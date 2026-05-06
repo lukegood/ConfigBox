@@ -12,14 +12,17 @@ def load_modules(tmp_path: Path):
     data_dir = tmp_path / "data"
     claude_path = tmp_path / "config" / "claude" / "settings.json"
     codex_path = tmp_path / "config" / "codex" / "auth.json"
+    codex_toml_path = tmp_path / "config" / "codex" / "config.toml"
     claude_path.parent.mkdir(parents=True)
     codex_path.parent.mkdir(parents=True)
     claude_path.write_text('{"model": "sonnet"}\n', encoding="utf-8")
     codex_path.write_text('{"OPENAI_API_KEY": "test"}\n', encoding="utf-8")
+    codex_toml_path.write_text('model = "gpt-5"\n', encoding="utf-8")
 
     os.environ["DATA_DIR"] = str(data_dir)
     os.environ["CLAUDE_CONFIG_PATH"] = str(claude_path)
     os.environ["CODEX_CONFIG_PATH"] = str(codex_path)
+    os.environ["CODEX_CONFIG_TOML_PATH"] = str(codex_toml_path)
     os.environ["BACKUP_RETENTION"] = "50"
 
     for name in list(sys.modules):
@@ -30,7 +33,7 @@ def load_modules(tmp_path: Path):
     storage = importlib.import_module("app.storage")
     errors = importlib.import_module("app.errors")
     storage.ensure_all()
-    return registry, storage, errors, claude_path, codex_path, data_dir
+    return registry, storage, errors, claude_path, codex_path, codex_toml_path, data_dir
 
 
 def test_invalid_tool_rejected(tmp_path: Path):
@@ -65,7 +68,7 @@ def test_invalid_codex_json_rejected(tmp_path: Path):
 
 
 def test_save_active_creates_backup(tmp_path: Path):
-    registry, storage, _, claude_path, _, data_dir = load_modules(tmp_path)
+    registry, storage, _, claude_path, *_, data_dir = load_modules(tmp_path)
     tool = registry.get_tool("claude")
     storage.save_active(tool, '{"model": "opus"}\n', storage.file_mtime(tool.active_path))
 
@@ -94,6 +97,37 @@ def test_external_mtime_conflict(tmp_path: Path):
     with pytest.raises(errors.APIError) as exc:
         storage.save_active(tool, '{"model": "opus"}\n', old_mtime)
     assert exc.value.code == "CONFLICT_MODIFIED_EXTERNALLY"
+
+
+def test_codex_profile_pairs_auth_json_and_config_toml(tmp_path: Path):
+    registry, storage, _, _, codex_path, codex_toml_path, data_dir = load_modules(tmp_path)
+    tool = registry.get_tool("codex")
+
+    storage.create_profile(tool, "deepseek", "active")
+    storage.save_profile(
+        tool,
+        "deepseek",
+        None,
+        [
+            {"id": "auth", "content": '{"OPENAI_API_KEY": "deepseek"}\n'},
+            {"id": "config", "content": 'model = "deepseek-chat"\n'},
+        ],
+    )
+    storage.activate_profile(tool, "deepseek")
+
+    assert codex_path.read_text(encoding="utf-8") == '{"OPENAI_API_KEY": "deepseek"}\n'
+    assert codex_toml_path.read_text(encoding="utf-8") == 'model = "deepseek-chat"\n'
+    assert (data_dir / "profiles" / "codex" / "deepseek" / "auth.json").exists()
+    assert (data_dir / "profiles" / "codex" / "deepseek" / "config.toml").exists()
+    assert any(path.is_dir() for path in (data_dir / "backups" / "codex").iterdir())
+
+
+def test_invalid_codex_toml_rejected(tmp_path: Path):
+    registry, storage, errors, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("codex")
+    with pytest.raises(errors.APIError) as exc:
+        storage.save_profile(tool, "default", None, [{"id": "config", "content": "bad = ["}])
+    assert exc.value.code == "INVALID_TOML"
 
 
 def test_password_hash_verification(tmp_path: Path):

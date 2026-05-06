@@ -32,7 +32,7 @@ import {
   saveProfile,
   setAuth
 } from "./api";
-import type { BackupItem, ProfileItem, Tool, ViewMode } from "./types";
+import type { ActiveConfig, BackupDoc, BackupItem, ConfigFile, ProfileDoc, ProfileItem, Tool, ViewMode } from "./types";
 
 const profileNamePattern = /^[a-zA-Z0-9_-]{1,64}$/;
 
@@ -49,8 +49,9 @@ function App() {
   const [mode, setMode] = useState<ViewMode>("active");
   const [selectedProfile, setSelectedProfile] = useState("");
   const [selectedBackup, setSelectedBackup] = useState("");
-  const [content, setContent] = useState("");
-  const [savedContent, setSavedContent] = useState("");
+  const [files, setFiles] = useState<ConfigFile[]>([]);
+  const [savedFiles, setSavedFiles] = useState<ConfigFile[]>([]);
+  const [activeFileId, setActiveFileId] = useState("");
   const [mtime, setMtime] = useState<number | null>(null);
   const [title, setTitle] = useState("当前配置");
   const [status, setStatus] = useState("准备就绪");
@@ -61,9 +62,27 @@ function App() {
   });
 
   const tool = useMemo(() => tools.find((item) => item.id === toolId), [tools, toolId]);
-  const dirty = content !== savedContent;
+  const activeFile = useMemo(() => files.find((file) => file.id === activeFileId) ?? files[0], [files, activeFileId]);
+  const activeContent = activeFile?.content ?? "";
+  const dirty = filesChanged(files, savedFiles);
   const readonly = mode === "backup";
-  const sensitive = /api[_-]?key|token|secret|password/i.test(content);
+  const sensitive = files.some((file) => /api[_-]?key|token|secret|password/i.test(file.content));
+  const contentLength = files.reduce((sum, file) => sum + file.content.length, 0);
+
+  function applyDocument(
+    doc: ActiveConfig | ProfileDoc | BackupDoc,
+    nextTitle: string,
+    nextStatus: string,
+    preferredFileId = activeFileId
+  ) {
+    const nextFiles = normalizeDocFiles(doc);
+    setFiles(nextFiles);
+    setSavedFiles(nextFiles);
+    setActiveFileId(nextFiles.some((file) => file.id === preferredFileId) ? preferredFileId : nextFiles[0]?.id ?? "");
+    setMtime(doc.mtime);
+    setTitle(nextTitle);
+    setStatus(nextStatus);
+  }
 
   async function bootstrap() {
     setLoading(true);
@@ -101,11 +120,7 @@ function App() {
       setMode("active");
       setSelectedProfile("");
       setSelectedBackup("");
-      setContent(active.content);
-      setSavedContent(active.content);
-      setMtime(active.mtime);
-      setTitle("当前配置");
-      setStatus("已加载当前配置");
+      applyDocument(active, "当前配置", "已加载当前配置", "");
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
     } finally {
@@ -118,11 +133,7 @@ function App() {
     setMode("active");
     setSelectedProfile("");
     setSelectedBackup("");
-    setContent(active.content);
-    setSavedContent(active.content);
-    setMtime(active.mtime);
-    setTitle("当前配置");
-    setStatus("已重新加载");
+    applyDocument(active, "当前配置", "已重新加载");
   }
 
   async function loadProfile(name: string) {
@@ -133,11 +144,7 @@ function App() {
       setMode("profile");
       setSelectedProfile(name);
       setSelectedBackup("");
-      setContent(doc.content);
-      setSavedContent(doc.content);
-      setMtime(doc.mtime);
-      setTitle(`Profile: ${name}`);
-      setStatus("已加载 Profile");
+      applyDocument(doc, `Profile: ${name}`, "已加载 Profile");
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载 Profile 失败");
     } finally {
@@ -153,11 +160,7 @@ function App() {
       setMode("backup");
       setSelectedBackup(name);
       setSelectedProfile("");
-      setContent(doc.content);
-      setSavedContent(doc.content);
-      setMtime(doc.mtime);
-      setTitle(`Backup: ${name}`);
-      setStatus("已加载备份");
+      applyDocument(doc, `Backup: ${name}`, "已加载备份");
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载备份失败");
     } finally {
@@ -188,18 +191,13 @@ function App() {
     setLoading(true);
     setError("");
     try {
+      const preferredFileId = activeFileId;
       if (mode === "active") {
-        const saved = await saveActiveConfig(toolId, content, mtime);
-        setContent(saved.content);
-        setSavedContent(saved.content);
-        setMtime(saved.mtime);
-        setStatus("已保存，旧版本已备份");
+        const saved = await saveActiveConfig(toolId, files, mtime);
+        applyDocument(saved, "当前配置", "已保存，旧版本已备份", preferredFileId);
       } else if (mode === "profile" && selectedProfile) {
-        const saved = await saveProfile(toolId, selectedProfile, content);
-        setContent(saved.content);
-        setSavedContent(saved.content);
-        setMtime(saved.mtime);
-        setStatus("Profile 已保存");
+        const saved = await saveProfile(toolId, selectedProfile, files);
+        applyDocument(saved, `Profile: ${selectedProfile}`, "Profile 已保存", preferredFileId);
       }
       await loadLists();
     } catch (err) {
@@ -254,11 +252,7 @@ function App() {
       await loadLists();
       setMode("active");
       setSelectedProfile("");
-      setContent(active.content);
-      setSavedContent(active.content);
-      setMtime(active.mtime);
-      setTitle("当前配置");
-      setStatus(`已启用 Profile: ${selectedProfile}`);
+      applyDocument(active, "当前配置", `已启用 Profile: ${selectedProfile}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "启用失败");
     } finally {
@@ -275,11 +269,7 @@ function App() {
       await loadLists();
       setMode("active");
       setSelectedBackup("");
-      setContent(active.content);
-      setSavedContent(active.content);
-      setMtime(active.mtime);
-      setTitle("当前配置");
-      setStatus("备份已恢复，恢复前版本也已备份");
+      applyDocument(active, "当前配置", "备份已恢复，恢复前版本也已备份");
     } catch (err) {
       setError(err instanceof Error ? err.message : "恢复失败");
     } finally {
@@ -288,16 +278,20 @@ function App() {
   }
 
   function handleFormat() {
-    if (tool?.format !== "json") {
+    if (!activeFile || activeFile.format !== "json") {
       setStatus("TOML 保留原格式");
       return;
     }
     try {
-      setContent(JSON.stringify(JSON.parse(content || "{}"), null, 2) + "\n");
+      updateActiveContent(JSON.stringify(JSON.parse(activeFile.content || "{}"), null, 2) + "\n");
       setStatus("JSON 已格式化");
     } catch (err) {
       setError(err instanceof Error ? err.message : "JSON 格式错误");
     }
+  }
+
+  function updateActiveContent(content: string) {
+    setFiles((current) => current.map((file) => (file.id === activeFile?.id ? { ...file, content } : file)));
   }
 
   async function logout() {
@@ -326,7 +320,7 @@ function App() {
           <div>
             <p className="eyebrow">ConfigBox</p>
             <h1>ConfigBox</h1>
-            <p className="login-copy">Claude settings 与 Codex auth 的安全配置台</p>
+            <p className="login-copy">Claude settings 与 Codex auth/config 的安全配置台</p>
           </div>
           <label>
             用户名
@@ -434,8 +428,10 @@ function App() {
       <section className="workspace">
         <header className="topbar">
           <div>
-            <h2>{tool?.name || toolId} / {title}</h2>
-            <p>{tool?.pathLabel} · {tool?.format.toUpperCase()}</p>
+            <h2>
+              {tool?.name || toolId} / {title}
+            </h2>
+            <p>{tool?.pathLabel} · {files.map((file) => file.format.toUpperCase()).join(" + ")}</p>
           </div>
           <div className="actions">
             <button onClick={handleSave} disabled={loading || readonly || !dirty} title="保存">
@@ -477,6 +473,14 @@ function App() {
           </div>
         </header>
 
+        <div className="statusline">
+          <span className={dirty ? "dirty-dot" : "clean-dot"} />
+          <span>{dirty ? "未保存" : "已同步"}</span>
+          <span>{contentLength} 字符</span>
+          <span>{status}</span>
+          <span>{mtime ? formatTime(mtime) : "无 mtime"}</span>
+        </div>
+
         {defaultPassword ? (
           <div className="banner warning">
             <AlertTriangle size={16} />
@@ -491,36 +495,65 @@ function App() {
         ) : null}
         {error ? <div className="banner error">{error}</div> : null}
 
-        <div className="editor-wrap">
-          <Editor
-            key={`${toolId}-${mode}-${selectedProfile}-${selectedBackup}`}
-            height="100%"
-            value={content}
-            onChange={(value) => setContent(value ?? "")}
-            loading={<div className="editor-loading">加载编辑器...</div>}
-            language={tool?.format === "json" ? "json" : "plaintext"}
-            theme={theme === "dark" ? "vs-dark" : "vs"}
-            options={{
-              automaticLayout: true,
-              minimap: { enabled: false },
-              readOnly: readonly,
-              scrollBeyondLastLine: false,
-              fontSize: 14,
-              wordWrap: "on"
-            }}
-          />
+        <div className="editor-panel">
+          <div className="file-tabs" role="tablist">
+            {files.map((file) => (
+              <button
+                key={file.id}
+                className={file.id === activeFile?.id ? "selected" : ""}
+                onClick={() => setActiveFileId(file.id)}
+                role="tab"
+                title={file.pathLabel}
+              >
+                {file.label}
+              </button>
+            ))}
+          </div>
+          <div className="editor-wrap">
+            <Editor
+              key={`${toolId}-${mode}-${selectedProfile}-${selectedBackup}-${activeFile?.id ?? "file"}`}
+              height="100%"
+              value={activeContent}
+              onChange={(value) => updateActiveContent(value ?? "")}
+              loading={<div className="editor-loading">加载编辑器...</div>}
+              language={activeFile?.format === "json" ? "json" : "plaintext"}
+              theme={theme === "dark" ? "vs-dark" : "vs"}
+              options={{
+                automaticLayout: true,
+                minimap: { enabled: false },
+                readOnly: readonly,
+                scrollBeyondLastLine: false,
+                fontSize: 14,
+                wordWrap: "on"
+              }}
+            />
+          </div>
         </div>
-
-        <footer className="statusbar">
-          <span className={dirty ? "dirty-dot" : "clean-dot"} />
-          <span>{dirty ? "未保存" : "已同步"}</span>
-          <span>{content.length} 字符</span>
-          <span>{status}</span>
-          <span>{mtime ? formatTime(mtime) : "无 mtime"}</span>
-        </footer>
       </section>
     </main>
   );
+}
+
+function normalizeDocFiles(doc: ActiveConfig | ProfileDoc | BackupDoc): ConfigFile[] {
+  if (doc.files?.length) {
+    return doc.files;
+  }
+  return [
+    {
+      id: "primary",
+      label: doc.format === "json" ? "config.json" : "config.toml",
+      filename: doc.format === "json" ? "config.json" : "config.toml",
+      content: doc.content,
+      format: doc.format,
+      mtime: doc.mtime,
+      pathLabel: "pathLabel" in doc ? doc.pathLabel : ""
+    }
+  ];
+}
+
+function filesChanged(current: ConfigFile[], saved: ConfigFile[]) {
+  if (current.length !== saved.length) return true;
+  return current.some((file) => saved.find((item) => item.id === file.id)?.content !== file.content);
 }
 
 function formatTime(mtime: number | null) {

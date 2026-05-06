@@ -10,7 +10,7 @@ ConfigBox是一个Docker化Web管理工具，用于可视化管理Linux服务器
 默认配置文件地址为:
 
 - Claude Code：`${HOME}/.claude/settings.json`
-- Codex：`${HOME}/.codex/auth.json`
+- Codex：`${HOME}/.codex/auth.json` + `${HOME}/.codex/config.toml`
 
 ## 项目截图
   <img src="yanshi.png" alt="configbox" width="800">
@@ -37,6 +37,7 @@ cd ~/configbox
 mkdir -p ~/.claude ~/.codex ~/.configbox
 [ -f ~/.claude/settings.json ] || printf '{}\n' > ~/.claude/settings.json
 [ -f ~/.codex/auth.json ] || printf '{}\n' > ~/.codex/auth.json
+[ -f ~/.codex/config.toml ] || touch ~/.codex/config.toml
 ```
 
 创建 `.env` 文件：
@@ -96,6 +97,7 @@ services:
       APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-false}
       CLAUDE_CONFIG_PATH: /config/claude/settings.json
       CODEX_CONFIG_PATH: /config/codex/auth.json
+      CODEX_CONFIG_TOML_PATH: /config/codex/config.toml
       DATA_DIR: /data
       BACKUP_RETENTION: ${BACKUP_RETENTION:-50}
     volumes:
@@ -132,6 +134,7 @@ cd configbox
 mkdir -p ~/.claude ~/.codex ~/.configbox
 [ -f ~/.claude/settings.json ] || printf '{}\n' > ~/.claude/settings.json
 [ -f ~/.codex/auth.json ] || printf '{}\n' > ~/.codex/auth.json
+[ -f ~/.codex/config.toml ] || touch ~/.codex/config.toml
 ```
 
 创建 `.env`：
@@ -260,13 +263,13 @@ APP_COOKIE_SECURE=false
 
 ```text
 Claude -> ~/.claude/settings.json
-Codex  -> ~/.codex/auth.json
+Codex  -> ~/.codex/auth.json + ~/.codex/config.toml
 ```
 
 点击 `保存` 时，系统会：
 
 ```text
-校验 JSON -> 备份旧版本 -> 原子写入新版本
+校验 JSON/TOML -> 备份旧版本 -> 原子写入新版本
 ```
 
 如果文件在页面打开后被外部终端修改，保存时会提示冲突，避免覆盖外部修改。
@@ -293,6 +296,8 @@ Profile默认存放在：
 ```
 
 点击某个`Profile`后可以编辑它。点击 `启用` 时，系统会把该 `Profile`覆盖到真实配置文件中，完成配置切换。
+
+Codex 的一个 Profile 会同时保存 `auth.json` 和 `config.toml`，启用时也会成组覆盖这两个真实配置文件。
 
 ### 备份与Backups
 
@@ -322,6 +327,7 @@ Backups是系统自动保存的历史版本。
 ```text
 /config/claude/settings.json
 /config/codex/auth.json
+/config/codex/config.toml
 /data
 ```
 

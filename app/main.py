@@ -107,7 +107,8 @@ def get_active(tool: str, user: AuthUser = Depends(require_user)) -> dict:
 
 @app.put("/api/configs/{tool}/active")
 def put_active(tool: str, payload: SaveActiveRequest, user: AuthUser = Depends(require_user)) -> dict:
-    return save_active(get_tool(tool), payload.content, payload.last_known_mtime)
+    files = [file.model_dump(by_alias=True) for file in payload.files] if payload.files else None
+    return save_active(get_tool(tool), payload.content, payload.last_known_mtime, files)
 
 
 @app.get("/api/profiles/{tool}")
@@ -118,7 +119,10 @@ def get_profiles(tool: str, user: AuthUser = Depends(require_user)) -> list[dict
 @app.post("/api/profiles/{tool}")
 def post_profile(tool: str, payload: ProfileCreateRequest, user: AuthUser = Depends(require_user)) -> dict:
     source = "content" if payload.content is not None and payload.source == "content" else payload.source
-    return create_profile(get_tool(tool), payload.name, source, payload.content)
+    files = [file.model_dump(by_alias=True) for file in payload.files] if payload.files else None
+    if files and payload.source == "content":
+        source = "content"
+    return create_profile(get_tool(tool), payload.name, source, payload.content, files)
 
 
 @app.get("/api/profiles/{tool}/{name}")
@@ -128,7 +132,8 @@ def get_profile(tool: str, name: str, user: AuthUser = Depends(require_user)) ->
 
 @app.put("/api/profiles/{tool}/{name}")
 def put_profile(tool: str, name: str, payload: ProfileSaveRequest, user: AuthUser = Depends(require_user)) -> dict:
-    return save_profile(get_tool(tool), name, payload.content)
+    files = [file.model_dump(by_alias=True) for file in payload.files] if payload.files else None
+    return save_profile(get_tool(tool), name, payload.content, files)
 
 
 @app.delete("/api/profiles/{tool}/{name}", response_model=OkResponse)

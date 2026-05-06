@@ -269,7 +269,7 @@ input {
   min-width: 0;
   min-height: 100vh;
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
   background: var(--page);
 }
 
@@ -319,9 +319,51 @@ input {
   color: var(--error-text);
 }
 
-.editor-wrap {
+.statusline {
+  min-height: 34px;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--muted);
+  padding: 0 18px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.statusline span:not(.clean-dot, .dirty-dot) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.editor-panel {
   min-height: 420px;
   margin: 14px 18px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.file-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow-x: auto;
+  padding-bottom: 8px;
+}
+
+.file-tabs button {
+  min-height: 32px;
+  flex: 0 0 auto;
+}
+
+.file-tabs button.selected {
+  background: var(--selected);
+  border-color: var(--selected-border);
+}
+
+.editor-wrap {
   border: 1px solid var(--border);
   border-radius: 8px;
   overflow: hidden;
@@ -333,18 +375,6 @@ input {
   place-items: center;
   color: var(--muted);
   background: var(--editor-loading);
-}
-
-.statusbar {
-  min-height: 38px;
-  border-top: 1px solid var(--border-soft);
-  color: var(--muted);
-  padding: 0 18px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  font-size: 13px;
-  overflow: hidden;
 }
 
 .clean-dot,

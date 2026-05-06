@@ -1,4 +1,4 @@
-import type { ActiveConfig, BackupDoc, BackupItem, ProfileDoc, ProfileItem, Tool } from "./types";
+import type { ActiveConfig, BackupDoc, BackupItem, ConfigFile, ProfileDoc, ProfileItem, Tool } from "./types";
 
 const AUTH_KEY = "configbox.loggedIn";
 
@@ -56,10 +56,18 @@ export async function getActiveConfig(tool: string) {
   return request<ActiveConfig>(`/api/configs/${tool}/active`);
 }
 
-export async function saveActiveConfig(tool: string, content: string, mtime?: number | null) {
+function filePayload(files: ConfigFile[]) {
+  return files.map((file) => ({
+    id: file.id,
+    content: file.content,
+    lastKnownMtime: file.mtime ?? null
+  }));
+}
+
+export async function saveActiveConfig(tool: string, files: ConfigFile[], mtime?: number | null) {
   return request<ActiveConfig>(`/api/configs/${tool}/active`, {
     method: "PUT",
-    body: JSON.stringify({ content, lastKnownMtime: mtime ?? null })
+    body: JSON.stringify({ files: filePayload(files), lastKnownMtime: mtime ?? null })
   });
 }
 
@@ -78,10 +86,10 @@ export async function getProfile(tool: string, name: string) {
   return request<ProfileDoc>(`/api/profiles/${tool}/${name}`);
 }
 
-export async function saveProfile(tool: string, name: string, content: string) {
+export async function saveProfile(tool: string, name: string, files: ConfigFile[]) {
   return request<ProfileDoc>(`/api/profiles/${tool}/${name}`, {
     method: "PUT",
-    body: JSON.stringify({ content })
+    body: JSON.stringify({ files: filePayload(files) })
   });
 }
 

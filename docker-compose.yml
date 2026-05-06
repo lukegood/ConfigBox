@@ -22,6 +22,7 @@ services:
       APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-false}
       CLAUDE_CONFIG_PATH: /config/claude/settings.json
       CODEX_CONFIG_PATH: /config/codex/auth.json
+      CODEX_CONFIG_TOML_PATH: /config/codex/config.toml
       DATA_DIR: /data
       BACKUP_RETENTION: ${BACKUP_RETENTION:-50}
     volumes:
