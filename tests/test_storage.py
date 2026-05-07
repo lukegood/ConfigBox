@@ -139,3 +139,61 @@ def test_password_hash_verification(tmp_path: Path):
 
     assert auth.verify_password("secret")
     assert not auth.verify_password("wrong")
+
+
+def test_password_hash_verification_accepts_compose_escaped_dollars(tmp_path: Path):
+    load_modules(tmp_path)
+    auth = importlib.import_module("app.auth")
+    password_hash = auth.generate_password_hash("secret")
+    os.environ["APP_PASSWORD"] = ""
+    os.environ["APP_PASSWORD_HASH"] = auth.compose_env_escape(password_hash)
+
+    assert "$$" in os.environ["APP_PASSWORD_HASH"]
+    assert auth.verify_password("secret")
+    assert not auth.verify_password("wrong")
+
+
+def test_password_hash_tool_updates_env_text(tmp_path: Path):
+    load_modules(tmp_path)
+    password_hash = importlib.import_module("app.password_hash")
+
+    updated = password_hash.update_env_text(
+        "# keep me\n"
+        "UID=1000\n"
+        "APP_PASSWORD=old\n"
+        "APP_PASSWORD_HASH=old-hash\n"
+        "SESSION_SECRET=old-secret\n"
+        "TZ=Asia/Shanghai\n",
+        {
+            "APP_PASSWORD": "",
+            "APP_PASSWORD_HASH": "pbkdf2_sha256$$260000$$salt$$digest",
+            "SESSION_SECRET": "new-secret",
+        },
+    )
+
+    assert "# keep me\n" in updated
+    assert "UID=1000\n" in updated
+    assert "APP_PASSWORD=\n" in updated
+    assert "APP_PASSWORD_HASH=pbkdf2_sha256$$260000$$salt$$digest\n" in updated
+    assert "SESSION_SECRET=new-secret\n" in updated
+    assert "TZ=Asia/Shanghai\n" in updated
+    assert "old-hash" not in updated
+
+
+def test_password_hash_tool_prints_manual_values_on_write_failure(tmp_path: Path, capsys, monkeypatch):
+    load_modules(tmp_path)
+    password_hash = importlib.import_module("app.password_hash")
+
+    monkeypatch.setattr("sys.argv", ["password_hash", "--env-file", str(tmp_path)])
+    monkeypatch.setattr("getpass.getpass", lambda _prompt: "secret")
+
+    with pytest.raises(SystemExit) as exc:
+        password_hash.main()
+
+    captured = capsys.readouterr()
+    assert exc.value.code == 1
+    assert "Failed to update" in captured.err
+    assert "Please manually write these lines to your .env file:" in captured.err
+    assert "APP_PASSWORD=\n" in captured.out
+    assert "APP_PASSWORD_HASH=pbkdf2_sha256$$" in captured.out
+    assert "SESSION_SECRET=" in captured.out

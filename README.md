@@ -66,20 +66,16 @@ EOF
 生成登录密码哈希和 Session Secret：
 
 ```bash
-docker run --rm -it cloudcollector/configbox:latest python -m app.password_hash
+docker run --rm -it --user "$(id -u):$(id -g)" -v "$PWD:/work" cloudcollector/configbox:latest \
+  python -m app.password_hash --env-file /work/.env
 ```
 
-命令会提示输入两次登录密码，然后输出：
-
-```env
-APP_PASSWORD_HASH=...
-SESSION_SECRET=...
-```
-
-把输出的两行填入 `.env`，并保持：
+命令会提示输入两次登录密码，然后自动更新 `.env`：
 
 ```env
 APP_PASSWORD=
+APP_PASSWORD_HASH=...
+SESSION_SECRET=...
 ```
 
 创建 `docker-compose.yml`：
@@ -90,6 +86,8 @@ services:
     image: cloudcollector/configbox:latest
     container_name: configbox
     restart: unless-stopped
+    env_file:
+      - .env
     user: "${UID:-1000}:${GID:-1000}"
     ports:
       - "8787:8787"
@@ -99,9 +97,6 @@ services:
       APP_HOST: 0.0.0.0
       APP_PORT: 8787
       APP_USERNAME: ${APP_USERNAME:-admin}
-      APP_PASSWORD: ${APP_PASSWORD:-}
-      APP_PASSWORD_HASH: ${APP_PASSWORD_HASH:-}
-      SESSION_SECRET: ${SESSION_SECRET:-}
       APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-false}
       CLAUDE_CONFIG_PATH: /config/claude/settings.json
       CODEX_CONFIG_PATH: /config/codex/auth.json
@@ -172,13 +167,16 @@ docker-compose build
 生成登录密码哈希和 Session Secret：
 
 ```bash
-docker run --rm -it configbox:latest python -m app.password_hash
+docker run --rm -it --user "$(id -u):$(id -g)" -v "$PWD:/work" configbox:latest \
+  python -m app.password_hash --env-file /work/.env
 ```
 
-把输出的 `APP_PASSWORD_HASH=...` 和 `SESSION_SECRET=...` 填入 `.env`，并保持：
+命令会自动更新 `.env`：
 
 ```env
 APP_PASSWORD=
+APP_PASSWORD_HASH=...
+SESSION_SECRET=...
 ```
 
 启动：
@@ -226,7 +224,7 @@ GATEWAY_LOG_MAX_MB=50
 ```env
 APP_USERNAME=admin
 APP_PASSWORD=
-APP_PASSWORD_HASH=pbkdf2_sha256$...
+APP_PASSWORD_HASH=pbkdf2_sha256$$...
 SESSION_SECRET=一串长随机字符串
 ```
 

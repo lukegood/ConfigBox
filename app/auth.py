@@ -34,7 +34,7 @@ def configured_password() -> str:
 
 
 def configured_password_hash() -> str:
-    return os.getenv("APP_PASSWORD_HASH", "")
+    return normalize_password_hash(os.getenv("APP_PASSWORD_HASH", ""))
 
 
 def session_secret() -> str:
@@ -57,6 +57,17 @@ def generate_password_hash(password: str, iterations: int = 260_000) -> str:
         base64.urlsafe_b64encode(salt).decode("ascii").rstrip("="),
         base64.urlsafe_b64encode(digest).decode("ascii").rstrip("="),
     )
+
+
+def compose_env_escape(value: str) -> str:
+    return value.replace("$", "$$")
+
+
+def normalize_password_hash(value: str) -> str:
+    normalized = value
+    while "$$" in normalized:
+        normalized = normalized.replace("$$", "$")
+    return normalized
 
 
 def verify_password(password: str) -> bool:

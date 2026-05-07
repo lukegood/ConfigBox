@@ -345,11 +345,6 @@ fn log_upstream_error_diag(
 ) {
     const REQ_MAX: usize = 2048;
     const RESP_MAX: usize = 4096;
-    // DEBUG: MiniMax 错误时 dump 完整请求体
-    if upstream_url.contains("minimaxi") {
-        let dump = String::from_utf8_lossy(request_body).into_owned();
-        let _ = std::fs::write("/tmp/minimax_req_dump.json", &dump);
-    }
     let req_snippet = bytes_preview(request_body, REQ_MAX);
     let resp_snippet = bytes_preview(response_body, RESP_MAX);
     telemetry.logs.add(

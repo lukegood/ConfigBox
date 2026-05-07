@@ -8,6 +8,8 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
     container_name: configbox
     restart: unless-stopped
+    env_file:
+      - .env
     user: "${UID:-1000}:${GID:-1000}"
     ports:
       - "8787:8787"
@@ -17,9 +19,6 @@ services:
       APP_HOST: 0.0.0.0
       APP_PORT: 8787
       APP_USERNAME: ${APP_USERNAME:-admin}
-      APP_PASSWORD: ${APP_PASSWORD:-}
-      APP_PASSWORD_HASH: ${APP_PASSWORD_HASH:-}
-      SESSION_SECRET: ${SESSION_SECRET:-}
       APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-false}
       CLAUDE_CONFIG_PATH: /config/claude/settings.json
       CODEX_CONFIG_PATH: /config/codex/auth.json
