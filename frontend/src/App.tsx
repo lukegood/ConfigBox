@@ -37,6 +37,7 @@ import {
   listProfiles,
   me,
   restoreBackup,
+  restartGateway,
   saveActiveConfig,
   saveProfile,
   setAuth,
@@ -111,6 +112,7 @@ function App() {
   const [gatewayLogs, setGatewayLogs] = useState<string[]>([]);
   const [gatewayLogBytes, setGatewayLogBytes] = useState({ current: 0, max: 0 });
   const [gatewayProviderForm, setGatewayProviderForm] = useState<GatewayProviderForm | null>(null);
+  const [gatewayRestartRequired, setGatewayRestartRequired] = useState(false);
 
   const tool = useMemo(() => tools.find((item) => item.id === toolId), [tools, toolId]);
   const activeFile = useMemo(() => files.find((file) => file.id === activeFileId) ?? files[0], [files, activeFileId]);
@@ -194,6 +196,9 @@ function App() {
       const [config, statusData, logs] = await Promise.all([getGatewayConfig(), getGatewayStatus(), getGatewayLogs()]);
       setGatewayConfig(config);
       setGatewayStatus(statusData);
+      if (!statusData.running) {
+        setGatewayRestartRequired(false);
+      }
       setGatewayLogs(logs.lines);
       setGatewayLogBytes({ current: logs.currentBytes, max: logs.maxBytes });
       setMode("gateway");
@@ -355,6 +360,7 @@ function App() {
     try {
       const next = await startGateway();
       setGatewayStatus(next);
+      setGatewayRestartRequired(false);
       setStatus(next.codexApplied ? "Gateway 已启动，Codex 配置已写入" : "Gateway 已启动");
       const logs = await getGatewayLogs();
       setGatewayLogs(logs.lines);
@@ -372,9 +378,28 @@ function App() {
     try {
       const next = await stopGateway();
       setGatewayStatus(next);
+      setGatewayRestartRequired(false);
       setStatus(next.codexRestored ? "Gateway 已停止，Codex 配置已自动还原" : "Gateway 已停止");
     } catch (err) {
       setError(err instanceof Error ? err.message : "停止 Gateway 失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleGatewayRestart() {
+    setLoading(true);
+    setError("");
+    try {
+      const next = await restartGateway();
+      setGatewayStatus(next);
+      setGatewayRestartRequired(false);
+      setStatus(next.codexApplied ? "Gateway 已重启，Provider 变更已生效" : "Gateway 已重启");
+      const logs = await getGatewayLogs();
+      setGatewayLogs(logs.lines);
+      setGatewayLogBytes({ current: logs.currentBytes, max: logs.maxBytes });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重启 Gateway 失败");
     } finally {
       setLoading(false);
     }
@@ -412,6 +437,7 @@ function App() {
     setLoading(true);
     setError("");
     try {
+      const wasRunning = Boolean(gatewayStatus?.running);
       const payload: Record<string, unknown> = {
         name: form.name.trim(),
         baseUrl: form.baseUrl.trim(),
@@ -433,7 +459,12 @@ function App() {
       }
       setGatewayProviderForm(null);
       await loadGateway();
-      setStatus(form.id ? `已更新 Provider: ${provider.name}` : `已添加 Provider: ${provider.name}`);
+      setGatewayRestartRequired(wasRunning);
+      setStatus(
+        wasRunning
+          ? `${form.id ? "已更新" : "已添加"} Provider: ${provider.name}，请重启 Gateway 后生效`
+          : `${form.id ? "已更新" : "已添加"} Provider: ${provider.name}`
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存 Provider 失败");
     } finally {
@@ -446,11 +477,29 @@ function App() {
     setLoading(true);
     setError("");
     try {
+      const wasRunning = Boolean(gatewayStatus?.running);
       await deleteGatewayProvider(providerId);
       await loadGateway();
-      setStatus(`已删除 Provider: ${name}`);
+      setGatewayRestartRequired(wasRunning);
+      setStatus(wasRunning ? `已删除 Provider: ${name}，请重启 Gateway 后生效` : `已删除 Provider: ${name}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除 Provider 失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleGatewayActivateProvider(providerId: string, name: string) {
+    setLoading(true);
+    setError("");
+    try {
+      const wasRunning = Boolean(gatewayStatus?.running);
+      await activateGatewayProvider(providerId);
+      await loadGateway();
+      setGatewayRestartRequired(wasRunning);
+      setStatus(wasRunning ? `已启用 Provider: ${name}，请重启 Gateway 后生效` : `已启用 Provider: ${name}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "启用 Provider 失败");
     } finally {
       setLoading(false);
     }
@@ -647,10 +696,16 @@ function App() {
                   Provider
                 </button>
                 {gatewayStatus?.running ? (
-                  <button onClick={handleGatewayStop} disabled={loading} title="停止 Gateway">
-                    <Power size={16} />
-                    停止
-                  </button>
+                  <>
+                    <button onClick={handleGatewayRestart} disabled={loading} title="重启 Gateway">
+                      <RefreshCcw size={16} />
+                      重启
+                    </button>
+                    <button onClick={handleGatewayStop} disabled={loading} title="停止 Gateway">
+                      <Power size={16} />
+                      停止
+                    </button>
+                  </>
                 ) : (
                   <button onClick={handleGatewayStart} disabled={loading} title="启动 Gateway">
                     <Play size={16} />
@@ -728,6 +783,16 @@ function App() {
         {mode === "gateway" ? (
           <>
             {error ? <div className="banner error">{error}</div> : null}
+            {gatewayRestartRequired && gatewayStatus?.running ? (
+              <div className="banner caution gateway-restart-banner">
+                <AlertTriangle size={16} />
+                <span>Provider 配置已变更，重启 Gateway 后生效。</span>
+                <button onClick={handleGatewayRestart} disabled={loading} title="重启 Gateway">
+                  <RefreshCcw size={15} />
+                  重启
+                </button>
+              </div>
+            ) : null}
             <div className="gateway-panel">
               <section className="gateway-section">
                 <div className="gateway-summary">
@@ -761,10 +826,8 @@ function App() {
                           <span className="pill">active</span>
                         ) : (
                           <button
-                            onClick={async () => {
-                              await activateGatewayProvider(provider.id);
-                              await loadGateway();
-                            }}
+                            onClick={() => handleGatewayActivateProvider(provider.id, provider.name)}
+                            disabled={loading}
                           >
                             启用
                           </button>

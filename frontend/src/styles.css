@@ -285,6 +285,17 @@ select {
   gap: 18px;
 }
 
+.topbar > div:first-child {
+  min-width: 0;
+}
+
+.topbar h2,
+.topbar p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .actions {
   display: flex;
   align-items: center;
@@ -302,6 +313,8 @@ select {
   gap: 8px;
   align-items: center;
   color: var(--text);
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .warning {
@@ -312,6 +325,18 @@ select {
 .caution {
   border-color: var(--caution-border);
   background: var(--caution-bg);
+}
+
+.gateway-restart-banner span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.gateway-restart-banner button {
+  flex: 0 0 auto;
+  min-height: 30px;
+  margin-left: auto;
 }
 
 .error,
@@ -335,6 +360,7 @@ select {
 }
 
 .statusline span:not(.clean-dot, .dirty-dot) {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -381,6 +407,7 @@ select {
 
 .gateway-panel {
   min-height: 0;
+  min-width: 0;
   margin: 14px 18px;
   display: grid;
   gap: 14px;
@@ -390,6 +417,7 @@ select {
 .gateway-section {
   border-top: 1px solid var(--border-soft);
   padding-top: 14px;
+  min-width: 0;
 }
 
 .gateway-section:first-child {
@@ -433,6 +461,7 @@ select {
 .provider-table {
   display: grid;
   gap: 7px;
+  min-width: 0;
 }
 
 .provider-row {
@@ -483,6 +512,7 @@ select {
 
 .gateway-logs {
   margin: 0;
+  min-width: 0;
   min-height: 220px;
   max-height: 360px;
   overflow: auto;
@@ -493,6 +523,8 @@ select {
   padding: 12px;
   font-size: 12px;
   line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .log-meta {
