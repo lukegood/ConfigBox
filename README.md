@@ -13,9 +13,11 @@ ConfigBox是一个Docker化Web管理工具，用于可视化管理Linux服务器
 - Codex：`${HOME}/.codex/auth.json` + `${HOME}/.codex/config.toml`
 
 ## 最近更新
-:loudspeaker: 2026.05.06  优化了codex的配置方式
+:loudspeaker: 2026.05.06  发布v0.2.0, 优化了codex的配置方式
 
-:loudspeaker: 2026.05.07  新增Codex Gateway，内置基于 [codex-app-transfer](https://github.com/Cmochance/codex-app-transfer)的codex转发能力，支持没有实现response协议的国模接入codex
+:loudspeaker: 2026.05.07  发布v0.3.0, 新增Codex Gateway，内置基于 [codex-app-transfer](https://github.com/Cmochance/codex-app-transfer)的codex转发能力，支持没有实现response协议的国模接入codex
+
+:loudspeaker: 2026.05.07  发布v0.3.2, 修复Codex Gateway转发MiniMax模型消息时的报错，修复前端错误
 
 ## 项目截图
   <img src="yanshi.png" alt="configbox" width="800">
