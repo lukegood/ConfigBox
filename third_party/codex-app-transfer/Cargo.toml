@@ -1,0 +1,19 @@
+# Minimal vendored Rust workspace extracted from Cmochance/codex-app-transfer.
+# It keeps only the crates needed to build the headless ConfigBox sidecar.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/registry",
+    "crates/proxy",
+    "crates/adapters",
+    "crates/codex_integration",
+    "crates/gateway",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Codex App Transfer maintainers"]
+repository = "https://github.com/Cmochance/codex-app-transfer"

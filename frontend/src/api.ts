@@ -1,4 +1,15 @@
-import type { ActiveConfig, BackupDoc, BackupItem, ConfigFile, ProfileDoc, ProfileItem, Tool } from "./types";
+import type {
+  ActiveConfig,
+  BackupDoc,
+  BackupItem,
+  ConfigFile,
+  GatewayConfig,
+  GatewayProvider,
+  GatewayStatus,
+  ProfileDoc,
+  ProfileItem,
+  Tool
+} from "./types";
 
 const AUTH_KEY = "configbox.loggedIn";
 
@@ -111,4 +122,62 @@ export async function getBackup(tool: string, backupName: string) {
 
 export async function restoreBackup(tool: string, backupName: string) {
   return request<ActiveConfig>(`/api/backups/${tool}/${backupName}/restore`, { method: "POST" });
+}
+
+export async function getGatewayConfig() {
+  return request<GatewayConfig>("/api/gateway/config");
+}
+
+export async function getGatewayStatus() {
+  return request<GatewayStatus>("/api/gateway/status");
+}
+
+export async function startGateway() {
+  return request<GatewayStatus>("/api/gateway/start", { method: "POST" });
+}
+
+export async function stopGateway() {
+  return request<GatewayStatus>("/api/gateway/stop", { method: "POST" });
+}
+
+export async function restartGateway() {
+  return request<GatewayStatus>("/api/gateway/restart", { method: "POST" });
+}
+
+export async function getGatewayLogs() {
+  return request<{ lines: string[]; logDir: string; maxBytes: number; currentBytes: number }>("/api/gateway/logs");
+}
+
+export async function clearGatewayLogs() {
+  return request<{ success: boolean; removed: number; logDir: string }>("/api/gateway/logs/clear", { method: "POST" });
+}
+
+export async function addGatewayProvider(provider: Record<string, unknown>) {
+  return request<GatewayProvider>("/api/gateway/providers", {
+    method: "POST",
+    body: JSON.stringify(provider)
+  });
+}
+
+export async function updateGatewayProvider(providerId: string, provider: Record<string, unknown>) {
+  return request<GatewayProvider>(`/api/gateway/providers/${providerId}`, {
+    method: "PUT",
+    body: JSON.stringify(provider)
+  });
+}
+
+export async function deleteGatewayProvider(providerId: string) {
+  return request<{ ok: boolean }>(`/api/gateway/providers/${providerId}`, { method: "DELETE" });
+}
+
+export async function activateGatewayProvider(providerId: string) {
+  return request<GatewayProvider>(`/api/gateway/providers/${providerId}/activate`, { method: "POST" });
+}
+
+export async function applyGatewayToCodex() {
+  return request<{ success: boolean; baseUrl: string }>("/api/gateway/apply", { method: "POST" });
+}
+
+export async function restoreGatewayCodex() {
+  return request<{ success: boolean }>("/api/gateway/restore", { method: "POST" });
 }
