@@ -14,6 +14,7 @@ ConfigBox是一个Docker化Web管理工具，用于可视化管理Linux服务器
 
 ## 最近更新
 :loudspeaker: 2026.05.06  优化了codex的配置方式
+
 :loudspeaker: 2026.05.07  新增Codex Gateway，内置基于 [codex-app-transfer](https://github.com/Cmochance/codex-app-transfer)的codex转发能力，支持没有实现response协议的国模接入codex
 
 ## 项目截图
