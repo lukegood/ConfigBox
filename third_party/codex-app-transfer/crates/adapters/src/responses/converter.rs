@@ -1,0 +1,1763 @@
+//! Chat SSE → Responses SSE 状态机.
+//!
+//! 覆盖范围:
+//! - **Stage 3.2c**:文本流(`delta.content`)→ message 生命周期
+//! - **Stage 3.3a**:推理流(`delta.reasoning_content`)→ reasoning 生命周期
+//! - **Stage 3.3b**:工具调用流(`delta.tool_calls[]`)→ function_call
+//!   生命周期。多个 tool_call 用 OpenAI 自带的 `index` 区分;同一 index 的
+//!   `function.arguments` 在多 chunk 间累计成一个完整 JSON 字符串。
+//! - **Stage 3.3c**:legacy 单工具流(`delta.function_call`)→ function_call
+//!   生命周期。旧版 Chat 流式适配器只读取 `choices[0]`;这里保留同一策略,
+//!   不把多个 choice 合并成一个 Responses 输出,避免发明 1.0.x 没有的语义。
+//!
+//! reasoning / message / tool_calls 三类 item 在同一响应里独立维持,按
+//! "实际出现顺序"决定它们在最终 `response.completed.output[]` 里的排列。
+//!
+//! 状态机生命周期(单次响应):
+//! ```text
+//! Idle ──first chunk parse──► Streaming ──[DONE] / EOF──► Done
+//!         │
+//!         emit response.created (一次)
+//!                    │
+//!         首次 reasoning_content delta:
+//!           reasoning open → reasoning.summary_text.delta*
+//!         首次 content delta:
+//!           if reasoning 还开着 → reasoning close
+//!           message open → output_text.delta*
+//!                    │
+//!         close 阶段:open 着的 item 依次 close → response.completed
+//! ```
+//!
+//! 设计取舍:
+//! - 状态机用同步 `feed(&[u8]) -> Vec<u8>` + `finish() -> Vec<u8>` 暴露,
+//!   流式包装放 `mod stream`,这样状态机本身能用单测覆盖完整生命周期
+//! - SSE 帧切分按 `\n\n` 终结符;增量 buffer 在 `BytesMut` 里(允许跨 chunk
+//!   接续)
+//! - JSON 解析允许失败:遇到非 JSON 的 `data:` 行(罕见但不能崩),静默跳过
+//!   (Stage 4 接 tracing 后再 warn)
+
+use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bytes::{Bytes, BytesMut};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use super::tool_call_cache::{global_tool_call_cache, ToolCallEntry};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Idle,
+    Streaming,
+    Done,
+}
+
+#[derive(Debug)]
+struct PendingToolCall {
+    output_index: u32,
+    fc_id: String,
+    /// 上游 OpenAI 给的 `tool_calls[i].id`(透传给 client);若上游没给会用
+    /// fc_id 兜底。Codex CLI 后续若把工具结果回灌到 Responses,就靠它做
+    /// `tool_call_id` 关联。
+    call_id: String,
+    name: String,
+    args_acc: String,
+    closed: bool,
+}
+
+#[derive(Debug)]
+pub struct ChatToResponsesConverter {
+    state: State,
+    buffer: BytesMut,
+    response_id: String,
+    next_output_index: u32,
+
+    // ── reasoning(推理流)──
+    reasoning_id: String,
+    reasoning_open: bool,
+    reasoning_closed: bool,
+    reasoning_index: u32,
+    reasoning_acc: String,
+
+    // ── message(文本流)──
+    message_id: String,
+    message_open: bool,
+    message_closed: bool,
+    message_index: u32,
+    text_acc: String,
+
+    // ── tool_calls(工具调用流)── BTreeMap 用 OpenAI 自带的 index 做 key,
+    // 迭代顺序天然按 OpenAI index 升序;output_index 在首次 open 时分配
+    tool_calls: BTreeMap<u32, PendingToolCall>,
+    /// fc_id 生成种子:`fc_<seed>_<openai_index>`;一次响应里固定不变
+    fc_id_seed: String,
+
+    model: String,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+}
+
+impl ChatToResponsesConverter {
+    pub fn new() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seed = format!("{nanos:x}");
+        Self::new_with_ids(
+            format!("resp_{seed}"),
+            format!("msg_{seed}"),
+            format!("rs_{seed}"),
+        )
+    }
+
+    pub fn new_with_ids(response_id: String, message_id: String, reasoning_id: String) -> Self {
+        let fc_id_seed = response_id
+            .strip_prefix("resp_")
+            .unwrap_or(response_id.as_str())
+            .to_owned();
+        Self {
+            state: State::Idle,
+            buffer: BytesMut::with_capacity(4096),
+            response_id,
+            next_output_index: 0,
+            reasoning_id,
+            reasoning_open: false,
+            reasoning_closed: false,
+            reasoning_index: 0,
+            reasoning_acc: String::new(),
+            message_id,
+            message_open: false,
+            message_closed: false,
+            message_index: 0,
+            text_acc: String::new(),
+            tool_calls: BTreeMap::new(),
+            fc_id_seed,
+            model: String::new(),
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    pub fn new_with_response_id(response_id: String) -> Self {
+        let seed = response_id
+            .strip_prefix("resp_")
+            .unwrap_or(response_id.as_str())
+            .to_owned();
+        Self::new_with_ids(response_id, format!("msg_{seed}"), format!("rs_{seed}"))
+    }
+
+    pub fn assistant_message(&self) -> Option<Value> {
+        if !self.message_open && self.tool_calls.is_empty() && self.reasoning_acc.is_empty() {
+            return None;
+        }
+
+        let mut message = json!({
+            "role": "assistant",
+            "content": self.text_acc,
+        });
+        if !self.reasoning_acc.is_empty() {
+            // ToolCallCache 重建走这条路把 reasoning 写回上游 messages —
+            // 上游不需要见到 v2.0.8+ open_reasoning 注入的 `**Thinking**\n\n`
+            // 人造 header(那只为 Codex CLI TUI 显示分支用),strip 后给上游。
+            let cleaned = self
+                .reasoning_acc
+                .strip_prefix(crate::responses::request::CODEX_REASONING_PREFIX)
+                .unwrap_or(self.reasoning_acc.as_str());
+            message["reasoning_content"] = Value::String(cleaned.to_owned());
+        }
+
+        if !self.tool_calls.is_empty() {
+            let tool_calls: Vec<Value> = self
+                .tool_calls
+                .values()
+                .map(|pending| {
+                    json!({
+                        "id": pending.call_id.clone(),
+                        "type": "function",
+                        "function": {
+                            "name": pending.name.clone(),
+                            "arguments": pending.args_acc.clone(),
+                        },
+                    })
+                })
+                .collect();
+            if !tool_calls.is_empty() {
+                message["tool_calls"] = Value::Array(tool_calls);
+            }
+        }
+
+        Some(message)
+    }
+
+    /// 喂入站 SSE 字节;返回**已经可以 flush** 的出站 SSE 字节。
+    /// 半个 frame(没遇到 `\n\n`)会留在内部 buffer 等下次 feed。
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if matches!(self.state, State::Done) {
+            return Vec::new();
+        }
+        self.buffer.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(frame) = drain_one_frame(&mut self.buffer) {
+            self.handle_frame(&frame, &mut out);
+            if matches!(self.state, State::Done) {
+                break;
+            }
+        }
+        out
+    }
+
+    /// 上游流结束(EOF)时调用;若 `[DONE]` 之前就断了,会补 emit
+    /// `response.completed`(标记 incomplete + interrupted),保证客户端不会
+    /// 看到半截流。
+    pub fn finish(&mut self) -> Vec<u8> {
+        if matches!(self.state, State::Done) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if !self.buffer.is_empty() {
+            self.buffer.extend_from_slice(b"\n\n");
+            if let Some(frame) = drain_one_frame(&mut self.buffer) {
+                self.handle_frame(&frame, &mut out);
+            }
+        }
+        if !matches!(self.state, State::Done) {
+            self.emit_close(&mut out, /*from_done=*/ false);
+        }
+        out
+    }
+
+    /// emit `response.created` 紧跟 `response.in_progress`(同一个 response
+    /// 信封)。OpenAI Responses 协议要求 `response.created` 后立即跟一个
+    /// `response.in_progress`,严格客户端(litellm 自身、Anthropic 工具链)
+    /// 不发就会卡住;Codex CLI 0.x/1.x 实测能容忍但不应当依赖这条容忍。
+    /// 与 Python pre-refactor `streaming_adapter.py:266-281`、litellm
+    /// `streaming_iterator.py:434-444` 行为一致。
+    fn emit_lifecycle_open(&self, out: &mut Vec<u8>) {
+        let envelope = json!({
+            "id": self.response_id,
+            "object": "response",
+            "status": "in_progress",
+            "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
+        });
+        emit_event(
+            out,
+            "response.created",
+            json!({"type": "response.created", "response": envelope.clone()}),
+        );
+        emit_event(
+            out,
+            "response.in_progress",
+            json!({"type": "response.in_progress", "response": envelope}),
+        );
+    }
+
+    fn handle_frame(&mut self, frame: &[u8], out: &mut Vec<u8>) {
+        let payload = match parse_sse_data_payload(frame) {
+            Some(p) => p,
+            None => return,
+        };
+        if payload == "[DONE]" {
+            self.emit_close(out, /*from_done=*/ true);
+            return;
+        }
+        let chunk: ChatChunk = match serde_json::from_str(&payload) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        // 确保 response.created / in_progress 只 emit 一次,且在任何 item open 之前
+        if matches!(self.state, State::Idle) {
+            self.state = State::Streaming;
+            // model 名优先取本帧;首帧没有再用 unknown 占位
+            if let Some(m) = chunk.model.as_deref() {
+                self.model = m.to_owned();
+            }
+            self.emit_lifecycle_open(out);
+        } else if self.model.is_empty() {
+            if let Some(m) = chunk.model.as_deref() {
+                self.model = m.to_owned();
+            }
+        }
+
+        // 1.0.x 旧版 StreamingAdapter 明确只读取 choices[0]。Responses
+        // 单个响应没有 Chat Completions 多候选的直接合并语义,所以这里保持
+        // 首个 choice 策略并用测试锁定,不自行合并或展开其他 choice。
+        let choice = match chunk.choices.first() {
+            Some(c) => c,
+            None => {
+                if let Some(u) = chunk.usage {
+                    self.usage = Some(u);
+                }
+                return;
+            }
+        };
+
+        // reasoning 优先于 content 处理(Kimi/DeepSeek 在同一 chunk 里通常只有一种)
+        if let Some(rs) = choice.delta.reasoning_content.as_deref() {
+            if !rs.is_empty() {
+                if !self.reasoning_open {
+                    self.open_reasoning(out);
+                }
+                self.reasoning_acc.push_str(rs);
+                emit_event(
+                    out,
+                    "response.reasoning_summary_text.delta",
+                    json!({
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": self.reasoning_id,
+                        "output_index": self.reasoning_index,
+                        "summary_index": 0,
+                        "delta": rs,
+                    }),
+                );
+            }
+        }
+
+        if let Some(text) = choice.delta.content.as_deref() {
+            if !text.is_empty() {
+                if self.reasoning_open && !self.reasoning_closed {
+                    self.close_reasoning(out);
+                }
+                if !self.message_open {
+                    self.open_message(out);
+                }
+                self.text_acc.push_str(text);
+                emit_event(
+                    out,
+                    "response.output_text.delta",
+                    json!({
+                        "type": "response.output_text.delta",
+                        "item_id": self.message_id,
+                        "output_index": self.message_index,
+                        "content_index": 0,
+                        "delta": text,
+                    }),
+                );
+            }
+        }
+
+        // tool_calls(可能与 content / reasoning 同帧;此处独立处理)
+        for tc in &choice.delta.tool_calls {
+            self.handle_tool_call_delta(tc, out);
+        }
+        if let Some(function_call) = &choice.delta.function_call {
+            if function_call.has_payload() {
+                let tc = ChatToolCallDelta {
+                    index: 0,
+                    id: None,
+                    _kind: Some("function".to_owned()),
+                    function: ChatToolCallFunctionDelta {
+                        name: function_call.name.clone(),
+                        arguments: function_call.arguments.clone(),
+                    },
+                };
+                self.handle_tool_call_delta(&tc, out);
+            }
+        }
+
+        if let Some(reason) = choice.finish_reason.as_deref() {
+            self.finish_reason = Some(reason.to_owned());
+        }
+        if let Some(u) = chunk.usage {
+            self.usage = Some(u);
+        } else if let Some(u) = choice.usage.clone() {
+            self.usage = Some(u);
+        }
+    }
+
+    fn handle_tool_call_delta(&mut self, tc: &ChatToolCallDelta, out: &mut Vec<u8>) {
+        let openai_index = tc.index;
+        // 第一次见到这个 index → open。OpenAI 在首帧通常给 id + name + ""(空 args);
+        // 也有 provider 在中间帧才补 id/name(我们持续合并)。
+        let is_new = !self.tool_calls.contains_key(&openai_index);
+        if is_new {
+            let output_index = self.next_output_index;
+            self.next_output_index += 1;
+            let fc_id = format!("fc_{}_{}", self.fc_id_seed, openai_index);
+            let call_id = tc
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("call_{}_{}", self.fc_id_seed, openai_index));
+            let name = tc.function.name.clone().unwrap_or_default();
+            self.tool_calls.insert(
+                openai_index,
+                PendingToolCall {
+                    output_index,
+                    fc_id: fc_id.clone(),
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    args_acc: String::new(),
+                    closed: false,
+                },
+            );
+            emit_event(
+                out,
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "function_call",
+                        "id": fc_id,
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": "",
+                        "status": "in_progress",
+                    },
+                }),
+            );
+        }
+
+        // 后续帧可能补全 name(罕见但兼容)
+        if let Some(name) = tc.function.name.as_deref() {
+            if !name.is_empty() {
+                if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+                    if pending.name.is_empty() {
+                        pending.name = name.to_owned();
+                    }
+                }
+            }
+        }
+        // call_id 也可能在后续帧才出现
+        if let Some(id) = tc.id.as_deref() {
+            if !id.is_empty() {
+                if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+                    // 只在首次给出 id 时覆盖(避免相同 index 不同 id 的混乱)
+                    if pending.call_id.starts_with("call_") && pending.call_id.contains('_') {
+                        // 兜底生成的 call_id 形如 `call_<seed>_<idx>`,真 id 来了就替换
+                        if !pending.call_id.starts_with(id) && pending.call_id != id {
+                            pending.call_id = id.to_owned();
+                        }
+                    }
+                }
+            }
+        }
+
+        // arguments delta(增量字符串)
+        if let Some(args) = tc.function.arguments.as_deref() {
+            if !args.is_empty() {
+                if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+                    pending.args_acc.push_str(args);
+                    let item_id = pending.fc_id.clone();
+                    let output_index = pending.output_index;
+                    emit_event(
+                        out,
+                        "response.function_call_arguments.delta",
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "delta": args,
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    fn close_tool_call(&mut self, openai_index: u32, out: &mut Vec<u8>) {
+        let Some(pending) = self.tool_calls.get_mut(&openai_index) else {
+            return;
+        };
+        if pending.closed {
+            return;
+        }
+        emit_event(
+            out,
+            "response.function_call_arguments.done",
+            json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": pending.fc_id,
+                "output_index": pending.output_index,
+                "arguments": pending.args_acc,
+            }),
+        );
+        let item = json!({
+            "type": "function_call",
+            "id": pending.fc_id,
+            "call_id": pending.call_id,
+            "name": pending.name,
+            "arguments": pending.args_acc,
+            "status": "completed",
+        });
+        emit_event(
+            out,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": pending.output_index,
+                "item": item,
+            }),
+        );
+        // 把 (call_id → name + arguments) 写进 ToolCallCache,供下一轮
+        // Codex CLI 发 function_call_output 时 repair_tool_call_ids 路径 B
+        // 在前 assistant 找不到 call_id 时重建工具调用上下文。
+        global_tool_call_cache().save(
+            &pending.call_id,
+            ToolCallEntry {
+                name: pending.name.clone(),
+                arguments: pending.args_acc.clone(),
+            },
+        );
+        pending.closed = true;
+    }
+
+    fn tool_call_item_completed(pending: &PendingToolCall) -> Value {
+        json!({
+            "type": "function_call",
+            "id": pending.fc_id,
+            "call_id": pending.call_id,
+            "name": pending.name,
+            "arguments": pending.args_acc,
+            "status": "completed",
+        })
+    }
+
+    fn open_reasoning(&mut self, out: &mut Vec<u8>) {
+        self.reasoning_open = true;
+        self.reasoning_index = self.next_output_index;
+        self.next_output_index += 1;
+        emit_event(
+            out,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": self.reasoning_index,
+                "item": {
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "id": self.reasoning_id,
+                    "summary": [],
+                    "content": null,
+                    "encrypted_content": null,
+                },
+            }),
+        );
+        emit_event(
+            out,
+            "response.reasoning_summary_part.added",
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "item_id": self.reasoning_id,
+                "output_index": self.reasoning_index,
+                "summary_index": 0,
+                "part": { "type": "summary_text", "text": "" },
+            }),
+        );
+        // 注入 `**Thinking**\n\n` header 让 Codex CLI TUI 走"显示" 分支。
+        // Codex CLI 0.128 `tui/src/history_cell.rs:2783 new_reasoning_summary_block`
+        // 检测累积 buffer 里是否有匹配的 `**...**` 标记 —— 命中走显示分支,
+        // 否则把整段 reasoning 标记为 transcript_only,主 UI 完全不渲染
+        // (只在 `/transcript` 命令可见)。OpenAI o1/o3 自带 section header,
+        // 但 Kimi for Coding / DeepSeek thinking 等纯文本流默认无 `**`,
+        // 不补 prefix 就会被整段隐藏。详见
+        // `docs/kimi-reasoning-truncation-investigation.md` §5.4 根因结论。
+        const REASONING_HEADER: &str = "**Thinking**\n\n";
+        self.reasoning_acc.push_str(REASONING_HEADER);
+        emit_event(
+            out,
+            "response.reasoning_summary_text.delta",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": self.reasoning_id,
+                "output_index": self.reasoning_index,
+                "summary_index": 0,
+                "delta": REASONING_HEADER,
+            }),
+        );
+    }
+
+    fn close_reasoning(&mut self, out: &mut Vec<u8>) {
+        emit_event(
+            out,
+            "response.reasoning_summary_text.done",
+            json!({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": self.reasoning_id,
+                "output_index": self.reasoning_index,
+                "summary_index": 0,
+                "text": self.reasoning_acc,
+            }),
+        );
+        emit_event(
+            out,
+            "response.reasoning_summary_part.done",
+            json!({
+                "type": "response.reasoning_summary_part.done",
+                "item_id": self.reasoning_id,
+                "output_index": self.reasoning_index,
+                "summary_index": 0,
+                "part": {
+                    "type": "summary_text",
+                    "text": self.reasoning_acc,
+                },
+            }),
+        );
+        emit_event(
+            out,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": self.reasoning_index,
+                "item": self.reasoning_item_completed(),
+            }),
+        );
+        self.reasoning_closed = true;
+    }
+
+    fn reasoning_item_completed(&self) -> Value {
+        json!({
+            "type": "reasoning",
+            "status": "completed",
+            "id": self.reasoning_id,
+            "summary": [{
+                "type": "summary_text",
+                "text": self.reasoning_acc,
+            }],
+            "content": null,
+            "encrypted_content": null,
+        })
+    }
+
+    fn open_message(&mut self, out: &mut Vec<u8>) {
+        self.message_open = true;
+        self.message_index = self.next_output_index;
+        self.next_output_index += 1;
+        emit_event(
+            out,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": self.message_index,
+                "item": {
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "id": self.message_id,
+                    "content": [],
+                },
+            }),
+        );
+        emit_event(
+            out,
+            "response.content_part.added",
+            json!({
+                "type": "response.content_part.added",
+                "item_id": self.message_id,
+                "output_index": self.message_index,
+                "content_index": 0,
+                "part": { "type": "output_text", "text": "", "annotations": [] },
+            }),
+        );
+    }
+
+    fn close_message(&mut self, out: &mut Vec<u8>) {
+        emit_event(
+            out,
+            "response.output_text.done",
+            json!({
+                "type": "response.output_text.done",
+                "item_id": self.message_id,
+                "output_index": self.message_index,
+                "content_index": 0,
+                "text": self.text_acc,
+            }),
+        );
+        emit_event(
+            out,
+            "response.content_part.done",
+            json!({
+                "type": "response.content_part.done",
+                "item_id": self.message_id,
+                "output_index": self.message_index,
+                "content_index": 0,
+                "part": {
+                    "type": "output_text",
+                    "text": self.text_acc,
+                    "annotations": [],
+                },
+            }),
+        );
+        emit_event(
+            out,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": self.message_index,
+                "item": self.message_item_completed(),
+            }),
+        );
+        self.message_closed = true;
+    }
+
+    fn message_item_completed(&self) -> Value {
+        json!({
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "id": self.message_id,
+            "content": [{
+                "type": "output_text",
+                "text": self.text_acc,
+                "annotations": [],
+            }],
+        })
+    }
+
+    fn emit_close(&mut self, out: &mut Vec<u8>, from_done: bool) {
+        // 如果到 [DONE] 还没 emit 过 created(纯 [DONE] 输入 / 全是坏 JSON),
+        // 仍要补 emit 一次,保证客户端拿到完整生命周期(response.created +
+        // response.in_progress 一起发)。
+        if matches!(self.state, State::Idle) {
+            self.state = State::Streaming;
+            self.emit_lifecycle_open(out);
+        }
+        if self.reasoning_open && !self.reasoning_closed {
+            self.close_reasoning(out);
+        }
+        if self.message_open && !self.message_closed {
+            self.close_message(out);
+        }
+        // tool_calls 按 OpenAI index 顺序闭合(BTreeMap 自然有序)
+        let tc_indices: Vec<u32> = self.tool_calls.keys().copied().collect();
+        for idx in tc_indices {
+            self.close_tool_call(idx, out);
+        }
+
+        let (status, incomplete_details) = match (self.finish_reason.as_deref(), from_done) {
+            (Some("stop") | Some("tool_calls") | Some("function_call"), _) => {
+                ("completed", Value::Null)
+            }
+            (Some("length"), _) => ("incomplete", json!({ "reason": "max_output_tokens" })),
+            (Some("content_filter"), _) => ("incomplete", json!({ "reason": "content_filter" })),
+            (Some(other), _) => ("incomplete", json!({ "reason": other })),
+            (None, true) => ("completed", Value::Null),
+            (None, false) => ("incomplete", json!({ "reason": "interrupted" })),
+        };
+
+        // output[] 严格按 output_index 排序(reasoning/message/tool_calls 全混在一起)
+        let mut all_items: Vec<(u32, Value)> = Vec::new();
+        if self.reasoning_open {
+            all_items.push((self.reasoning_index, self.reasoning_item_completed()));
+        }
+        if self.message_open {
+            all_items.push((self.message_index, self.message_item_completed()));
+        }
+        for tc in self.tool_calls.values() {
+            all_items.push((tc.output_index, Self::tool_call_item_completed(tc)));
+        }
+        all_items.sort_by_key(|(idx, _)| *idx);
+        let output_items: Vec<Value> = all_items.into_iter().map(|(_, v)| v).collect();
+
+        let mut completed = json!({
+            "type": "response.completed",
+            "response": {
+                "id": self.response_id,
+                "object": "response",
+                "status": status,
+                "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
+                "output": output_items,
+                "incomplete_details": incomplete_details,
+            },
+        });
+        // Codex CLI 反序列化 `ResponseCompleted` 时 usage 中的 `input_tokens` /
+        // `output_tokens` / `total_tokens` 是必填,缺一帧就整流断开重连。Chat
+        // 上游的 `prompt_tokens` / `completion_tokens` 与 Responses 的字段名
+        // 不同,部分 provider 也可能完全不发 usage,这里统一规范化。
+        completed["response"]["usage"] = normalize_usage_to_responses_shape(self.usage.clone());
+        emit_event(out, "response.completed", completed);
+        self.state = State::Done;
+    }
+}
+
+impl Default for ChatToResponsesConverter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 把 Chat Completions 风格的 `usage`(prompt_tokens / completion_tokens /
+/// total_tokens / *_tokens_details)统一翻译为 Responses 风格(input_tokens /
+/// output_tokens / total_tokens / input_tokens_details / output_tokens_details)。
+///
+/// - 已经是 Responses 形态(含 `input_tokens` 键)时原值兜底返回,只补 total。
+/// - 上游完全没发 usage 时返回三零结构,避免 Codex CLI 因
+///   "missing field input_tokens" 报错断流(2026-05-06)。
+/// - 与 litellm 的 `_transform_chat_completion_usage_to_responses_usage`
+///   (docs/litellm/.../litellm_completion_transformation/transformation.py)
+///   语义一致,仅做静态字段重命名,不引入业务行为差异。
+fn normalize_usage_to_responses_shape(usage: Option<Value>) -> Value {
+    let zero = json!({
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    });
+    let Some(value) = usage else {
+        return zero;
+    };
+    let Value::Object(map) = value else {
+        return zero;
+    };
+
+    let already_responses = map.contains_key("input_tokens") || map.contains_key("output_tokens");
+    let mut out = serde_json::Map::new();
+
+    let input_tokens = if already_responses {
+        map.get("input_tokens").cloned().unwrap_or_else(|| json!(0))
+    } else {
+        map.get("prompt_tokens")
+            .cloned()
+            .unwrap_or_else(|| json!(0))
+    };
+    let output_tokens = if already_responses {
+        map.get("output_tokens")
+            .cloned()
+            .unwrap_or_else(|| json!(0))
+    } else {
+        map.get("completion_tokens")
+            .cloned()
+            .unwrap_or_else(|| json!(0))
+    };
+    let total_tokens = map.get("total_tokens").cloned().unwrap_or_else(|| {
+        let i = input_tokens.as_u64().unwrap_or(0);
+        let o = output_tokens.as_u64().unwrap_or(0);
+        json!(i + o)
+    });
+
+    out.insert("input_tokens".into(), input_tokens);
+    out.insert("output_tokens".into(), output_tokens);
+    out.insert("total_tokens".into(), total_tokens);
+
+    // *_tokens_details 子对象重命名;已经是 Responses 形态就原样保留。
+    if let Some(details) = map.get("input_tokens_details").cloned() {
+        out.insert("input_tokens_details".into(), details);
+    } else if let Some(details) = map.get("prompt_tokens_details").cloned() {
+        out.insert("input_tokens_details".into(), details);
+    }
+    if let Some(details) = map.get("output_tokens_details").cloned() {
+        out.insert("output_tokens_details".into(), details);
+    } else if let Some(details) = map.get("completion_tokens_details").cloned() {
+        out.insert("output_tokens_details".into(), details);
+    }
+
+    Value::Object(out)
+}
+
+fn emit_event(out: &mut Vec<u8>, event_name: &str, payload: Value) {
+    let line = format!(
+        "event: {event_name}\ndata: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into())
+    );
+    out.extend_from_slice(line.as_bytes());
+}
+
+fn drain_one_frame(buf: &mut BytesMut) -> Option<Bytes> {
+    let pos = find_double_newline(buf)?;
+    Some(buf.split_to(pos + 2).freeze())
+}
+
+fn find_double_newline(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 2 {
+        return None;
+    }
+    buf.windows(2).position(|w| w == b"\n\n")
+}
+
+fn parse_sse_data_payload(frame: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(frame).ok()?;
+    for line in s.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("data:") {
+            return Some(rest.trim().to_owned());
+        }
+    }
+    None
+}
+
+// ── 入站 chunk 反序列化结构 ────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ChatChunk {
+    #[serde(default)]
+    model: Option<String>,
+    /// `choices: null` 与 `tool_calls: null` 同源 —— 部分上游(MiMo /
+    /// 一些聚合层)在某些 chunk 里把 choices 写成 null;直接 Vec 解析失败
+    /// 会丢整帧。同样套 Option 兜底。
+    #[serde(default, deserialize_with = "deserialize_null_or_missing_to_empty_vec")]
+    choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChoice {
+    #[serde(default)]
+    delta: ChatDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+    /// 非标准位置的 usage —— Kimi (Moonshot) 在 finish 帧把 usage 塞在
+    /// `choices[0].usage`,而 OpenAI 标准是把它放顶层。两个位置都收。
+    #[serde(default)]
+    usage: Option<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatDelta {
+    #[serde(default)]
+    content: Option<String>,
+    /// DeepSeek / Kimi 等用 `reasoning_content` 表达推理链;OpenAI 标准里
+    /// 没有这个字段,我们透传到 Responses 的 reasoning summary。
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    /// OpenAI / DeepSeek / Kimi 工具调用增量;同一 `index` 的多 chunk 累计
+    /// 成完整的 `function.arguments` JSON 字符串。
+    ///
+    /// **null 容忍**:小米 MiMo 在每个 delta 里把无关字段显式发成 `null`
+    /// (`{"content":null,"reasoning_content":"...","tool_calls":null}`),
+    /// 直接 `Vec<...>` 解析 `null` 会让整帧反序列化失败、被静默丢弃,导致
+    /// 文本 / reasoning 全丢。这里走 Option 兜底再 flatten 回空 Vec。
+    #[serde(default, deserialize_with = "deserialize_null_or_missing_to_empty_vec")]
+    tool_calls: Vec<ChatToolCallDelta>,
+    /// 旧版 Chat Completions 单工具调用增量。OpenAI 后续改为
+    /// `tool_calls[]`,但 1.0.x 已把 `finish_reason=function_call` 视为完成,
+    /// 这里把流式 delta 直接转成 index=0 的 function_call item。
+    #[serde(default)]
+    function_call: Option<LegacyFunctionCallDelta>,
+}
+
+fn deserialize_null_or_missing_to_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(|v| v.unwrap_or_default())
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LegacyFunctionCallDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+impl LegacyFunctionCallDelta {
+    fn has_payload(&self) -> bool {
+        self.name.as_deref().map_or(false, |v| !v.is_empty())
+            || self.arguments.as_deref().map_or(false, |v| !v.is_empty())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatToolCallDelta {
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "type")]
+    _kind: Option<String>,
+    #[serde(default)]
+    function: ChatToolCallFunctionDelta,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatToolCallFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixed() -> ChatToResponsesConverter {
+        ChatToResponsesConverter::new_with_ids("resp_x".into(), "msg_x".into(), "rs_x".into())
+    }
+
+    fn parse_emitted(bytes: &[u8]) -> Vec<(String, Value)> {
+        let s = std::str::from_utf8(bytes).expect("utf8");
+        let mut out = Vec::new();
+        for frame in s.split("\n\n") {
+            if frame.trim().is_empty() {
+                continue;
+            }
+            let mut event = String::new();
+            let mut data = String::new();
+            for line in frame.split('\n') {
+                if let Some(v) = line.strip_prefix("event: ") {
+                    event = v.to_owned();
+                } else if let Some(v) = line.strip_prefix("data: ") {
+                    data = v.to_owned();
+                }
+            }
+            out.push((event, serde_json::from_str(&data).expect("data is JSON")));
+        }
+        out
+    }
+
+    fn names(events: &[(String, Value)]) -> Vec<&str> {
+        events.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    // ── Stage 3.2c 行为回归(content-only)── ─────────────────────────
+
+    #[test]
+    fn lifecycle_open_emits_created_and_in_progress_back_to_back() {
+        // OpenAI Responses 协议要求 response.created 后立即跟 response.in_progress;
+        // 严格客户端(litellm 自身、Anthropic 工具链)缺这条会卡住。
+        // 同 envelope(同 id / status / model)保证语义一致。
+        let mut c = fixed();
+        let out = c.feed(
+            br#"data: {"model":"mock","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+"#,
+        );
+        let events = parse_emitted(&out);
+        assert_eq!(
+            names(&events),
+            vec!["response.created", "response.in_progress"],
+            "首个 chunk 必须先 emit lifecycle open(created + in_progress)"
+        );
+        // 同一个 envelope:id / status / model 全一致
+        assert_eq!(events[0].1["response"]["id"], events[1].1["response"]["id"]);
+        assert_eq!(
+            events[0].1["response"]["status"],
+            events[1].1["response"]["status"]
+        );
+        assert_eq!(events[0].1["response"]["status"], "in_progress");
+        assert_eq!(events[0].1["response"]["model"], "mock");
+        assert_eq!(events[1].1["response"]["model"], "mock");
+    }
+
+    #[test]
+    fn lifecycle_open_emits_once_even_across_many_chunks() {
+        let mut c = fixed();
+        let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n");
+        let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}]}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        // 整流里 response.created / in_progress 各只能出现 1 次
+        let count = |needle: &str, body: &[u8]| {
+            String::from_utf8_lossy(body)
+                .lines()
+                .filter(|l| l.starts_with(&format!("event: {needle}")))
+                .count()
+        };
+        // 用 finish 的 out 检验全流(包含前两块)就麻烦,直接做端到端字符串拼接:
+        let mut all = Vec::new();
+        let mut c2 = fixed();
+        all.extend(
+            c2.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n"),
+        );
+        all.extend(
+            c2.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}]}\n\n"),
+        );
+        all.extend(c2.feed(b"data: [DONE]\n\n"));
+        assert_eq!(count("response.created", &all), 1);
+        assert_eq!(count("response.in_progress", &all), 1);
+        // 顺便 sanity 一下原 c 也走完了
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn first_chunk_emits_only_lifecycle_open_when_content_is_empty() {
+        let mut c = fixed();
+        let out = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+"#,
+        );
+        let events = parse_emitted(&out);
+        assert_eq!(
+            names(&events),
+            vec!["response.created", "response.in_progress"],
+            "无实际内容时只 emit lifecycle open(created + in_progress),message 懒开"
+        );
+    }
+
+    #[test]
+    fn first_content_delta_lazily_opens_message() {
+        let mut c = fixed();
+        let out = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"content":"Hi"}}]}
+
+"#,
+        );
+        let events = parse_emitted(&out);
+        assert_eq!(
+            names(&events),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+            ],
+            "首个非空 content 应同时懒开 message item"
+        );
+        assert_eq!(events[4].1["delta"], "Hi");
+        assert_eq!(events[2].1["output_index"], 0);
+    }
+
+    #[test]
+    fn content_only_done_full_lifecycle() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"content":"Hello"}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        assert_eq!(
+            names(&events),
+            vec![
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        let completed = &events[3].1["response"];
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["output"][0]["type"], "message");
+        assert_eq!(completed["output"][0]["content"][0]["text"], "Hello");
+    }
+
+    // ── Stage 3.3 新行为(reasoning)──────────────────────────────────
+
+    #[test]
+    fn reasoning_only_completed_turn_emits_reasoning_lifecycle_no_message() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"The"}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let close_names = names(&events);
+        assert_eq!(
+            close_names,
+            vec![
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ],
+            "reasoning-only completed turns should not inject synthetic assistant text"
+        );
+        let completed = &events[3].1["response"];
+        let output = completed["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "output contains only the reasoning item");
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"], Value::Null);
+        assert_eq!(output[0]["encrypted_content"], Value::Null);
+        // summary[0].text 是注入 prefix + 上游 reasoning 累积的全文
+        assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nThe");
+        assert_eq!(output[0]["summary"][0]["type"], "summary_text");
+    }
+
+    #[test]
+    fn reasoning_then_content_emits_two_items_in_order() {
+        let mut c = fixed();
+        // 第 1 chunk:首帧 + reasoning 开
+        let out1 = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}
+
+"#,
+        );
+        let ev1 = parse_emitted(&out1);
+        // open_reasoning 现在多 emit 一条 `**Thinking**` prefix delta,放在
+        // reasoning_summary_part.added 之后、上游真实 delta "think" 之前。
+        assert_eq!(
+            names(&ev1),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added", // reasoning open
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta", // prefix `**Thinking**\n\n`
+                "response.reasoning_summary_text.delta", // 上游 "think"
+            ]
+        );
+        assert_eq!(ev1[2].1["item"]["type"], "reasoning");
+        assert_eq!(ev1[2].1["output_index"], 0);
+        assert_eq!(ev1[2].1["item"]["summary"], json!([]));
+        assert_eq!(ev1[2].1["item"]["content"], Value::Null);
+        assert_eq!(ev1[2].1["item"]["encrypted_content"], Value::Null);
+        assert_eq!(ev1[4].1["delta"], "**Thinking**\n\n");
+        assert_eq!(ev1[5].1["delta"], "think");
+
+        // 第 2 chunk:content 出现,先关 reasoning 再开 message
+        let out2 = c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"content":"answer"}}]}
+
+"#,
+        );
+        let ev2 = parse_emitted(&out2);
+        assert_eq!(
+            names(&ev2),
+            vec![
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",  // reasoning close
+                "response.output_item.added", // message open
+                "response.content_part.added",
+                "response.output_text.delta",
+            ]
+        );
+        // reasoning 关闭事件的 output_index = 0
+        assert_eq!(ev2[2].1["output_index"], 0);
+        assert_eq!(ev2[2].1["item"]["content"], Value::Null);
+        assert_eq!(ev2[2].1["item"]["encrypted_content"], Value::Null);
+        assert_eq!(ev2[2].1["item"]["summary"][0]["type"], "summary_text");
+        // message 打开事件的 output_index = 1
+        assert_eq!(ev2[3].1["output_index"], 1);
+
+        // 第 3 chunk:finish + [DONE]
+        let _ = c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        let out3 = c.feed(b"data: [DONE]\n\n");
+        let ev3 = parse_emitted(&out3);
+        assert_eq!(
+            names(&ev3),
+            vec![
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done", // message close
+                "response.completed",
+            ]
+        );
+        let output = ev3[3].1["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"], Value::Null);
+        assert_eq!(output[0]["encrypted_content"], Value::Null);
+        assert_eq!(output[0]["summary"][0]["type"], "summary_text");
+        assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nthink");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "answer");
+    }
+
+    #[test]
+    fn reasoning_split_across_multiple_deltas_concatenates() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"par"}}]}
+
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"t1 "}}]}
+
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"part2"}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        // 多 chunk reasoning 与 prefix 合并后是 `**Thinking**\n\npart1 part2`
+        assert_eq!(
+            completed["output"][0]["summary"][0]["text"],
+            "**Thinking**\n\npart1 part2"
+        );
+    }
+
+    // ── 边界回归(已有用例迁移)──────────────────────────────────────
+
+    #[test]
+    fn after_done_further_feed_is_noop() {
+        let mut c = fixed();
+        let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n");
+        let _ = c.feed(b"data: [DONE]\n\n");
+        let out = c.feed(b"data: anything\n\n");
+        assert!(out.is_empty(), "Done 之后不应再 emit");
+    }
+
+    #[test]
+    fn frame_split_across_chunks_is_buffered() {
+        let mut c = fixed();
+        let out1 = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"par");
+        assert!(out1.is_empty(), "半帧不应 emit");
+        let out2 = c.feed(b"t1\"}}]}\n\n");
+        let events = parse_emitted(&out2);
+        assert_eq!(
+            names(&events),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+            ]
+        );
+        assert_eq!(events[4].1["delta"], "part1");
+    }
+
+    #[test]
+    fn finish_without_done_emits_incomplete_close() {
+        let mut c = fixed();
+        let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"abc\"}}]}\n\n");
+        let out = c.finish();
+        let events = parse_emitted(&out);
+        assert_eq!(
+            names(&events),
+            vec![
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        assert_eq!(events[3].1["response"]["status"], "incomplete");
+        assert_eq!(
+            events[3].1["response"]["incomplete_details"]["reason"],
+            "interrupted"
+        );
+    }
+
+    #[test]
+    fn usage_in_last_chunk_is_carried_to_completed() {
+        let mut c = fixed();
+        let all = c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}
+
+data: [DONE]
+
+"#,
+        );
+        let events = parse_emitted(&all);
+        let completed = events
+            .iter()
+            .rev()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        assert_eq!(completed.1["response"]["usage"]["total_tokens"], 3);
+    }
+
+    #[test]
+    fn invalid_json_data_line_is_silently_skipped() {
+        let mut c = fixed();
+        let out = c.feed(b"data: not json at all\n\n");
+        assert!(out.is_empty());
+    }
+
+    // ── Stage 3.3b 新行为(tool_calls)──────────────────────────────
+
+    #[test]
+    fn single_tool_call_full_lifecycle() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"loc"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ation\":\"NYC\"}"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let n = names(&events);
+        assert_eq!(
+            n,
+            vec![
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ],
+            "[DONE] 时只 close tool_call(open 在前面已经 emit 过)"
+        );
+        let done = &events[0];
+        assert_eq!(done.1["arguments"], "{\"location\":\"NYC\"}");
+
+        let item_done = &events[1].1["item"];
+        assert_eq!(item_done["type"], "function_call");
+        assert_eq!(item_done["status"], "completed");
+        assert_eq!(item_done["call_id"], "call_abc");
+        assert_eq!(item_done["name"], "get_weather");
+        assert_eq!(item_done["arguments"], "{\"location\":\"NYC\"}");
+
+        let completed = &events[2].1["response"];
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["output"][0]["type"], "function_call");
+        assert_eq!(completed["output"][0]["call_id"], "call_abc");
+    }
+
+    #[test]
+    fn tool_call_open_emits_added_and_first_args_delta() {
+        let mut c = fixed();
+        let out = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}
+
+"#,
+        );
+        let events = parse_emitted(&out);
+        assert_eq!(
+            names(&events),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+            ],
+            "首帧:lifecycle open + tool_call open + 第一段 args delta"
+        );
+        assert_eq!(events[2].1["item"]["type"], "function_call");
+        assert_eq!(events[2].1["item"]["call_id"], "call_a");
+        assert_eq!(events[2].1["item"]["name"], "f");
+        assert_eq!(events[3].1["delta"], "{}");
+    }
+
+    #[test]
+    fn multiple_tool_calls_get_distinct_output_indices() {
+        let mut c = fixed();
+        // SSE data 必须单行,所以这里手工拼起来(不用 raw string 多行)
+        let chunk1 = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"a","arguments":"{}"}},{"index":1,"id":"call_1","type":"function","function":{"name":"b","arguments":"{}"}}]}}]}
+"#;
+        let _ = c.feed(chunk1);
+        let _ = c.feed(b"\n");
+        let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = events
+            .iter()
+            .rev()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let output = completed.1["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2, "两个 tool_call 应各自占一个 output item");
+        assert_eq!(output[0]["call_id"], "call_0");
+        assert_eq!(output[0]["name"], "a");
+        assert_eq!(output[1]["call_id"], "call_1");
+        assert_eq!(output[1]["name"], "b");
+    }
+
+    #[test]
+    fn tool_call_call_id_falls_back_when_upstream_omits_id() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":"{}"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = events
+            .iter()
+            .rev()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let call_id = completed.1["response"]["output"][0]["call_id"]
+            .as_str()
+            .unwrap();
+        assert!(
+            call_id.starts_with("call_"),
+            "call_id 兜底应以 call_ 开头,实际:{call_id}"
+        );
+    }
+
+    #[test]
+    fn tool_call_arguments_concatenate_across_chunks() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"f","arguments":"{\"a"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\":1"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let done = events
+            .iter()
+            .find(|(n, _)| n == "response.function_call_arguments.done")
+            .unwrap();
+        assert_eq!(done.1["arguments"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn message_then_tool_call_keeps_output_index_order() {
+        let mut c = fixed();
+        // 罕见但合法:有 content 也有 tool_call
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"content":"hi"}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_t","type":"function","function":{"name":"t","arguments":"{}"}}]}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = events
+            .iter()
+            .rev()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let output = completed.1["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        // message 先出现,output_index=0
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["text"], "hi");
+        // tool_call 后出现,output_index=1
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["call_id"], "call_t");
+    }
+
+    // ── Stage 3.3c legacy function_call / multi-choice 兼容 ────────
+
+    #[test]
+    fn legacy_function_call_stream_becomes_function_call_item() {
+        let mut c = fixed();
+        let first = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"function_call":{"name":"legacy_tool","arguments":""}}}]}
+
+"#,
+        );
+        let first_events = parse_emitted(&first);
+        assert_eq!(
+            names(&first_events),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+            ]
+        );
+        assert_eq!(first_events[2].1["item"]["type"], "function_call");
+        assert_eq!(first_events[2].1["item"]["id"], "fc_x_0");
+        assert_eq!(first_events[2].1["item"]["call_id"], "call_x_0");
+        assert_eq!(first_events[2].1["item"]["name"], "legacy_tool");
+
+        let _ = c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"function_call":{"arguments":"{\"a\""}}}]}
+
+data: {"choices":[{"index":0,"delta":{"function_call":{"arguments":":1}"}},"finish_reason":"function_call"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        assert_eq!(
+            names(&events),
+            vec![
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+
+        let item_done = &events[1].1["item"];
+        assert_eq!(item_done["type"], "function_call");
+        assert_eq!(item_done["status"], "completed");
+        assert_eq!(item_done["call_id"], "call_x_0");
+        assert_eq!(item_done["name"], "legacy_tool");
+        assert_eq!(item_done["arguments"], "{\"a\":1}");
+
+        let completed = &events[2].1["response"];
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["incomplete_details"], Value::Null);
+        assert_eq!(completed["output"][0]["type"], "function_call");
+        assert_eq!(completed["output"][0]["arguments"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn multi_choice_uses_first_choice_only_like_legacy_adapter() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"content":"first"}},{"index":1,"delta":{"content":"second"}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delta":{},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        assert_eq!(completed["output"][0]["type"], "message");
+        assert_eq!(completed["output"][0]["content"][0]["text"], "first");
+        assert_ne!(completed["output"][0]["content"][0]["text"], "second");
+    }
+
+    // ── 边界回归(已有用例迁移)──────────────────────────────────────
+
+    #[test]
+    fn finish_reason_length_maps_to_max_output_tokens() {
+        let mut c = fixed();
+        let _ = c.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":\"length\"}]}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        assert_eq!(completed["status"], "incomplete");
+        assert_eq!(
+            completed["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+    }
+
+    // ── usage 规范化 ──────────────────────────────────────────────────
+    // Codex CLI ResponseCompleted 反序列化要求 usage.{input_tokens,output_tokens,
+    // total_tokens} 都到位;Chat 上游用的是 prompt/completion_tokens,部分
+    // provider 完全不发 usage —— 都要兜住。
+
+    #[test]
+    fn missing_upstream_usage_emits_zero_usage_block() {
+        let mut c = fixed();
+        let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 0);
+        assert_eq!(usage["output_tokens"], 0);
+        assert_eq!(usage["total_tokens"], 0);
+    }
+
+    #[test]
+    fn chat_usage_prompt_completion_remapped_to_responses() {
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 7);
+        assert_eq!(usage["output_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 10);
+        assert!(usage.get("prompt_tokens").is_none());
+        assert!(usage.get("completion_tokens").is_none());
+    }
+
+    #[test]
+    fn responses_shape_usage_passes_through() {
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"total_tokens\":10}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 7);
+        assert_eq!(usage["output_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 10);
+    }
+
+    #[test]
+    fn chat_usage_subdetails_remapped_to_responses_subdetails() {
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":1}}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 2);
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 1);
+        assert!(usage.get("prompt_tokens_details").is_none());
+        assert!(usage.get("completion_tokens_details").is_none());
+    }
+
+    // ── null 容忍(MiMo 真实帧形态)─────────────────────────────────────
+    // 上游在每个 delta 里把无关字段显式发 null:
+    //   {"delta":{"content":null,"reasoning_content":"...","tool_calls":null}}
+    // 直接 `Vec<ChatToolCallDelta>` 反序列化 null 会报错,导致整帧被
+    // serde_json::from_str 静默丢弃,文本和 reasoning 全丢失。
+
+    #[test]
+    fn delta_with_explicit_null_tool_calls_does_not_drop_content() {
+        let mut c = fixed();
+        let _ = c.feed(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":null,\"tool_calls\":null},\"finish_reason\":null}]}\n\n".as_bytes(),
+        );
+        let out = c.feed(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\",\"reasoning_content\":null,\"tool_calls\":null,\"role\":null},\"finish_reason\":null}]}\n\n".as_bytes(),
+        );
+        let events = parse_emitted(&out);
+        let kinds = names(&events);
+        assert!(
+            kinds.contains(&"response.output_text.delta"),
+            "delta.content 必须 emit;实际事件: {kinds:?}"
+        );
+        let delta_event = events
+            .iter()
+            .find(|(n, _)| n == "response.output_text.delta")
+            .unwrap();
+        assert_eq!(delta_event.1["delta"], "你好");
+    }
+
+    #[test]
+    fn delta_with_explicit_null_tool_calls_keeps_reasoning_content() {
+        let mut c = fixed();
+        let out = c.feed(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"reasoning_content\":\"想想\",\"tool_calls\":null,\"role\":null},\"finish_reason\":null}]}\n\n".as_bytes(),
+        );
+        let events = parse_emitted(&out);
+        // open_reasoning 注入一次 `**Thinking**\n\n` prefix delta(让 Codex CLI
+        // TUI 走 bold-header 显示分支),然后再 emit 上游 "想想" delta —— 总计 2 条。
+        let reasoning_deltas: Vec<&Value> = events
+            .iter()
+            .filter(|(n, _)| n == "response.reasoning_summary_text.delta")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            reasoning_deltas.len(),
+            2,
+            "应有 prefix + 上游 reasoning_content 共两条 delta;实际事件: {:?}",
+            names(&events)
+        );
+        assert_eq!(reasoning_deltas[0]["delta"], "**Thinking**\n\n");
+        assert_eq!(reasoning_deltas[1]["delta"], "想想");
+    }
+
+    #[test]
+    fn chunk_with_explicit_null_choices_is_not_dropped() {
+        // 部分聚合层在 usage-only 帧里写 `choices: null` 而非 `[]`
+        let mut c = fixed();
+        let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n");
+        let _ = c.feed(b"data: {\"choices\":null,\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 3);
+        assert_eq!(usage["output_tokens"], 1);
+        assert_eq!(usage["total_tokens"], 4);
+    }
+
+    #[test]
+    fn missing_total_tokens_is_computed_from_input_output_sum() {
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = c.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6}}\n\n",
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 4);
+        assert_eq!(usage["output_tokens"], 6);
+        assert_eq!(usage["total_tokens"], 10);
+    }
+}

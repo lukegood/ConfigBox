@@ -1,0 +1,20 @@
+[package]
+name = "codex-gateway"
+version = "0.1.0"
+description = "Headless Codex App Transfer gateway sidecar for ConfigBox"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "codex-gateway"
+path = "src/main.rs"
+
+[dependencies]
+codex-app-transfer-proxy = { path = "../proxy" }
+codex-app-transfer-registry = { path = "../registry" }
+axum = { version = "0.8", features = ["http1", "http2", "tokio", "ws"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }

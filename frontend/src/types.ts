@@ -14,7 +14,7 @@ export type ConfigFile = ToolFile & {
 };
 
 export type Tool = {
-  id: "claude" | "codex";
+  id: ToolId;
   name: string;
   format: ConfigFormat;
   profileExt: string;
@@ -61,4 +61,44 @@ export type BackupDoc = {
   files?: ConfigFile[];
 };
 
-export type ViewMode = "active" | "profile" | "backup";
+export type ToolId = "claude" | "codex";
+
+export type ViewMode = "active" | "profile" | "backup" | "gateway";
+
+export type GatewayProvider = {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiFormat: string;
+  authScheme: string;
+  models: Record<string, string>;
+  hasApiKey?: boolean;
+};
+
+export type GatewayConfig = {
+  activeProvider: string | null;
+  gatewayApiKey: string;
+  gatewayApiKeyPresent: boolean;
+  providers: GatewayProvider[];
+  path: string;
+  logDir: string;
+  settings: {
+    proxyPort: number;
+  };
+};
+
+export type GatewayStatus = {
+  running: boolean;
+  managedProcess: boolean;
+  healthy: boolean;
+  pid: number | null;
+  host: string;
+  publicBaseUrl: string;
+  port: number;
+  configPath: string;
+  logDir: string;
+  activeProvider: string | null;
+  providerCount: number;
+  codexRestored?: boolean;
+  codexApplied?: boolean;
+};

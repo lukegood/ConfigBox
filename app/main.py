@@ -34,14 +34,18 @@ from .storage import (
     save_active,
     save_profile,
 )
+from . import gateway
 
 
-app = FastAPI(title="ConfigBox", version="1.0.0")
+app = FastAPI(title="ConfigBox", version="0.3.0")
 
 
 @app.on_event("startup")
 def startup() -> None:
     ensure_all()
+    gateway.ensure_gateway()
+    gateway.startup_clear_logs()
+    gateway.startup_recover_codex()
 
 
 @app.exception_handler(APIError)
@@ -160,6 +164,83 @@ def get_backup(tool: str, backup_name: str, user: AuthUser = Depends(require_use
 @app.post("/api/backups/{tool}/{backup_name}/restore")
 def restore(tool: str, backup_name: str, user: AuthUser = Depends(require_user)) -> dict:
     return restore_backup(get_tool(tool), backup_name)
+
+
+@app.get("/api/gateway/config")
+def gateway_config(user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.public_config()
+
+
+@app.put("/api/gateway/config")
+def put_gateway_config(payload: dict, user: AuthUser = Depends(require_user)) -> dict:
+    gateway.write_config(payload)
+    return gateway.public_config()
+
+
+@app.get("/api/gateway/status")
+def gateway_status(user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.gateway_status()
+
+
+@app.post("/api/gateway/start")
+def gateway_start(user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.start_gateway()
+
+
+@app.post("/api/gateway/stop")
+def gateway_stop(user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.stop_gateway()
+
+
+@app.post("/api/gateway/restart")
+def gateway_restart(user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.restart_gateway()
+
+
+@app.get("/api/gateway/logs")
+def gateway_logs(user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.read_logs()
+
+
+@app.post("/api/gateway/logs/clear")
+def gateway_clear_logs(user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.clear_logs()
+
+
+@app.get("/api/gateway/providers")
+def gateway_providers(user: AuthUser = Depends(require_user)) -> list[dict]:
+    return gateway.list_providers()
+
+
+@app.post("/api/gateway/providers")
+def gateway_add_provider(payload: dict, user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.add_provider(payload)
+
+
+@app.put("/api/gateway/providers/{provider_id}")
+def gateway_update_provider(provider_id: str, payload: dict, user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.update_provider(provider_id, payload)
+
+
+@app.delete("/api/gateway/providers/{provider_id}", response_model=OkResponse)
+def gateway_delete_provider(provider_id: str, user: AuthUser = Depends(require_user)) -> OkResponse:
+    gateway.delete_provider(provider_id)
+    return OkResponse()
+
+
+@app.post("/api/gateway/providers/{provider_id}/activate")
+def gateway_activate_provider(provider_id: str, user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.activate_provider(provider_id)
+
+
+@app.post("/api/gateway/apply")
+def gateway_apply(user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.apply_codex()
+
+
+@app.post("/api/gateway/restore")
+def gateway_restore(user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.restore_codex()
 
 
 static_dir = Path(__file__).parent / "static"
