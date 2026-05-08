@@ -1,16 +1,14 @@
 <div align="center">
   <img src="logo_config.png" alt="configbox" width="800">
-  <h1>ConfigBox: 服务器上的Claude Code & Codex配置可视化切换工具</h1>
+  <h1>ConfigBox: Web端的Claude Code & Codex配置可视化切换工具</h1>
   <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/lukegood/ConfigBox">
   <img alt="GitHub forks" src="https://img.shields.io/github/forks/lukegood/ConfigBox">
   <img alt="GitHub License" src="https://img.shields.io/github/license/lukegood/ConfigBox">
 </div>
 
-ConfigBox是一个Docker化Web管理工具，用于可视化管理Linux服务器中的claude code和codex工具配置文件，方便轻松修改配置和切换配置。
-默认配置文件地址为:
+ConfigBox是一个Docker化Web管理工具，用于可视化管理claude code和codex工具配置文件，方便轻松修改配置和切换配置。
 
-- Claude Code：`${HOME}/.claude/settings.json`
-- Codex：`${HOME}/.codex/auth.json` + `${HOME}/.codex/config.toml`
+**ConfigBox同时适用于本地和Linux服务器上的配置切换管理！**
 
 ## 最近更新
 :loudspeaker: 2026.05.06  发布v0.2.0, 优化了codex的配置方式
