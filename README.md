@@ -6,7 +6,7 @@
   <img alt="GitHub License" src="https://img.shields.io/github/license/lukegood/ConfigBox">
 </div>
 
-ConfigBox是一个Docker化Web管理工具，用于可视化管理claude code和codex工具配置文件，方便轻松修改配置和切换配置。
+ConfigBox是一个Docker化Web管理工具，用于可视化管理claude code和codex工具配置文件，方便轻松修改配置和切换配置。同时，支持第三方模型接入Codex。
 
 **ConfigBox同时适用于本地和Linux服务器上的配置切换管理！**
 
