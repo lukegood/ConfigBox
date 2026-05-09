@@ -10,7 +10,7 @@
   </p>
 </div>
 
-ConfigBox 是一个 Docker 化的 Web 管理工具，用于在浏览器中可视化管理和切换 Claude Code 与 Codex 的配置文件。ConfigBox 具备 Codex 转发功能，支持第三方模型接入 Codex。ConfigBox 支持 Linux、macOS 和 Windows。
+ConfigBox是一个Docker化的Web管理工具，用于在浏览器中可视化管理和切换 Claude Code 与 Codex 的配置文件。ConfigBox具备Codex转发功能，支持第三方模型接入Codex。ConfigBox支持Linux、macOS 和 Windows平台。
 
 ## 最近更新
 
@@ -18,7 +18,7 @@ ConfigBox 是一个 Docker 化的 Web 管理工具，用于在浏览器中可视
 
 :loudspeaker: 2026.05.07 发布 v0.3.3，内置基于 [Cmochance/codex-app-transfer](https://github.com/Cmochance/codex-app-transfer) 的 Codex 转发能力，支持国模等第三方模型接入 Codex，修复转发 MiniMax 模型消息时的报错，修复前端错误
 
-:loudspeaker: 2026.05.09 发布 v0.4.0，新增 Linux / macOS / Windows 分平台 Docker 部署目录，补充中英文 README 和跨平台构建说明
+:loudspeaker: 2026.05.09 发布 v0.4.0，新增macOS / Windows 平台 Docker支持
 
 ## 项目截图
 
@@ -27,7 +27,6 @@ ConfigBox 是一个 Docker 化的 Web 管理工具，用于在浏览器中可视
 ## 运行要求
 
 - 已安装 Docker
-- 宿主机 `.claude`、`.codex`、`.configbox` 目录可被 Docker bind mount
 
 ## 安装方式
 
@@ -59,7 +58,7 @@ id -g
 ```
 - 编辑环境变量
 
-编辑 `.env`，把 `yourname` 改成你的用户名，并把 `CONFIGBOX_UID` / `CONFIGBOX_GID` 改成上面 `id -u` / `id -g` 的输出。这两个值在 Linux 下必填；不填写时 Docker Compose 会提前报错，避免容器启动后再遇到目录权限问题。
+编辑 `.env`，把 `yourname` 改成你的用户名，并把 `CONFIGBOX_UID` / `CONFIGBOX_GID` 改成上面 `id -u` / `id -g` 的输出。这两个值在 Linux 下必填，否则会报错。
 
 - 设置登录密码
 
@@ -138,7 +137,7 @@ if (!(Test-Path "$env:USERPROFILE\.codex\config.toml")) { New-Item -ItemType Fil
 
 - 编辑环境变量
 
-编辑 `.env`，把 `C:/Users/yourname` 改成你的用户目录。Windows 路径建议使用正斜杠，例如 `C:/Users/Alice/.codex`。
+编辑 `.env`，把 `C:/Users/yourname` 改成你的用户目录。Windows 路径必须使用正斜杠，例如 `C:/Users/Alice/.codex`。
 
 - 设置登录密码
 
@@ -168,8 +167,6 @@ http://主机IP:8787
 ```
 
 ### 方式二: 从源码本地 Docker 构建
-
-本地构建会在 Docker 中编译前端、后端镜像和内置 `codex-gateway`。先进入对应平台目录并准备 `.env`，然后叠加 `docker-compose.build.yml`。
 
 <details>
 <summary><strong>Linux</strong></summary>
@@ -201,7 +198,7 @@ id -g
 
 - 编辑环境变量
 
-编辑 `.env`，把 `yourname` 改成你的用户名，并把 `CONFIGBOX_UID` / `CONFIGBOX_GID` 改成上面 `id -u` / `id -g` 的输出。这两个值在 Linux 下必填；不填写时 Docker Compose 会提前报错，避免容器启动后再遇到目录权限问题。
+编辑 `.env`，把 `yourname` 改成你的用户名，并把 `CONFIGBOX_UID` / `CONFIGBOX_GID` 改成上面 `id -u` / `id -g` 的输出。这两个值在 Linux 下必填；不填写时会报错。
 
 - 构建镜像
 
@@ -293,7 +290,7 @@ if (!(Test-Path "$env:USERPROFILE\.codex\config.toml")) { New-Item -ItemType Fil
 
 - 编辑环境变量
 
-编辑 `.env`，把 `C:/Users/yourname` 改成你的用户目录。Windows 路径建议使用正斜杠，例如 `C:/Users/Alice/.codex`。
+编辑 `.env`，把 `C:/Users/yourname` 改成你的用户目录。Windows 路径使用正斜杠，例如 `C:/Users/Alice/.codex`。
 
 - 构建镜像
 
@@ -325,7 +322,7 @@ PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 ## 环境变量
 
-每个平台目录都有自己的 `.env.example`。主要变量如下：
+主要变量如下：
 
 | 变量 | 说明 |
 | --- | --- |
@@ -361,7 +358,7 @@ ports:
   - "127.0.0.1:18080:18080"
 ```
 
-Web UI 通过 `8787` 访问。Codex Gateway 默认只把宿主机 `127.0.0.1:18080` 映射到容器，供同一台机器上的 Codex CLI / VS Code Codex 插件访问。
+Web UI 通过 `8787` 访问。Codex Gateway默认只把宿主机 `127.0.0.1:18080` 映射到容器，供同一台机器上的 Codex CLI / VS Code Codex 插件访问。
 
 如果使用 HTTPS 反向代理，请设置：
 
@@ -465,7 +462,7 @@ CONFIGBOX_DATA_DIR=C:/Users/yourname/.configbox
 
 ### Windows/macOS 挂载目录不可写怎么办？
 
-确认 Docker 运行时允许共享你的用户目录。Docker Desktop、OrbStack、Colima 等工具都可能有目录共享或文件访问权限设置。
+确认 Docker 运行时允许共享你的用户目录。Docker Desktop等工具都可能有目录共享或文件访问权限设置。
 
 ### Linux 容器反复重启并提示 /data 权限错误怎么办？
 
