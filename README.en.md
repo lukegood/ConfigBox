@@ -20,6 +20,8 @@ ConfigBox is a Dockerized web management tool for viewing, editing, and switchin
 
 :loudspeaker: 2026.05.09 v0.4.0, added platform-specific Docker deployment directories for Linux, macOS, and Windows, plus bilingual README and cross-platform build instructions
 
+:loudspeaker: 2026.05.10 v0.5.0, added OpenCode support
+
 ## Screenshot
 
 <img src="yanshi.png" alt="ConfigBox screenshot" width="800">
