@@ -1,13 +1,13 @@
 <div align="center">
   <img src="logo_config.png" alt="ConfigBox" width="800">
   <h1>ConfigBox: Web-Based Configuration Switcher for Claude Code & Codex</h1>
+  <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/lukegood/ConfigBox">
+  <img alt="GitHub forks" src="https://img.shields.io/github/forks/lukegood/ConfigBox">
+  <img alt="GitHub License" src="https://img.shields.io/github/license/lukegood/ConfigBox">
   <p>
     <a href="README.md">简体中文</a> |
     <a href="README.en.md">English</a>
   </p>
-  <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/lukegood/ConfigBox">
-  <img alt="GitHub forks" src="https://img.shields.io/github/forks/lukegood/ConfigBox">
-  <img alt="GitHub License" src="https://img.shields.io/github/license/lukegood/ConfigBox">
 </div>
 
 ConfigBox is a Dockerized web management tool for viewing, editing, and switching Claude Code and Codex configuration files from your browser. ConfigBox includes Codex forwarding capabilities, allowing third-party models to connect to Codex. ConfigBox supports Linux, macOS, and Windows.

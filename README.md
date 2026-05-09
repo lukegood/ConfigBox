@@ -1,13 +1,13 @@
 <div align="center">
   <img src="logo_config.png" alt="ConfigBox" width="800">
   <h1>ConfigBox: Web 端的Claude Code & Codex配置切换器</h1>
+  <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/lukegood/ConfigBox">
+  <img alt="GitHub forks" src="https://img.shields.io/github/forks/lukegood/ConfigBox">
+  <img alt="GitHub License" src="https://img.shields.io/github/license/lukegood/ConfigBox">
   <p>
     <a href="README.md">简体中文</a> |
     <a href="README.en.md">English</a>
   </p>
-  <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/lukegood/ConfigBox">
-  <img alt="GitHub forks" src="https://img.shields.io/github/forks/lukegood/ConfigBox">
-  <img alt="GitHub License" src="https://img.shields.io/github/license/lukegood/ConfigBox">
 </div>
 
 ConfigBox 是一个 Docker 化的 Web 管理工具，用于在浏览器中可视化管理和切换 Claude Code 与 Codex 的配置文件。ConfigBox 具备 Codex 转发功能，支持第三方模型接入 Codex。ConfigBox 支持 Linux、macOS 和 Windows。
