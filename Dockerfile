@@ -1,4 +1,4 @@
-FROM node:22-alpine AS frontend
+FROM node:22-bookworm-slim AS frontend
 
 WORKDIR /ui
 ARG NPM_REGISTRY=https://registry.npmmirror.com

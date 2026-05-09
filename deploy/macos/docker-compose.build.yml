@@ -1,0 +1,8 @@
+services:
+  configbox:
+    image: configbox:latest
+    build:
+      context: ../..
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
