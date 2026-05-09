@@ -1,6 +1,6 @@
 <div align="center">
   <img src="logo_config.png" alt="ConfigBox" width="800">
-  <h1>ConfigBox: Web-Based Configuration Switcher for Claude Code & Codex</h1>
+  <h1>ConfigBox: Web-Based Configuration Switcher for Claude Code / Codex / OpenCode</h1>
   <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/lukegood/ConfigBox">
   <img alt="GitHub forks" src="https://img.shields.io/github/forks/lukegood/ConfigBox">
   <img alt="GitHub License" src="https://img.shields.io/github/license/lukegood/ConfigBox">
@@ -10,7 +10,7 @@
   </p>
 </div>
 
-ConfigBox is a Dockerized web management tool for viewing, editing, and switching Claude Code and Codex configuration files from your browser. ConfigBox includes Codex forwarding capabilities, allowing third-party models to connect to Codex. ConfigBox supports Linux, macOS, and Windows.
+ConfigBox is a Dockerized web management tool for viewing, editing, and switching Claude Code, Codex, and OpenCode configuration files from your browser. ConfigBox includes Codex forwarding capabilities, allowing third-party models to connect to Codex. ConfigBox supports Linux, macOS, and Windows.
 
 ## Recent Updates
 
@@ -48,10 +48,11 @@ cd ConfigBox
 ```bash
 cd deploy/linux
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
+[ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
 ```
 
 - Find your user id:
@@ -95,10 +96,11 @@ cd ConfigBox
 ```bash
 cd deploy/macos
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
+[ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
 ```
 
 - Edit environment variables
@@ -135,10 +137,11 @@ Set-Location ConfigBox
 ```powershell
 Set-Location deploy\windows
 Copy-Item .env.example .env
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.configbox" | Out-Null
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.config\opencode", "$env:USERPROFILE\.configbox" | Out-Null
 if (!(Test-Path "$env:USERPROFILE\.claude\settings.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.claude\settings.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\auth.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.codex\auth.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\config.toml")) { New-Item -ItemType File -Force "$env:USERPROFILE\.codex\config.toml" | Out-Null }
+if (!(Test-Path "$env:USERPROFILE\.config\opencode\config.json")) { '{"$schema":"https://opencode.ai/config.json","provider":{}}' | Set-Content -Encoding ascii "$env:USERPROFILE\.config\opencode\config.json" }
 ```
 
 - Edit environment variables
@@ -191,10 +194,11 @@ cd ConfigBox
 ```bash
 cd deploy/linux
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
+[ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
 ```
 
 - Find your user id:
@@ -244,10 +248,11 @@ cd ConfigBox
 ```bash
 cd deploy/macos
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
+[ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
 ```
 
 - Edit environment variables
@@ -290,10 +295,11 @@ Set-Location ConfigBox
 ```powershell
 Set-Location deploy\windows
 Copy-Item .env.example .env
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.configbox" | Out-Null
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.config\opencode", "$env:USERPROFILE\.configbox" | Out-Null
 if (!(Test-Path "$env:USERPROFILE\.claude\settings.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.claude\settings.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\auth.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.codex\auth.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\config.toml")) { New-Item -ItemType File -Force "$env:USERPROFILE\.codex\config.toml" | Out-Null }
+if (!(Test-Path "$env:USERPROFILE\.config\opencode\config.json")) { '{"$schema":"https://opencode.ai/config.json","provider":{}}' | Set-Content -Encoding ascii "$env:USERPROFILE\.config\opencode\config.json" }
 ```
 
 - Edit environment variables
@@ -336,6 +342,7 @@ Each platform directory has its own `.env.example`. Main variables:
 | --- | --- |
 | `CLAUDE_DIR` | Host Claude Code config directory, mounted to `/config/claude` |
 | `CODEX_DIR` | Host Codex config directory, mounted to `/config/codex` |
+| `OPENCODE_DIR` | Host OpenCode config directory, mounted to `/config/opencode` |
 | `CONFIGBOX_DATA_DIR` | Profiles, backups, gateway config, and logs |
 | `CONFIGBOX_UID` / `CONFIGBOX_GID` | Linux only. Required container user, usually `id -u` / `id -g` |
 | `APP_USERNAME` | Web login username |
@@ -386,11 +393,12 @@ APP_COOKIE_SECURE=false
 
 <img src="yanshi.png" alt="ConfigBox screenshot" width="800">
 
-Choose `Claude` or `Codex` on the left, then open `Current Config`. These are the real active config files:
+Choose `Claude`, `Codex`, or `OpenCode` on the left, then open `Current Config`. These are the real active config files:
 
 ```text
 Claude -> .claude/settings.json
 Codex  -> .codex/auth.json + .codex/config.toml
+OpenCode -> .config/opencode/config.json
 ```
 
 When you save, ConfigBox validates JSON/TOML, backs up the old version, then writes atomically. If a file changed outside the web UI after the page was opened, ConfigBox reports a conflict instead of overwriting it.
@@ -405,6 +413,10 @@ profiles/codex/
 ```
 
 Activating a Profile overwrites the real config files. A Codex Profile stores and activates both `auth.json` and `config.toml` together.
+
+### OpenCode Provider / Model Editing
+
+Choose `OpenCode` on the left to edit the full `config.json` directly. When the active config or a Profile is editable, the editor shows an OpenCode helper above the file editor for adding Providers or Models. These actions first update the editor content; click `Save` to write the real file.
 
 ### Codex Gateway for Third-Party Models
 
@@ -430,6 +442,7 @@ Container paths:
 /config/claude/settings.json
 /config/codex/auth.json
 /config/codex/config.toml
+/config/opencode/config.json
 /data
 /data/codex-gateway/config.json
 /data/codex-gateway/logs/
@@ -440,6 +453,7 @@ Host mappings:
 ```text
 CLAUDE_DIR         -> /config/claude
 CODEX_DIR          -> /config/codex
+OPENCODE_DIR       -> /config/opencode
 CONFIGBOX_DATA_DIR -> /data
 ```
 
@@ -463,6 +477,7 @@ Use forward slashes in `.env`:
 ```env
 CLAUDE_DIR=C:/Users/yourname/.claude
 CODEX_DIR=C:/Users/yourname/.codex
+OPENCODE_DIR=C:/Users/yourname/.config/opencode
 CONFIGBOX_DATA_DIR=C:/Users/yourname/.configbox
 ```
 
@@ -500,7 +515,7 @@ Recommendations:
 - Use a strong random `SESSION_SECRET`
 - Use HTTPS for public deployments
 - Restrict access with firewall or security-group rules whenever possible
-- Do not commit `.env`, `.claude`, `.codex`, or `.configbox` to public repositories
+- Do not commit `.env`, `.claude`, `.codex`, `.config/opencode`, or `.configbox` to public repositories
 
 ## Credits
 

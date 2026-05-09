@@ -30,7 +30,7 @@ COPY app ./app
 COPY --from=frontend /ui/dist ./app/static
 COPY --from=gateway /gateway/target/release/codex-gateway /usr/local/bin/codex-gateway
 
-RUN mkdir -p /data /config/claude /config/codex \
+RUN mkdir -p /data /config/claude /config/codex /config/opencode \
     && chmod -R a+rX /app \
     && chmod a+rx /usr/local/bin/codex-gateway \
     && chmod -R 0777 /data /config

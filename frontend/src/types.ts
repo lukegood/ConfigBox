@@ -61,7 +61,7 @@ export type BackupDoc = {
   files?: ConfigFile[];
 };
 
-export type ToolId = "claude" | "codex";
+export type ToolId = "claude" | "codex" | "opencode";
 
 export type ViewMode = "active" | "profile" | "backup" | "gateway";
 
