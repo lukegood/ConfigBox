@@ -1,6 +1,6 @@
 <div align="center">
   <img src="logo_config.png" alt="ConfigBox" width="800">
-  <h1>ConfigBox: Web 端的Claude Code & Codex配置切换器</h1>
+  <h1>ConfigBox: Web端的Claude Code / Codex / OpenCode配置切换器</h1>
   <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/lukegood/ConfigBox">
   <img alt="GitHub forks" src="https://img.shields.io/github/forks/lukegood/ConfigBox">
   <img alt="GitHub License" src="https://img.shields.io/github/license/lukegood/ConfigBox">
@@ -10,7 +10,7 @@
   </p>
 </div>
 
-ConfigBox是一个Docker化的Web管理工具，用于在浏览器中可视化管理和切换 Claude Code 与 Codex 的配置文件。ConfigBox具备Codex转发功能，支持第三方模型接入Codex。ConfigBox支持Linux、macOS 和 Windows平台。
+ConfigBox是一个Docker化的Web管理工具，用于在浏览器中可视化管理和切换 Claude Code、Codex 与OpenCode的配置文件。ConfigBox具备Codex转发功能，支持第三方模型接入Codex。ConfigBox支持Linux、macOS 和 Windows平台。
 
 ## 最近更新
 
@@ -46,10 +46,11 @@ cd ConfigBox
 ```bash
 cd deploy/linux
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
+[ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
 ```
 - 查找id
 ```bash
@@ -89,10 +90,11 @@ cd ConfigBox
 ```bash
 cd deploy/macos
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
+[ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
 ```
 
 - 编辑环境变量
@@ -129,10 +131,11 @@ Set-Location ConfigBox
 ```powershell
 Set-Location deploy\windows
 Copy-Item .env.example .env
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.configbox" | Out-Null
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.config\opencode", "$env:USERPROFILE\.configbox" | Out-Null
 if (!(Test-Path "$env:USERPROFILE\.claude\settings.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.claude\settings.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\auth.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.codex\auth.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\config.toml")) { New-Item -ItemType File -Force "$env:USERPROFILE\.codex\config.toml" | Out-Null }
+if (!(Test-Path "$env:USERPROFILE\.config\opencode\config.json")) { '{"$schema":"https://opencode.ai/config.json","provider":{}}' | Set-Content -Encoding ascii "$env:USERPROFILE\.config\opencode\config.json" }
 ```
 
 - 编辑环境变量
@@ -183,10 +186,11 @@ cd ConfigBox
 ```bash
 cd deploy/linux
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
+[ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
 ```
 
 - 查找 id
@@ -236,10 +240,11 @@ cd ConfigBox
 ```bash
 cd deploy/macos
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
+[ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
 ```
 
 - 编辑环境变量
@@ -282,10 +287,11 @@ Set-Location ConfigBox
 ```powershell
 Set-Location deploy\windows
 Copy-Item .env.example .env
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.configbox" | Out-Null
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.config\opencode", "$env:USERPROFILE\.configbox" | Out-Null
 if (!(Test-Path "$env:USERPROFILE\.claude\settings.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.claude\settings.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\auth.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.codex\auth.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\config.toml")) { New-Item -ItemType File -Force "$env:USERPROFILE\.codex\config.toml" | Out-Null }
+if (!(Test-Path "$env:USERPROFILE\.config\opencode\config.json")) { '{"$schema":"https://opencode.ai/config.json","provider":{}}' | Set-Content -Encoding ascii "$env:USERPROFILE\.config\opencode\config.json" }
 ```
 
 - 编辑环境变量
@@ -328,6 +334,7 @@ PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 | --- | --- |
 | `CLAUDE_DIR` | 宿主机 Claude Code 配置目录，挂载到容器 `/config/claude` |
 | `CODEX_DIR` | 宿主机 Codex 配置目录，挂载到容器 `/config/codex` |
+| `OPENCODE_DIR` | 宿主机 OpenCode 配置目录，挂载到容器 `/config/opencode` |
 | `CONFIGBOX_DATA_DIR` | ConfigBox 的 profiles、backups、gateway 配置和日志目录 |
 | `CONFIGBOX_UID` / `CONFIGBOX_GID` | Linux 专用，容器运行用户，必填，建议设置为 `id -u` / `id -g` |
 | `APP_USERNAME` | Web 登录用户名 |
@@ -378,11 +385,12 @@ APP_COOKIE_SECURE=false
 
 <img src="yanshi.png" alt="ConfigBox screenshot" width="800">
 
-左侧选择 `Claude` 或 `Codex`，点击 `当前配置`。这里编辑的是当前真实生效配置：
+左侧选择 `Claude`、`Codex` 或 `OpenCode`，点击 `当前配置`。这里编辑的是当前真实生效配置：
 
 ```text
 Claude -> .claude/settings.json
 Codex  -> .codex/auth.json + .codex/config.toml
+OpenCode -> .config/opencode/config.json
 ```
 
 点击 `保存` 时，系统会校验 JSON/TOML、备份旧版本，然后原子写入新版本。如果文件在页面打开后被外部终端修改，保存时会提示冲突，避免覆盖外部修改。
@@ -397,6 +405,10 @@ profiles/codex/
 ```
 
 点击某个 `Profile` 后可以编辑它。点击 `启用` 时，系统会把该 `Profile` 覆盖到真实配置文件中，完成配置切换。Codex 的一个 Profile 会同时保存 `auth.json` 和 `config.toml`。
+
+### OpenCode Provider / Model 编辑
+
+左侧选择 `OpenCode` 后，可以直接编辑完整 `config.json`。当前配置或 Profile 处于可编辑状态时，编辑器上方会显示 OpenCode 配置助手，可通过按钮添加 Provider 或 Model。添加动作会先写入编辑器内容，确认无误后点击 `保存` 才会写入真实文件。
 
 ### Codex Gateway 接入第三方模型
 
@@ -422,6 +434,7 @@ CONFIGBOX_DATA_DIR/codex-gateway/logs/
 /config/claude/settings.json
 /config/codex/auth.json
 /config/codex/config.toml
+/config/opencode/config.json
 /data
 /data/codex-gateway/config.json
 /data/codex-gateway/logs/
@@ -432,6 +445,7 @@ CONFIGBOX_DATA_DIR/codex-gateway/logs/
 ```text
 CLAUDE_DIR         -> /config/claude
 CODEX_DIR          -> /config/codex
+OPENCODE_DIR       -> /config/opencode
 CONFIGBOX_DATA_DIR -> /data
 ```
 
@@ -455,6 +469,7 @@ curl -u admin:你的密码 http://127.0.0.1:8787/api/configs/codex/active
 ```env
 CLAUDE_DIR=C:/Users/yourname/.claude
 CODEX_DIR=C:/Users/yourname/.codex
+OPENCODE_DIR=C:/Users/yourname/.config/opencode
 CONFIGBOX_DATA_DIR=C:/Users/yourname/.configbox
 ```
 
@@ -492,7 +507,7 @@ ConfigBox 能查看和编辑敏感配置文件，请把它当作管理员工具�
 - 使用强随机 `SESSION_SECRET`
 - 公网部署时使用 HTTPS
 - 尽量通过防火墙、安全组限制访问来源
-- 不要把 `.env`、`.claude`、`.codex`、`.configbox` 提交到公开仓库
+- 不要把 `.env`、`.claude`、`.codex`、`.config/opencode`、`.configbox` 提交到公开仓库
 
 ## 致谢与社区支持
 

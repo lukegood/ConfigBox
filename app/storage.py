@@ -498,6 +498,19 @@ def list_backups(tool: ToolConfig) -> list[dict]:
     return backups
 
 
+def clear_backups(tool: ToolConfig) -> int:
+    ensure_dirs(tool)
+    removed = 0
+    for path in list(tool.backup_dir.iterdir()):
+        if path.is_dir():
+            shutil.rmtree(path)
+            removed += 1
+        elif path.is_file():
+            path.unlink(missing_ok=True)
+            removed += 1
+    return removed
+
+
 def backup_path(tool: ToolConfig, name: str) -> Path:
     validate_backup_name(name)
     path = tool.backup_dir / name
@@ -519,6 +532,16 @@ def read_backup_contents(tool: ToolConfig, name: str) -> tuple[dict[str, str], f
         }
         return contents, tree_mtime(path), path
     return {tool.primary_file.id: path.read_text(encoding="utf-8")}, file_mtime(path), path
+
+
+def delete_backup(tool: ToolConfig, name: str) -> None:
+    path = backup_path(tool, name)
+    if not path.exists() or not (path.is_file() or path.is_dir()):
+        raise APIError("BACKUP_NOT_FOUND", "Backup not found.", 404)
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def read_backup(tool: ToolConfig, name: str) -> dict:

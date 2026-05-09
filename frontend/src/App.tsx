@@ -22,7 +22,9 @@ import {
   addGatewayProvider,
   clearGatewayLogs,
   clearAuth,
+  clearBackups,
   createProfile,
+  deleteBackup,
   deleteGatewayProvider,
   deleteProfile,
   getGatewayConfig,
@@ -72,6 +74,29 @@ type GatewayProviderForm = {
   gpt53Model: string;
 };
 
+type OpenCodeProviderForm = {
+  providerId: string;
+  name: string;
+  npm: string;
+  baseURL: string;
+  apiKey: string;
+  modelId: string;
+  modelName: string;
+};
+
+type OpenCodeModelForm = {
+  providerId: string;
+  modelId: string;
+  modelName: string;
+};
+
+type OpenCodeSummary = {
+  valid: boolean;
+  providerCount: number;
+  modelCount: number;
+  providerIds: string[];
+};
+
 const emptyGatewayProviderForm: GatewayProviderForm = {
   id: "",
   name: "",
@@ -81,6 +106,16 @@ const emptyGatewayProviderForm: GatewayProviderForm = {
   apiFormat: "openai_chat",
   defaultModel: "",
   gpt53Model: ""
+};
+
+const emptyOpenCodeProviderForm: OpenCodeProviderForm = {
+  providerId: "",
+  name: "",
+  npm: "@ai-sdk/openai-compatible",
+  baseURL: "",
+  apiKey: "",
+  modelId: "",
+  modelName: ""
 };
 
 function App() {
@@ -113,12 +148,17 @@ function App() {
   const [gatewayLogBytes, setGatewayLogBytes] = useState({ current: 0, max: 0 });
   const [gatewayProviderForm, setGatewayProviderForm] = useState<GatewayProviderForm | null>(null);
   const [gatewayRestartRequired, setGatewayRestartRequired] = useState(false);
+  const [openCodeProviderForm, setOpenCodeProviderForm] = useState<OpenCodeProviderForm | null>(null);
+  const [openCodeModelForm, setOpenCodeModelForm] = useState<OpenCodeModelForm | null>(null);
 
   const tool = useMemo(() => tools.find((item) => item.id === toolId), [tools, toolId]);
   const activeFile = useMemo(() => files.find((file) => file.id === activeFileId) ?? files[0], [files, activeFileId]);
   const activeContent = activeFile?.content ?? "";
+  const openCodeStats = useMemo(() => summarizeOpenCodeConfig(activeContent), [activeContent]);
   const dirty = filesChanged(files, savedFiles);
   const readonly = mode === "backup" || mode === "gateway";
+  const showOpenCodeAssistant =
+    toolId === "opencode" && mode !== "backup" && mode !== "gateway" && activeFile?.format === "json";
   const sensitive = files.some((file) => /api[_-]?key|token|secret|password/i.test(file.content));
   const contentLength = files.reduce((sum, file) => sum + file.content.length, 0);
 
@@ -354,6 +394,42 @@ function App() {
     }
   }
 
+  async function handleDeleteBackup() {
+    if (!selectedBackup || !window.confirm(`删除备份 "${selectedBackup}"？`)) return;
+    setLoading(true);
+    setError("");
+    try {
+      await deleteBackup(toolId, selectedBackup);
+      await loadLists();
+      await loadActive();
+      setStatus("备份已删除");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除备份失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleClearBackups() {
+    if (!backups.length) return;
+    if (!window.confirm(`删除 ${tool?.name || toolId} 的全部 ${backups.length} 个备份？`)) return;
+    setLoading(true);
+    setError("");
+    try {
+      await clearBackups(toolId);
+      await loadLists();
+      if (mode === "backup") {
+        await loadActive();
+      }
+      setSelectedBackup("");
+      setStatus("全部备份已删除");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "清空备份失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleGatewayStart() {
     setLoading(true);
     setError("");
@@ -522,6 +598,106 @@ function App() {
     }
   }
 
+  function openOpenCodeProviderForm() {
+    setOpenCodeProviderForm(emptyOpenCodeProviderForm);
+  }
+
+  function openOpenCodeModelFormDialog() {
+    const stats = summarizeOpenCodeConfig(activeContent);
+    if (!stats.valid) {
+      setError("OpenCode 配置不是合法 JSON，请先修复后再添加。");
+      return;
+    }
+    if (!stats.providerIds.length) {
+      setError("请先添加 Provider。");
+      return;
+    }
+    setOpenCodeModelForm({ providerId: stats.providerIds[0], modelId: "", modelName: "" });
+  }
+
+  function updateOpenCodeProviderForm(field: keyof OpenCodeProviderForm, value: string) {
+    setOpenCodeProviderForm((current) => (current ? { ...current, [field]: value } : current));
+  }
+
+  function updateOpenCodeModelForm(field: keyof OpenCodeModelForm, value: string) {
+    setOpenCodeModelForm((current) => (current ? { ...current, [field]: value } : current));
+  }
+
+  function handleOpenCodeProviderSubmit(event: FormEvent) {
+    event.preventDefault();
+    if (!openCodeProviderForm) return;
+    const form = trimOpenCodeProviderForm(openCodeProviderForm);
+    if (!form.providerId || !form.name || !form.npm || !form.baseURL || !form.apiKey || !form.modelId) {
+      setError("Provider ID、名称、npm、Base URL、API Key 和初始模型必填");
+      return;
+    }
+    try {
+      const doc = parseOpenCodeObject(activeContent);
+      const providers = ensurePlainObject(doc.provider);
+      if (providers[form.providerId] !== undefined) {
+        setError(`Provider "${form.providerId}" 已存在`);
+        return;
+      }
+      doc.$schema = typeof doc.$schema === "string" ? doc.$schema : "https://opencode.ai/config.json";
+      providers[form.providerId] = {
+        npm: form.npm,
+        name: form.name,
+        options: {
+          baseURL: form.baseURL,
+          apiKey: form.apiKey
+        },
+        models: {
+          [form.modelId]: {
+            name: form.modelName || form.modelId
+          }
+        }
+      };
+      doc.provider = providers;
+      updateActiveContent(formatOpenCodeConfig(doc));
+      setOpenCodeProviderForm(null);
+      setError("");
+      setStatus(`已添加 OpenCode Provider: ${form.providerId}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "添加 Provider 失败");
+    }
+  }
+
+  function handleOpenCodeModelSubmit(event: FormEvent) {
+    event.preventDefault();
+    if (!openCodeModelForm) return;
+    const providerId = openCodeModelForm.providerId.trim();
+    const modelId = openCodeModelForm.modelId.trim();
+    const modelName = openCodeModelForm.modelName.trim() || modelId;
+    if (!providerId || !modelId) {
+      setError("Provider 和模型 ID 必填");
+      return;
+    }
+    try {
+      const doc = parseOpenCodeObject(activeContent);
+      const providers = ensurePlainObject(doc.provider);
+      if (providers[providerId] === undefined) {
+        setError(`Provider "${providerId}" 不存在`);
+        return;
+      }
+      const provider = ensurePlainObject(providers[providerId]);
+      const models = ensurePlainObject(provider.models);
+      if (models[modelId] !== undefined) {
+        setError(`Model "${modelId}" 已存在`);
+        return;
+      }
+      models[modelId] = { name: modelName };
+      provider.models = models;
+      providers[providerId] = provider;
+      doc.provider = providers;
+      updateActiveContent(formatOpenCodeConfig(doc));
+      setOpenCodeModelForm(null);
+      setError("");
+      setStatus(`已添加 OpenCode Model: ${modelId}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "添加 Model 失败");
+    }
+  }
+
   function handleFormat() {
     if (!activeFile || activeFile.format !== "json") {
       setStatus("TOML 保留原格式");
@@ -659,7 +835,19 @@ function App() {
         <section className="nav-section backups">
           <div className="section-title">
             <span>Backups</span>
-            <DatabaseBackup size={15} />
+            <div className="mini-actions">
+              <span className="section-icon">
+                <DatabaseBackup size={15} />
+              </span>
+              <button
+                className="danger"
+                title="删除全部备份"
+                onClick={handleClearBackups}
+                disabled={loading || backups.length === 0}
+              >
+                <Trash2 size={15} />
+              </button>
+            </div>
           </div>
           <div className="scroll-list">
             {backups.map((item) => (
@@ -749,10 +937,15 @@ function App() {
               </>
             ) : null}
             {mode === "backup" ? (
-              <button onClick={handleRestoreBackup} disabled={loading} title="恢复备份">
-                <Play size={16} />
-                恢复
-              </button>
+              <>
+                <button onClick={handleRestoreBackup} disabled={loading} title="恢复备份">
+                  <Play size={16} />
+                  恢复
+                </button>
+                <button className="danger" onClick={handleDeleteBackup} disabled={loading} title="删除备份">
+                  <Trash2 size={16} />
+                </button>
+              </>
             ) : null}
             <button onClick={logout} title="退出">
               <LogOut size={16} />
@@ -848,8 +1041,9 @@ function App() {
               <section className="gateway-section">
                 <div className="section-title">
                   <span>Logs</span>
-                  <button onClick={handleGatewayClearLogs} disabled={loading} title="清除日志">
+                  <button className="danger" onClick={handleGatewayClearLogs} disabled={loading} title="清除日志">
                     <Trash2 size={15} />
+                    清除日志
                   </button>
                 </div>
                 <div className="log-meta">
@@ -875,7 +1069,7 @@ function App() {
             ) : null}
             {error ? <div className="banner error">{error}</div> : null}
 
-            <div className="editor-panel">
+            <div className={showOpenCodeAssistant ? "editor-panel with-helper" : "editor-panel"}>
               <div className="file-tabs" role="tablist">
                 {files.map((file) => (
                   <button
@@ -889,6 +1083,30 @@ function App() {
                   </button>
                 ))}
               </div>
+              {showOpenCodeAssistant ? (
+                <div className="opencode-helper">
+                  <div className="opencode-helper-title">
+                    <span>OpenCode 配置助手</span>
+                    <span className={openCodeStats.valid ? "pill" : "pill muted-pill"}>
+                      {openCodeStats.valid ? "JSON" : "JSON 错误"}
+                    </span>
+                  </div>
+                  <div className="opencode-helper-stats">
+                    <span>{openCodeStats.providerCount} providers</span>
+                    <span>{openCodeStats.modelCount} models</span>
+                  </div>
+                  <div className="opencode-helper-actions">
+                    <button type="button" onClick={openOpenCodeProviderForm} disabled={loading}>
+                      <FolderPlus size={15} />
+                      Provider
+                    </button>
+                    <button type="button" onClick={openOpenCodeModelFormDialog} disabled={loading}>
+                      +
+                      Model
+                    </button>
+                  </div>
+                </div>
+              ) : null}
               <div className="editor-wrap">
                 <Editor
                   key={`${toolId}-${mode}-${selectedProfile}-${selectedBackup}-${activeFile?.id ?? "file"}`}
@@ -991,6 +1209,146 @@ function App() {
           </form>
         </div>
       ) : null}
+      {openCodeProviderForm ? (
+        <div className="modal-backdrop" role="presentation">
+          <form className="provider-modal" onSubmit={handleOpenCodeProviderSubmit}>
+            <div className="modal-head">
+              <div>
+                <h3>添加 OpenCode Provider</h3>
+                <p>config.json</p>
+              </div>
+              <button type="button" onClick={() => setOpenCodeProviderForm(null)}>
+                关闭
+              </button>
+            </div>
+            <div className="provider-form-grid">
+              <label>
+                Provider ID
+                <input
+                  value={openCodeProviderForm.providerId}
+                  onChange={(event) => updateOpenCodeProviderForm("providerId", event.target.value)}
+                  placeholder="tianyiyun"
+                  autoFocus
+                />
+              </label>
+              <label>
+                名称
+                <input
+                  value={openCodeProviderForm.name}
+                  onChange={(event) => updateOpenCodeProviderForm("name", event.target.value)}
+                  placeholder="tianyiyun"
+                />
+              </label>
+              <label>
+                npm
+                <input
+                  value={openCodeProviderForm.npm}
+                  onChange={(event) => updateOpenCodeProviderForm("npm", event.target.value)}
+                  placeholder="@ai-sdk/openai-compatible"
+                />
+              </label>
+              <label>
+                Base URL
+                <input
+                  value={openCodeProviderForm.baseURL}
+                  onChange={(event) => updateOpenCodeProviderForm("baseURL", event.target.value)}
+                  placeholder="https://open.bigmodel.cn/api/coding/paas/v4"
+                />
+              </label>
+              <label>
+                API Key
+                <input
+                  value={openCodeProviderForm.apiKey}
+                  onChange={(event) => updateOpenCodeProviderForm("apiKey", event.target.value)}
+                  placeholder="sk-..."
+                  type="password"
+                />
+              </label>
+              <label>
+                初始模型 ID
+                <input
+                  value={openCodeProviderForm.modelId}
+                  onChange={(event) => updateOpenCodeProviderForm("modelId", event.target.value)}
+                  placeholder="GLM-5.1"
+                />
+              </label>
+              <label>
+                初始模型名称
+                <input
+                  value={openCodeProviderForm.modelName}
+                  onChange={(event) => updateOpenCodeProviderForm("modelName", event.target.value)}
+                  placeholder="GLM-5.1"
+                />
+              </label>
+            </div>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setOpenCodeProviderForm(null)}>
+                取消
+              </button>
+              <button className="primary" type="submit">
+                <Save size={16} />
+                添加
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+      {openCodeModelForm ? (
+        <div className="modal-backdrop" role="presentation">
+          <form className="provider-modal compact-modal" onSubmit={handleOpenCodeModelSubmit}>
+            <div className="modal-head">
+              <div>
+                <h3>添加 OpenCode Model</h3>
+                <p>config.json</p>
+              </div>
+              <button type="button" onClick={() => setOpenCodeModelForm(null)}>
+                关闭
+              </button>
+            </div>
+            <div className="provider-form-grid">
+              <label>
+                Provider
+                <select
+                  value={openCodeModelForm.providerId}
+                  onChange={(event) => updateOpenCodeModelForm("providerId", event.target.value)}
+                  autoFocus
+                >
+                  {openCodeStats.providerIds.map((providerId) => (
+                    <option key={providerId} value={providerId}>
+                      {providerId}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                模型 ID
+                <input
+                  value={openCodeModelForm.modelId}
+                  onChange={(event) => updateOpenCodeModelForm("modelId", event.target.value)}
+                  placeholder="GLM-5.1"
+                />
+              </label>
+              <label>
+                模型名称
+                <input
+                  value={openCodeModelForm.modelName}
+                  onChange={(event) => updateOpenCodeModelForm("modelName", event.target.value)}
+                  placeholder="GLM-5.1"
+                />
+              </label>
+            </div>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setOpenCodeModelForm(null)}>
+                取消
+              </button>
+              <button className="primary" type="submit">
+                <Save size={16} />
+                添加
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
     </main>
   );
 }
@@ -1032,6 +1390,63 @@ function formatBytes(bytes: number) {
     index += 1;
   }
   return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function parseOpenCodeObject(content: string): Record<string, unknown> {
+  const parsed = JSON.parse(content || "{}");
+  if (!isPlainObject(parsed)) {
+    throw new Error("OpenCode 配置根节点必须是 JSON 对象");
+  }
+  return parsed;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function ensurePlainObject(value: unknown): Record<string, unknown> {
+  return isPlainObject(value) ? value : {};
+}
+
+function summarizeOpenCodeConfig(content: string): OpenCodeSummary {
+  try {
+    const doc = parseOpenCodeObject(content);
+    const providers = ensurePlainObject(doc.provider);
+    const providerIds = Object.keys(providers);
+    const modelCount = Object.values(providers).reduce<number>((sum, provider) => {
+      const providerDoc = ensurePlainObject(provider);
+      return sum + Object.keys(ensurePlainObject(providerDoc.models)).length;
+    }, 0);
+    return {
+      valid: true,
+      providerCount: providerIds.length,
+      modelCount,
+      providerIds
+    };
+  } catch {
+    return {
+      valid: false,
+      providerCount: 0,
+      modelCount: 0,
+      providerIds: []
+    };
+  }
+}
+
+function trimOpenCodeProviderForm(form: OpenCodeProviderForm): OpenCodeProviderForm {
+  return {
+    providerId: form.providerId.trim(),
+    name: form.name.trim(),
+    npm: form.npm.trim(),
+    baseURL: form.baseURL.trim(),
+    apiKey: form.apiKey.trim(),
+    modelId: form.modelId.trim(),
+    modelName: form.modelName.trim()
+  };
+}
+
+function formatOpenCodeConfig(doc: Record<string, unknown>) {
+  return JSON.stringify(doc, null, 2) + "\n";
 }
 
 export default App;

@@ -17,6 +17,7 @@ services:
       CLAUDE_CONFIG_PATH: /config/claude/settings.json
       CODEX_CONFIG_PATH: /config/codex/auth.json
       CODEX_CONFIG_TOML_PATH: /config/codex/config.toml
+      OPENCODE_CONFIG_PATH: /config/opencode/config.json
       CODEX_GATEWAY_HOST: ${CODEX_GATEWAY_HOST:-0.0.0.0}
       CODEX_GATEWAY_PORT: ${CODEX_GATEWAY_PORT:-18080}
       CODEX_GATEWAY_PUBLIC_HOST: ${CODEX_GATEWAY_PUBLIC_HOST:-127.0.0.1}
@@ -30,6 +31,9 @@ services:
       - type: bind
         source: ${CODEX_DIR:?Set CODEX_DIR in .env}
         target: /config/codex
+      - type: bind
+        source: ${OPENCODE_DIR:?Set OPENCODE_DIR in .env}
+        target: /config/opencode
       - type: bind
         source: ${CONFIGBOX_DATA_DIR:?Set CONFIGBOX_DATA_DIR in .env}
         target: /data

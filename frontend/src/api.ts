@@ -120,6 +120,14 @@ export async function getBackup(tool: string, backupName: string) {
   return request<BackupDoc>(`/api/backups/${tool}/${backupName}`);
 }
 
+export async function deleteBackup(tool: string, backupName: string) {
+  return request<{ ok: boolean }>(`/api/backups/${tool}/${backupName}`, { method: "DELETE" });
+}
+
+export async function clearBackups(tool: string) {
+  return request<{ ok: boolean }>(`/api/backups/${tool}`, { method: "DELETE" });
+}
+
 export async function restoreBackup(tool: string, backupName: string) {
   return request<ActiveConfig>(`/api/backups/${tool}/${backupName}/restore`, { method: "POST" });
 }

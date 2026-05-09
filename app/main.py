@@ -22,7 +22,9 @@ from .schemas import (
 )
 from .storage import (
     activate_profile,
+    clear_backups,
     create_profile,
+    delete_backup,
     delete_profile,
     ensure_all,
     list_backups,
@@ -156,9 +158,21 @@ def get_backups(tool: str, user: AuthUser = Depends(require_user)) -> list[dict]
     return list_backups(get_tool(tool))
 
 
+@app.delete("/api/backups/{tool}", response_model=OkResponse)
+def remove_backups(tool: str, user: AuthUser = Depends(require_user)) -> OkResponse:
+    clear_backups(get_tool(tool))
+    return OkResponse()
+
+
 @app.get("/api/backups/{tool}/{backup_name}")
 def get_backup(tool: str, backup_name: str, user: AuthUser = Depends(require_user)) -> dict:
     return read_backup(get_tool(tool), backup_name)
+
+
+@app.delete("/api/backups/{tool}/{backup_name}", response_model=OkResponse)
+def remove_backup(tool: str, backup_name: str, user: AuthUser = Depends(require_user)) -> OkResponse:
+    delete_backup(get_tool(tool), backup_name)
+    return OkResponse()
 
 
 @app.post("/api/backups/{tool}/{backup_name}/restore")

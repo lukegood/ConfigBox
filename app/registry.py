@@ -65,6 +65,7 @@ class ToolConfig:
 
 _codex_auth_path = Path(os.getenv("CODEX_CONFIG_PATH", "/config/codex/auth.json"))
 _codex_toml_path = Path(os.getenv("CODEX_CONFIG_TOML_PATH", str(_codex_auth_path.with_name("config.toml"))))
+_opencode_config_path = Path(os.getenv("OPENCODE_CONFIG_PATH", "/config/opencode/config.json"))
 
 
 TOOLS: dict[str, ToolConfig] = {
@@ -104,6 +105,22 @@ TOOLS: dict[str, ToolConfig] = {
                 active_path=_codex_toml_path,
                 format="toml",
                 path_label="~/.codex/config.toml",
+            ),
+        ),
+    ),
+    "opencode": ToolConfig(
+        id="opencode",
+        name="OpenCode",
+        profile_dir=DATA_DIR / "profiles" / "opencode",
+        backup_dir=DATA_DIR / "backups" / "opencode",
+        lock_path=DATA_DIR / "locks" / "opencode.lock",
+        files=(
+            ToolFile(
+                id="config",
+                label="config.json",
+                active_path=_opencode_config_path,
+                format="json",
+                path_label="~/.config/opencode/config.json",
             ),
         ),
     ),

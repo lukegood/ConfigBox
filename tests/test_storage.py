@@ -13,16 +13,20 @@ def load_modules(tmp_path: Path):
     claude_path = tmp_path / "config" / "claude" / "settings.json"
     codex_path = tmp_path / "config" / "codex" / "auth.json"
     codex_toml_path = tmp_path / "config" / "codex" / "config.toml"
+    opencode_path = tmp_path / "config" / "opencode" / "config.json"
     claude_path.parent.mkdir(parents=True)
     codex_path.parent.mkdir(parents=True)
+    opencode_path.parent.mkdir(parents=True)
     claude_path.write_text('{"model": "sonnet"}\n', encoding="utf-8")
     codex_path.write_text('{"OPENAI_API_KEY": "test"}\n', encoding="utf-8")
     codex_toml_path.write_text('model = "gpt-5"\n', encoding="utf-8")
+    opencode_path.write_text('{"provider": {}}\n', encoding="utf-8")
 
     os.environ["DATA_DIR"] = str(data_dir)
     os.environ["CLAUDE_CONFIG_PATH"] = str(claude_path)
     os.environ["CODEX_CONFIG_PATH"] = str(codex_path)
     os.environ["CODEX_CONFIG_TOML_PATH"] = str(codex_toml_path)
+    os.environ["OPENCODE_CONFIG_PATH"] = str(opencode_path)
     os.environ["BACKUP_RETENTION"] = "50"
 
     for name in list(sys.modules):
@@ -128,6 +132,57 @@ def test_invalid_codex_toml_rejected(tmp_path: Path):
     with pytest.raises(errors.APIError) as exc:
         storage.save_profile(tool, "default", None, [{"id": "config", "content": "bad = ["}])
     assert exc.value.code == "INVALID_TOML"
+
+
+def test_delete_backup_removes_single_backup(tmp_path: Path):
+    registry, storage, errors, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("claude")
+    storage.save_active(tool, '{"model": "opus"}\n', storage.file_mtime(tool.active_path))
+    backup_name = storage.list_backups(tool)[0]["name"]
+
+    storage.delete_backup(tool, backup_name)
+
+    assert storage.list_backups(tool) == []
+    with pytest.raises(errors.APIError) as exc:
+        storage.read_backup(tool, backup_name)
+    assert exc.value.code == "BACKUP_NOT_FOUND"
+
+
+def test_clear_backups_removes_file_and_directory_backups(tmp_path: Path):
+    registry, storage, *_ = load_modules(tmp_path)
+    claude = registry.get_tool("claude")
+    codex = registry.get_tool("codex")
+    storage.save_active(claude, '{"model": "opus"}\n', storage.file_mtime(claude.active_path))
+    storage.save_active(
+        codex,
+        None,
+        None,
+        [
+            {"id": "auth", "content": '{"OPENAI_API_KEY": "next"}\n', "lastKnownMtime": storage.file_mtime(codex.files[0].active_path)},
+            {"id": "config", "content": 'model = "next"\n', "lastKnownMtime": storage.file_mtime(codex.files[1].active_path)},
+        ],
+    )
+
+    assert storage.clear_backups(claude) == 1
+    assert storage.clear_backups(codex) == 1
+    assert storage.list_backups(claude) == []
+    assert storage.list_backups(codex) == []
+
+
+def test_opencode_config_is_json_tool(tmp_path: Path):
+    registry, storage, _errors, *_ = load_modules(tmp_path)
+    opencode_path = tmp_path / "config" / "opencode" / "config.json"
+    tool = registry.get_tool("opencode")
+
+    storage.save_active(
+        tool,
+        '{"$schema": "https://opencode.ai/config.json", "provider": {"zhipu": {"models": {}}}}\n',
+        storage.file_mtime(tool.active_path),
+    )
+
+    assert tool.name == "OpenCode"
+    assert tool.path_label == "~/.config/opencode/config.json"
+    assert '"zhipu"' in opencode_path.read_text(encoding="utf-8")
 
 
 def test_password_hash_verification(tmp_path: Path):
