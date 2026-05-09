@@ -1,6 +1,6 @@
 <div align="center">
   <img src="logo_config.png" alt="ConfigBox" width="800">
-  <h1>ConfigBox: Web 端的 Claude Code & Codex 配置可视化切换器</h1>
+  <h1>ConfigBox: Web 端的Claude Code & Codex配置切换器</h1>
   <p>
     <a href="README.md">简体中文</a> |
     <a href="README.en.md">English</a>
