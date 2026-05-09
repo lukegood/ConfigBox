@@ -1,16 +1,11 @@
 services:
   configbox:
-    image: configbox:latest
-    build:
-      context: .
-      args:
-        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
-        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    image: cloudcollector/configbox:latest
     container_name: configbox
     restart: unless-stopped
     env_file:
       - .env
-    user: "${UID:-1000}:${GID:-1000}"
+    user: "${CONFIGBOX_UID:?Set CONFIGBOX_UID in .env}:${CONFIGBOX_GID:?Set CONFIGBOX_GID in .env}"
     ports:
       - "8787:8787"
       - "127.0.0.1:18080:18080"
@@ -30,6 +25,12 @@ services:
       DATA_DIR: /data
       BACKUP_RETENTION: ${BACKUP_RETENTION:-50}
     volumes:
-      - ${HOME}/.claude:/config/claude
-      - ${HOME}/.codex:/config/codex
-      - ${HOME}/.configbox:/data
+      - type: bind
+        source: ${CLAUDE_DIR:?Set CLAUDE_DIR in .env}
+        target: /config/claude
+      - type: bind
+        source: ${CODEX_DIR:?Set CODEX_DIR in .env}
+        target: /config/codex
+      - type: bind
+        source: ${CONFIGBOX_DATA_DIR:?Set CONFIGBOX_DATA_DIR in .env}
+        target: /data

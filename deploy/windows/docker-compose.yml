@@ -1,0 +1,35 @@
+services:
+  configbox:
+    image: cloudcollector/configbox:latest
+    container_name: configbox
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8787:8787"
+      - "127.0.0.1:18080:18080"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8787
+      APP_USERNAME: ${APP_USERNAME:-admin}
+      APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-false}
+      CLAUDE_CONFIG_PATH: /config/claude/settings.json
+      CODEX_CONFIG_PATH: /config/codex/auth.json
+      CODEX_CONFIG_TOML_PATH: /config/codex/config.toml
+      CODEX_GATEWAY_HOST: ${CODEX_GATEWAY_HOST:-0.0.0.0}
+      CODEX_GATEWAY_PORT: ${CODEX_GATEWAY_PORT:-18080}
+      CODEX_GATEWAY_PUBLIC_HOST: ${CODEX_GATEWAY_PUBLIC_HOST:-127.0.0.1}
+      GATEWAY_LOG_MAX_MB: ${GATEWAY_LOG_MAX_MB:-50}
+      DATA_DIR: /data
+      BACKUP_RETENTION: ${BACKUP_RETENTION:-50}
+    volumes:
+      - type: bind
+        source: ${CLAUDE_DIR:?Set CLAUDE_DIR in .env}
+        target: /config/claude
+      - type: bind
+        source: ${CODEX_DIR:?Set CODEX_DIR in .env}
+        target: /config/codex
+      - type: bind
+        source: ${CONFIGBOX_DATA_DIR:?Set CONFIGBOX_DATA_DIR in .env}
+        target: /data
