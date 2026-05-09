@@ -39,7 +39,7 @@ from .storage import (
 from . import gateway
 
 
-app = FastAPI(title="ConfigBox", version="0.4.0")
+app = FastAPI(title="ConfigBox", version="0.5.0")
 
 
 @app.on_event("startup")
