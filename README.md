@@ -12,7 +12,7 @@
 
 ConfigBox是一个Docker化的Web管理工具，用于在浏览器中可视化管理和切换 Claude Code、Codex 与OpenCode的配置文件。ConfigBox具备Codex转发功能，支持第三方模型接入Codex。ConfigBox支持Linux、macOS 和 Windows平台。
 
-** 欢迎积极试用提PR，成为贡献者 **
+**欢迎积极试用提PR，成为贡献者 :raising_hand:**
 
 ## 最近更新
 
