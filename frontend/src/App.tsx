@@ -1199,7 +1199,7 @@ function App() {
                 />
               </label>
               <label>
-                Codex 模型映射
+                将Codex请求的模型映射为
                 <input
                   value={gatewayProviderForm.gpt53Model}
                   onChange={(event) => updateGatewayProviderForm("gpt53Model", event.target.value)}
