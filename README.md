@@ -10,15 +10,11 @@
   </p>
 </div>
 
-ConfigBox是一个Docker化的Web管理工具，用于在浏览器中可视化管理和切换 Claude Code、Codex 与OpenCode的配置文件。ConfigBox具备Codex转发功能，支持第三方模型接入Codex。ConfigBox支持Linux、macOS 和 Windows平台。
+ConfigBox是一个Docker化的Web管理工具，用于在浏览器中可视化管理和切换 Claude Code、Codex 与OpenCode的配置文件。ConfigBox内置基于[Cmochance/codex-app-transfer](https://github.com/Cmochance/codex-app-transfer)的Codex转发能力，具备Codex转发功能，支持第三方模型接入Codex。ConfigBox支持Linux、macOS 和 Windows平台。
 
 **欢迎积极试用提PR，成为贡献者 :raising_hand:**
 
-## 最近更新
-
-:loudspeaker: 2026.05.07 发布 v0.3.3，内置基于[Cmochance/codex-app-transfer](https://github.com/Cmochance/codex-app-transfer)的Codex转发能力，支持国模等第三方模型接入 Codex，修复转发 MiniMax 模型消息时的报错，修复前端错误
-
-:loudspeaker: 2026.05.09 发布 v0.4.0，新增macOS / Windows 平台 Docker支持
+## 版本更新
 
 :loudspeaker: 2026.05.14 发布 v0.5.2，同步上游codex-app-transfer，修复gateway的部分前端。
 
