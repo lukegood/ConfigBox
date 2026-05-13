@@ -153,7 +153,6 @@ function App() {
   const [gatewayRestartRequired, setGatewayRestartRequired] = useState(false);
   const [openCodeProviderForm, setOpenCodeProviderForm] = useState<OpenCodeProviderForm | null>(null);
   const [openCodeModelForm, setOpenCodeModelForm] = useState<OpenCodeModelForm | null>(null);
-  const [showGatewayApiKey, setShowGatewayApiKey] = useState(false);
   const [showGatewayProviderApiKey, setShowGatewayProviderApiKey] = useState(false);
   const [showOpenCodeProviderApiKey, setShowOpenCodeProviderApiKey] = useState(false);
 
@@ -242,7 +241,6 @@ function App() {
       const [config, statusData, logs] = await Promise.all([getGatewayConfig(), getGatewayStatus(), getGatewayLogs()]);
       setGatewayConfig(config);
       setGatewayStatus(statusData);
-      setShowGatewayApiKey(false);
       if (!statusData.running) {
         setGatewayRestartRequired(false);
       }
@@ -453,6 +451,18 @@ function App() {
     } finally {
       setLoading(false);
     }
+  }
+
+
+  async function handleRefreshGatewayLogs() {
+    if (loading) return;
+    setLoading(true);
+    try {
+      const logs = await getGatewayLogs();
+      setGatewayLogs(logs.lines);
+      setGatewayLogBytes({ current: logs.currentBytes, max: logs.maxBytes });
+    } catch { /* ignore */ }
+    setLoading(false);
   }
 
   async function handleGatewayStop() {
@@ -881,7 +891,7 @@ function App() {
             </h2>
             <p>
               {mode === "gateway"
-                ? `${gatewayStatus?.publicBaseUrl ?? "Gateway"} · ${gatewayConfig?.path ?? ""}`
+                ? "管理 Providers 与运行日志"
                 : `${tool?.pathLabel} · ${files.map((file) => file.format.toUpperCase()).join(" + ")}`}
             </p>
           </div>
@@ -997,33 +1007,6 @@ function App() {
             ) : null}
             <div className="gateway-panel">
               <section className="gateway-section">
-                <div className="gateway-summary">
-                  <div>
-                    <span>监听地址</span>
-                    <strong>{gatewayStatus?.publicBaseUrl ?? "-"}</strong>
-                  </div>
-                  <div>
-                    <span>配置文件</span>
-                    <strong>{gatewayConfig?.path ?? "-"}</strong>
-                  </div>
-                  <div>
-                    <span>Gateway Key</span>
-                    <div className="secret-row">
-                      <strong>{showGatewayApiKey ? gatewayConfig?.gatewayApiKey || "-" : gatewayConfig?.gatewayApiKey ? secretDots : "-"}</strong>
-                      <button
-                        type="button"
-                        className="secret-toggle"
-                        onClick={() => setShowGatewayApiKey((current) => !current)}
-                        disabled={!gatewayConfig?.gatewayApiKey}
-                        title={showGatewayApiKey ? "隐藏 Key" : "显示 Key"}
-                      >
-                        {showGatewayApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </section>
-              <section className="gateway-section">
                 <div className="section-title">Providers</div>
                 <div className="provider-table">
                   {(gatewayConfig?.providers ?? []).map((provider) => (
@@ -1059,15 +1042,23 @@ function App() {
                 </div>
               </section>
               <section className="gateway-section">
-                <div className="section-title">
-                  <span>Logs</span>
-                  <button className="danger" onClick={handleGatewayClearLogs} disabled={loading} title="清除日志">
-                    <Trash2 size={15} />
-                    清除日志
-                  </button>
-                </div>
-                <div className="log-meta">
-                  {formatBytes(gatewayLogBytes.current)} / {formatBytes(gatewayLogBytes.max)}
+                <div className="section-title gateway-log-heading">
+                  <div className="log-title-block">
+                    <span>Logs</span>
+                    <span className="log-meta">
+                      {formatBytes(gatewayLogBytes.current)} / {formatBytes(gatewayLogBytes.max)}
+                    </span>
+                  </div>
+                  <div className="mini-actions">
+                    <button onClick={handleRefreshGatewayLogs} disabled={loading} title="刷新日志">
+                      <RefreshCcw size={15} />
+                      刷新
+                    </button>
+                    <button className="danger" onClick={handleGatewayClearLogs} disabled={loading} title="清除日志">
+                      <Trash2 size={15} />
+                      清除日志
+                    </button>
+                  </div>
                 </div>
                 <pre className="gateway-logs">{gatewayLogs.join("\n") || "暂无日志"}</pre>
               </section>
@@ -1208,7 +1199,7 @@ function App() {
                 />
               </label>
               <label>
-                Codex 模型映射
+                将Codex请求的模型映射为
                 <input
                   value={gatewayProviderForm.gpt53Model}
                   onChange={(event) => updateGatewayProviderForm("gpt53Model", event.target.value)}

@@ -244,6 +244,23 @@ select {
   padding: 0;
 }
 
+.gateway-section .mini-actions button {
+  width: auto;
+  min-width: max-content;
+  padding: 0 10px;
+}
+
+.gateway-log-heading {
+  align-items: center;
+  gap: 12px;
+}
+
+.log-title-block {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
 .section-icon {
   width: 30px;
   min-height: 30px;
@@ -501,50 +518,6 @@ select {
   padding-top: 0;
 }
 
-.gateway-summary {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.gateway-summary div {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel);
-  padding: 12px;
-  min-width: 0;
-}
-
-.gateway-summary span,
-.gateway-summary strong {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.gateway-summary span {
-  color: var(--muted);
-  font-size: 12px;
-  margin-bottom: 5px;
-}
-
-.gateway-summary strong {
-  font-size: 14px;
-  letter-spacing: 0;
-}
-
-.secret-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-
-.secret-row strong {
-  flex: 1 1 auto;
-}
-
 .secret-toggle {
   width: 28px;
   height: 28px;
@@ -631,9 +604,9 @@ select {
 .gateway-logs {
   margin: 0;
   min-width: 0;
-  min-height: 220px;
-  max-height: 360px;
+  height: clamp(260px, 38vh, 440px);
   overflow: auto;
+  scrollbar-gutter: stable;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--input);
@@ -648,7 +621,9 @@ select {
 .log-meta {
   color: var(--muted);
   font-size: 12px;
-  margin: -4px 0 8px;
+  letter-spacing: 0;
+  margin: 0;
+  text-transform: none;
 }
 
 .modal-backdrop {
@@ -738,7 +713,6 @@ select {
     flex-direction: column;
   }
 
-  .gateway-summary,
   .provider-row,
   .provider-form-grid,
   .opencode-helper {
@@ -748,5 +722,9 @@ select {
   .provider-actions,
   .opencode-helper-actions {
     justify-content: flex-start;
+  }
+
+  .gateway-logs {
+    height: clamp(220px, 45vh, 340px);
   }
 }
