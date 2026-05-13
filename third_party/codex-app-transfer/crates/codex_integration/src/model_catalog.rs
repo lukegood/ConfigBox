@@ -24,6 +24,17 @@ const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: u64 = 95;
 const DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
 const ONE_M_CONTEXT_WINDOW: u64 = 1_000_000;
 
+/// Codex CLI 触发自动 compact 的阈值百分比:`auto_compact_token_limit = context_window × 75%`。
+///
+/// 根因:Codex CLI 在 `total_usage_tokens >= auto_compact_token_limit` 时触发摘要
+/// (`codex-rs/core/src/session/turn.rs:736-748`),如果 catalog model 没写这个字段
+/// 会 fallback `i64::MAX` → **永不触发**(实测 245K 上限 90% 仍不动)。
+///
+/// 75% 留 25% buffer 给 summarize 请求本身(~20K max_output_tokens + system
+/// prompt + 当轮 input + 工具开销)。256K 触发于 192K,1M 触发于 750K,与
+/// litellm `effective_context_window_percent` 行业惯例对齐。
+const AUTO_COMPACT_TRIGGER_PERCENT: u64 = 75;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogModel {
     pub slug: String,
@@ -114,15 +125,21 @@ pub fn catalog_models_for_provider(
         ));
     }
     if !default_model.is_empty() && !models.iter().any(|m| m.slug == default_model) {
+        // 与上面 MODEL_SLOTS 走同一条 context_window_for_model,保证显式
+        // model_capabilities[<default>].context_window 在 fallback entry 上
+        // 也生效(2026-05-07 fix:之前这里硬编码二档值,绕过显式 override)。
+        let fallback_window = context_window_for_model(
+            default_model,
+            default_model,
+            default_model,
+            supports_1m,
+            model_capabilities,
+        );
         models.push(catalog_model(
             default_model,
             provider_name,
             default_model,
-            if supports_1m {
-                ONE_M_CONTEXT_WINDOW
-            } else {
-                DEFAULT_CONTEXT_WINDOW
-            },
+            fallback_window,
         ));
     }
     models
@@ -142,6 +159,15 @@ fn context_window_for_model(
     if clean_model.is_empty() {
         return DEFAULT_CONTEXT_WINDOW;
     }
+    // 1. 最高优先级:`model_capabilities[<model>].context_window` 数值显式声明
+    //    (2026-05-07 新增,替代旧版只能在 258_400 / 1_000_000 二档之间的限制)
+    //    数值 ≥ 1024 才认(防止误填导致 Codex CLI 把 context_window 设成 0
+    //    或负值);clean_model 优先,fallback 到 original_model(含可能的 [1m]
+    //    后缀)。
+    if let Some(n) = explicit_context_window(original_model, clean_model, model_capabilities) {
+        return n;
+    }
+    // 2. 二档 fallback:default_model + supports_1m / known prefix / supports1m bool
     if clean_model == default_model {
         if default_supports_1m {
             ONE_M_CONTEXT_WINDOW
@@ -153,6 +179,31 @@ fn context_window_for_model(
     } else {
         DEFAULT_CONTEXT_WINDOW
     }
+}
+
+fn explicit_context_window(
+    original_model: &str,
+    clean_model: &str,
+    model_capabilities: Option<&Value>,
+) -> Option<u64> {
+    let caps = model_capabilities.and_then(Value::as_object)?;
+    for key in [clean_model, original_model.trim()] {
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(n) = caps
+            .get(key)
+            .and_then(|v| v.get("context_window"))
+            .and_then(Value::as_u64)
+        {
+            // 防御:< 1024 token 没法跑 Codex 系统提示,认为是配置错误,
+            // 让 fallback 接管(走 supports_1m 二档)。
+            if n >= 1024 {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 fn model_supports_1m(
@@ -212,6 +263,14 @@ fn model_to_json(model: &CatalogModel) -> Value {
     entry["context_window"] = json!(model.context_window);
     entry["max_context_window"] = json!(model.context_window);
     entry["effective_context_window_percent"] = json!(model.effective_context_window_percent);
+    // 不写这个字段会让 Codex CLI fallback i64::MAX(永不触发自动 compact)。
+    // catalog 字段格式见 codex-rs/protocol/src/openai_models.rs:298。
+    entry["auto_compact_token_limit"] = json!(
+        model
+            .context_window
+            .saturating_mul(AUTO_COMPACT_TRIGGER_PERCENT)
+            / 100
+    );
     entry
 }
 
@@ -457,6 +516,44 @@ mod tests {
     }
 
     #[test]
+    fn catalog_model_writes_auto_compact_token_limit_at_75_percent() {
+        // 1M context: 触发于 750K(留 25% buffer)
+        let big = catalog_models_for_provider("Big", "deepseek-v4-pro", true, None, None);
+        let entry = model_to_json(big.iter().find(|m| m.slug == "gpt-5.5").unwrap());
+        assert_eq!(entry["context_window"], 1_000_000);
+        assert_eq!(
+            entry["auto_compact_token_limit"], 750_000,
+            "1M provider 应在 75% (750K) 触发自动 compact"
+        );
+
+        // 258_400 context(默认 supports_1m=false):触发于 193_800
+        let mid = catalog_models_for_provider("Mid", "mock-model", false, None, None);
+        let entry_mid = model_to_json(mid.iter().find(|m| m.slug == "gpt-5.5").unwrap());
+        assert_eq!(entry_mid["context_window"], 258_400);
+        assert_eq!(
+            entry_mid["auto_compact_token_limit"], 193_800,
+            "默认 258K provider 应在 75% (193_800) 触发自动 compact"
+        );
+
+        // 显式 32K context(moonshot-v1-32k): 触发于 24_576
+        let mappings = json!({"default": "moonshot-v1-32k"});
+        let capabilities = json!({"moonshot-v1-32k": {"context_window": 32_768}});
+        let small = catalog_models_for_provider(
+            "Moonshot",
+            "moonshot-v1-32k",
+            false,
+            Some(&mappings),
+            Some(&capabilities),
+        );
+        let entry_small = model_to_json(small.iter().find(|m| m.slug == "gpt-5.5").unwrap());
+        assert_eq!(entry_small["context_window"], 32_768);
+        assert_eq!(
+            entry_small["auto_compact_token_limit"], 24_576,
+            "32K context 应在 75% (24_576) 触发"
+        );
+    }
+
+    #[test]
     fn catalog_uses_slot_mapping_and_per_model_windows() {
         let mappings = json!({
             "default": "deepseek-v4-pro",
@@ -491,6 +588,128 @@ mod tests {
             "empty slot mappings should still document the default fallback target"
         );
         assert_eq!(codex.context_window, 1_000_000);
+    }
+
+    // ── 新增 (2026-05-07):model_capabilities[<model>].context_window 数值
+    // ── 显式声明优先级最高,替代旧版只能 258_400/1_000_000 二档限制
+    //
+    // 用户实际接的非 GPT 模型 context window 五花八门,旧版只能在两个写死值
+    // 之间选,导致:
+    // - mimo-v2.5-pro 真实 1M 但被 catalog 标 258_400(用户实测被早压缩 75%)
+    // - moonshot-v1-8k 真实 8192 但被 catalog 标 258_400(理论上 codex 不
+    //   截输入,上游收到大 body 直接 400)
+
+    #[test]
+    fn explicit_context_window_overrides_two_tier_default() {
+        // user 显式标 mimo-v2.5-pro: { context_window: 1_000_000 } → 走数值
+        let mappings = json!({"default": "mimo-v2.5-pro"});
+        let capabilities = json!({
+            "mimo-v2.5-pro": {"context_window": 1_000_000}
+        });
+        let models = catalog_models_for_provider(
+            "Xiaomi MiMo",
+            "mimo-v2.5-pro",
+            false, // supports_1m=false 但显式 capability 应当胜出
+            Some(&mappings),
+            Some(&capabilities),
+        );
+        let entry = models.iter().find(|m| m.slug == "mimo-v2.5-pro").unwrap();
+        assert_eq!(
+            entry.context_window, 1_000_000,
+            "显式 context_window 必须越过 supports_1m=false 的二档默认 258_400"
+        );
+    }
+
+    #[test]
+    fn explicit_context_window_supports_arbitrary_values() {
+        // moonshot-v1-32k 真实 32768 — 既不是 258_400 也不是 1_000_000
+        let mappings = json!({"default": "moonshot-v1-32k"});
+        let capabilities = json!({
+            "moonshot-v1-32k": {"context_window": 32_768}
+        });
+        let models = catalog_models_for_provider(
+            "Moonshot",
+            "moonshot-v1-32k",
+            false,
+            Some(&mappings),
+            Some(&capabilities),
+        );
+        let entry = models.iter().find(|m| m.slug == "moonshot-v1-32k").unwrap();
+        assert_eq!(entry.context_window, 32_768);
+    }
+
+    #[test]
+    fn explicit_context_window_per_slot_independent() {
+        // 同一 provider 内不同模型不同 context_window:gpt-5.5 → moonshot-v1-8k
+        // (8192),gpt-5.4 → kimi-k2.6 (262144)。各 slot 不互相污染。
+        let mappings = json!({
+            "default": "kimi-k2.6",
+            "gpt_5_5": "moonshot-v1-8k",
+            "gpt_5_4": "kimi-k2.6",
+        });
+        let capabilities = json!({
+            "moonshot-v1-8k": {"context_window": 8_192},
+            "kimi-k2.6":     {"context_window": 262_144},
+        });
+        let models = catalog_models_for_provider(
+            "Moonshot",
+            "kimi-k2.6",
+            false,
+            Some(&mappings),
+            Some(&capabilities),
+        );
+        let m55 = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
+        let m54 = models.iter().find(|m| m.slug == "gpt-5.4").unwrap();
+        assert_eq!(m55.context_window, 8_192, "gpt-5.5 → moonshot-v1-8k");
+        assert_eq!(m54.context_window, 262_144, "gpt-5.4 → kimi-k2.6");
+    }
+
+    #[test]
+    fn explicit_context_window_below_minimum_falls_back() {
+        // 防御:context_window < 1024 视为配置错误,fallback 到二档逻辑。
+        let mappings = json!({"default": "deepseek-v4-pro"});
+        let capabilities = json!({
+            "deepseek-v4-pro": {"context_window": 100}
+        });
+        let models = catalog_models_for_provider(
+            "DeepSeek",
+            "deepseek-v4-pro",
+            true, // supports_1m
+            Some(&mappings),
+            Some(&capabilities),
+        );
+        let entry = models.iter().find(|m| m.slug == "deepseek-v4-pro").unwrap();
+        assert_eq!(
+            entry.context_window, 1_000_000,
+            "非法值 100 应被忽略,fallback 到 supports_1m=true 的 1M"
+        );
+    }
+
+    #[test]
+    fn explicit_context_window_overrides_supports1m_capability_too() {
+        // 既显式 supports1m=true 又显式 context_window=512_000 → context_window 胜出
+        let mappings = json!({"default": "custom"});
+        let capabilities = json!({
+            "custom": {"supports1m": true, "context_window": 512_000}
+        });
+        let models = catalog_models_for_provider(
+            "Custom",
+            "custom",
+            false,
+            Some(&mappings),
+            Some(&capabilities),
+        );
+        let entry = models.iter().find(|m| m.slug == "custom").unwrap();
+        assert_eq!(entry.context_window, 512_000);
+    }
+
+    #[test]
+    fn no_explicit_context_window_keeps_two_tier_fallback() {
+        // 没填 context_window:旧逻辑保持,supports_1m=true 走 1M,false 走 258_400
+        let mappings = json!({"default": "kimi-k2.6"});
+        let models = catalog_models_for_provider("Kimi", "kimi-k2.6", false, Some(&mappings), None);
+        let entry = models.iter().find(|m| m.slug == "kimi-k2.6").unwrap();
+        assert_eq!(entry.context_window, 258_400, "fallback to 258_400");
     }
 
     #[test]

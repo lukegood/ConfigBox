@@ -228,11 +228,6 @@ pub fn proxy_telemetry() -> &'static ProxyTelemetry {
 }
 
 pub fn proxy_log_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("CODEX_APP_TRANSFER_LOG_DIR") {
-        if !dir.is_empty() {
-            return Some(PathBuf::from(dir));
-        }
-    }
     config_dir().map(|dir| dir.join("logs"))
 }
 

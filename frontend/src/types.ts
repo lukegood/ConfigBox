@@ -72,6 +72,7 @@ export type GatewayProvider = {
   apiFormat: string;
   authScheme: string;
   models: Record<string, string>;
+  apiKey?: string;
   hasApiKey?: boolean;
 };
 

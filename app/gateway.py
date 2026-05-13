@@ -116,24 +116,17 @@ def public_config() -> dict[str, Any]:
     config = read_config()
     public = dict(config)
     public["gatewayApiKeyPresent"] = bool(config.get("gatewayApiKey"))
-    public["gatewayApiKey"] = mask_secret(config.get("gatewayApiKey", ""))
+    public["gatewayApiKey"] = str(config.get("gatewayApiKey") or "")
     public["providers"] = [public_provider(provider) for provider in config["providers"]]
     public["path"] = str(GATEWAY_CONFIG_PATH)
     public["logDir"] = str(GATEWAY_LOG_DIR)
     return public
 
 
-def mask_secret(value: str) -> str:
-    if not value:
-        return ""
-    if len(value) <= 10:
-        return "******"
-    return f"{value[:6]}******{value[-4:]}"
-
-
 def public_provider(provider: dict[str, Any]) -> dict[str, Any]:
     result = dict(provider)
-    api_key = str(result.pop("apiKey", "") or "")
+    api_key = str(result.get("apiKey") or "")
+    result["apiKey"] = api_key
     result["hasApiKey"] = bool(api_key)
     if "extraHeaders" in result:
         result["extraHeadersPresent"] = True

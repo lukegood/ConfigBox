@@ -11,19 +11,25 @@
 //!   `serde_json::to_string_pretty` 默认 2 空格缩进、非 ASCII 不转义,
 //!   `,` 与 `: ` 分隔符也一致。
 //! - **未实现** OS 集成层(Windows 注册表 / macOS plist / Codex TOML 注入),
-//!   按 docs/migration-plan.md §4 拆分,留给 Stage 2.5 的 `crates/codex_integration`。
+//!   按 docs/refactor/migration.md §4 拆分,留给 Stage 2.5 的 `crates/codex_integration`。
 
+pub mod healing;
 pub mod model_alias;
 pub mod paths;
 pub mod presets;
 pub mod raw_io;
 pub mod schema;
 
+#[allow(deprecated)]
+pub use healing::heal_builtin_extra_headers;
+pub use healing::heal_builtin_provider_fields;
 pub use model_alias::{
     empty_model_mappings, has_internal_one_m_suffix, normalize_model_mappings, openai_model_slot,
     provider_slug, strip_internal_model_suffix, MODEL_ORDER, MODEL_SLOTS,
 };
-pub use paths::{config_dir, config_file, library_dir, resolve_home};
+pub use paths::{
+    config_dir, config_file, library_dir, resolve_home, sessions_db_file, tool_artifacts_db_file,
+};
 pub use presets::builtin_presets;
 pub use raw_io::{load_raw_config, save_raw_config, IoError, RawConfig};
 pub use schema::{Config, ModelSlotKey, Provider, Settings, APP_VERSION, DEFAULT_UPDATE_URL};

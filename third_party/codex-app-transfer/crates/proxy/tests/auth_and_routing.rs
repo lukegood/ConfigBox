@@ -30,6 +30,11 @@ use tokio_tungstenite::{
 
 /// echo-back 上游:把收到的请求镜像成 JSON 返回。`marker` 用来在响应头里
 /// 标记是哪个 mock,以便测试断言代理选对了上游。
+///
+/// `headers` 字段:每个 header name 只保留**最后一个**值(serde Map insert
+/// 语义),用于已有断言。
+/// `headers_all` 字段:每个 header name → 所有值的列表,用于检测同名
+/// header 是否被重复发送(extras override 单测要看这里)。
 fn echo_mock(marker: &'static str) -> Router {
     Router::new().fallback(any(move |req: Request| async move {
         let (parts, body) = req.into_parts();
@@ -37,17 +42,24 @@ fn echo_mock(marker: &'static str) -> Router {
             .await
             .unwrap_or_default();
         let mut headers_map = serde_json::Map::new();
+        let mut headers_all: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
         for (k, v) in parts.headers.iter() {
-            headers_map.insert(
-                k.as_str().to_owned(),
-                serde_json::Value::String(v.to_str().unwrap_or("").to_owned()),
-            );
+            let name = k.as_str().to_owned();
+            let value = v.to_str().unwrap_or("").to_owned();
+            headers_map.insert(name.clone(), serde_json::Value::String(value.clone()));
+            headers_all
+                .entry(name)
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::Value::String(value));
         }
         let payload = json!({
             "marker": marker,
             "method": parts.method.as_str(),
             "path": parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"),
             "headers": headers_map,
+            "headers_all": headers_all,
             "body": String::from_utf8_lossy(&bytes),
         });
         Response::builder()
@@ -197,10 +209,10 @@ async fn successful_forward_updates_proxy_telemetry() {
     let logs = proxy_telemetry().logs.get_all();
     assert!(logs
         .iter()
-        .any(|entry| entry.level == "INFO" && entry.message.contains("请求: POST")));
+        .any(|entry| entry.level == "INFO" && entry.message.contains("request: POST")));
     assert!(logs
         .iter()
-        .any(|entry| entry.level == "SUCCESS" && entry.message == "上游响应 200"));
+        .any(|entry| entry.level == "SUCCESS" && entry.message == "upstream status 200"));
 }
 
 #[tokio::test]
@@ -224,7 +236,7 @@ async fn gateway_auth_failure_updates_proxy_telemetry() {
     let logs = proxy_telemetry().logs.get_all();
     assert!(logs
         .iter()
-        .any(|entry| entry.level == "ERROR" && entry.message.contains("代理请求失败")));
+        .any(|entry| entry.level == "ERROR" && entry.message.contains("proxy request failed")));
 }
 
 #[tokio::test]
@@ -332,6 +344,147 @@ async fn slug_routes_to_provider_b_with_x_api_key_and_extras() {
     let body = v["body"].as_str().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(parsed["model"], "coding");
+}
+
+/// 同名 header 必须**只**带 `provider.extraHeaders` 的值上线,**不能**和
+/// 客户端原始 header 一起以多值形式打到上游。reqwest `RequestBuilder::header`
+/// 是 append 语义,如果不在复制客户端 header 时过滤掉 extras 已覆盖的名字,
+/// kimi-code 这类靠 `User-Agent: KimiCLI/1.40.0` 伪装身份的 provider 会被
+/// 上游"首条 UA"一票否决(2026-05-07 Windows v2.0.8 Kimi 403 现场)。
+#[tokio::test]
+async fn extras_header_overrides_client_value_no_duplicate() {
+    let s = build_stack().await;
+    // 客户端显式带 User-Agent 模拟 Codex CLI 自加身份头
+    let resp = client()
+        .post(format!("http://{}/v1/chat/completions", s.proxy))
+        .header("authorization", "Bearer cas_test_gw")
+        .header("user-agent", "client-codex-cli/0.x.x")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"provider-b/coding"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let v = body_json(resp).await;
+
+    let ua_values = v["headers_all"]["user-agent"]
+        .as_array()
+        .expect("upstream 应当至少收到一条 user-agent");
+    assert_eq!(
+        ua_values.len(),
+        1,
+        "extras 必须 override:上游应只见到 1 条 User-Agent,实际: {:?}",
+        ua_values
+    );
+    assert_eq!(
+        ua_values[0].as_str().unwrap(),
+        "TestAgent/1.0",
+        "唯一一条 User-Agent 必须是 extras 的值,而不是客户端 codex CLI 的值"
+    );
+}
+
+/// 关键回归(2026-05-08 Kimi Windows 403):extras 没 User-Agent 时,客户端的
+/// codex_cli_rs/... UA 必须被 strip,上游收到的是中性 default UA
+/// (Codex-App-Transfer/<v>),绝不能透传客户端 codex UA。
+///
+/// provider-a 在 build_stack 里 extras 不含 User-Agent(只有 `x-mock-marker`),
+/// 所以走 default UA 路径。
+#[tokio::test]
+async fn client_user_agent_stripped_when_provider_extras_lacks_ua() {
+    let s = build_stack().await;
+    let resp = client()
+        .post(format!("http://{}/v1/chat/completions", s.proxy))
+        .header("authorization", "Bearer cas_test_gw")
+        .header("user-agent", "codex_cli_rs/0.128.0 (Windows 10.0; x86_64)")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"plain-model-name"}"#) // 走 fallback default = provider-a
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let v = body_json(resp).await;
+    let ua_values = v["headers_all"]["user-agent"]
+        .as_array()
+        .expect("upstream 应有 user-agent");
+    assert_eq!(ua_values.len(), 1, "应只有 1 条 UA,实际: {:?}", ua_values);
+    let ua = ua_values[0].as_str().unwrap();
+    assert!(
+        !ua.contains("codex_cli_rs"),
+        "客户端 codex UA 必须被 strip,实际泄漏: {ua}"
+    );
+    assert!(
+        ua.starts_with("Codex-App-Transfer/"),
+        "无 extras UA 时上游应收到中性 default UA,实际: {ua}"
+    );
+}
+
+/// 关键回归(2026-05-08):Codex CLI 内置注入 originator / x-codex-installation-id /
+/// x-codex-window-id / x-openai-* / chatgpt-account-id 等身份头(`codex-rs/login/
+/// src/auth/default_client.rs::default_headers` + `codex-rs/core/src/client.rs:481-605`)。
+/// 这些头对第三方 OpenAI-compatible provider 永远没用,但 Kimi For Coding 等 provider
+/// 的反爬规则会按这些头判定"非白名单 client"返回 403 access_terminated_error。
+/// 出站时**必须**整片剔除,不能透传到上游。
+#[tokio::test]
+async fn codex_identity_headers_are_stripped_on_forward() {
+    let s = build_stack().await;
+    let resp = client()
+        .post(format!("http://{}/v1/chat/completions", s.proxy))
+        .header("authorization", "Bearer cas_test_gw")
+        // Codex CLI 自家身份头(精确名 + 前缀两类全覆盖)
+        .header("originator", "codex_cli_rs")
+        .header("x-codex-installation-id", "test-installation-uuid")
+        .header("x-codex-window-id", "test-window-uuid")
+        .header("x-openai-subagent", "memgen")
+        .header("x-openai-memgen-request", "1")
+        .header("chatgpt-account-id", "test-acct")
+        .header("session_id", "test-session")
+        .header("thread_id", "test-thread")
+        // 普通 header 应正常透传
+        .header("content-type", "application/json")
+        .body(r#"{"model":"provider-b/coding"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let v = body_json(resp).await;
+    let headers_all = v["headers_all"].as_object().expect("headers_all");
+
+    // 精确名黑名单
+    for forbidden in [
+        "originator",
+        "chatgpt-account-id",
+        "session_id",
+        "thread_id",
+    ] {
+        assert!(
+            !headers_all.contains_key(forbidden),
+            "上游绝不应收到 codex 身份头 {forbidden},实际 headers: {:?}",
+            headers_all.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // 前缀黑名单(防御未来 Codex CLI 加新头)
+    for (k, _) in headers_all.iter() {
+        let lower = k.to_ascii_lowercase();
+        assert!(
+            !lower.starts_with("x-codex-"),
+            "上游不应收到任何 x-codex-* 头,但有: {k}"
+        );
+        assert!(
+            !lower.starts_with("x-openai-"),
+            "上游不应收到任何 x-openai-* 头,但有: {k}"
+        );
+        assert!(
+            !lower.starts_with("x-chatgpt-"),
+            "上游不应收到任何 x-chatgpt-* 头,但有: {k}"
+        );
+    }
+
+    // 普通 header 仍然透传
+    assert!(
+        headers_all.contains_key("content-type"),
+        "正常 content-type 头仍应透传"
+    );
 }
 
 #[tokio::test]

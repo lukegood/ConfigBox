@@ -45,6 +45,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::tool_call_cache::{global_tool_call_cache, ToolCallEntry};
+use crate::core::events::{build_tool_namespace_map, emit_sse_event};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -102,6 +103,40 @@ pub struct ChatToResponsesConverter {
     model: String,
     finish_reason: Option<String>,
     usage: Option<Value>,
+
+    /// 原入站 Responses API request 的**完整 body**(未经展平),用于在
+    /// envelope 里回灌完整字段集(tools / parallel_tool_calls / tool_choice
+    /// / reasoning / text / metadata / previous_response_id / instructions
+    /// / temperature / top_p / max_output_tokens / truncation 等),让
+    /// Codex CLI 严格 Responses 协议解析不缺字段、并能反向路由 namespace
+    /// 工具调用。借鉴 mimo2codex `streamToSse.ts:75-105` `buildResponseSnapshot`。
+    original_request: Option<Value>,
+
+    /// SSE event 单调递增 sequence,从 0 开始;每次 `emit_event` 自增。
+    /// 借鉴 mimo2codex `streamToSse.ts:71-72` `sequence_number: state.nextSeq()`。
+    /// 严格 Responses 协议客户端用这个字段确保事件不乱序 / 不丢。
+    sequence_number: u64,
+
+    /// envelope.created_at 时间戳(秒),整个响应生命周期固定。借鉴
+    /// mimo2codex `streamToSse.ts:41` `createdAt = Math.floor(Date.now() / 1000)`。
+    created_at: u64,
+
+    /// `function_name → namespace_name` 反查表,扫 `original_request.tools`
+    /// 里所有 `type:"namespace"` 包的内层 function name 建立。`emit_*` function_call
+    /// 相关 SSE event 时,若 function.name 命中此表,**给 item 加 `namespace`
+    /// 字段** —— 这是 Codex.app 客户端 dispatch namespace 工具调用的必要字段
+    /// (实测 `strings /Applications/Codex.app/Contents/Resources/codex` 含
+    /// `"dynamic tool namespace must not be empty for"` 校验 + `DynamicToolCallRequest`
+    /// 含 6 个字段都需 namespace),缺 namespace 字段时所有 namespace 工具调用
+    /// 都返回 `"unsupported call: <name>"`。
+    tool_namespace_map: std::collections::HashMap<String, String>,
+
+    /// 当前 message item 累计的 url citation annotations(`delta.annotations`
+    /// 解析后的转换结果)。每条 message item open 时清空,close 时写入
+    /// final item 的 `content[0].annotations`。借鉴 mimo2codex
+    /// `streamToSse.ts:48` `state.activeAnnotations` + `streamToSse.ts:338-352`
+    /// 累计逻辑。
+    active_annotations: Vec<Value>,
 }
 
 impl ChatToResponsesConverter {
@@ -146,6 +181,14 @@ impl ChatToResponsesConverter {
             model: String::new(),
             finish_reason: None,
             usage: None,
+            original_request: None,
+            sequence_number: 0,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            tool_namespace_map: std::collections::HashMap::new(),
+            active_annotations: Vec::new(),
         }
     }
 
@@ -161,6 +204,66 @@ impl ChatToResponsesConverter {
     pub fn with_think_tag_split(mut self, enabled: bool) -> Self {
         self.enable_think_tag_split = enabled;
         self
+    }
+
+    /// 注入原入站 Responses API request 的**完整 body**(未展平 / 未转换)。
+    /// envelope 构造时从中抽取 tools / parallel_tool_calls / tool_choice /
+    /// reasoning / text / metadata / previous_response_id / instructions /
+    /// temperature / top_p / max_output_tokens / truncation 等字段,保协议
+    /// 合规性。**同时**扫描 tools 里 `type:"namespace"` 包,建立
+    /// `function.name → namespace.name` 反查表,emit function_call 相关
+    /// events 时给 item 加 `namespace` 字段(Codex.app dispatch 必要字段)。
+    /// 借鉴 mimo2codex `streamToSse.ts:75-105` `buildResponseSnapshot`(全字段
+    /// 回灌)+ `Codex.app` binary strings 实证(`DynamicToolCallRequest` 含
+    /// namespace 必填字段)。
+    pub fn with_original_request(mut self, request: Option<Value>) -> Self {
+        self.tool_namespace_map = build_tool_namespace_map(request.as_ref());
+        self.original_request = request;
+        self
+    }
+
+    /// 查询 function.name 对应的 namespace.name(用于给 function_call output
+    /// 添加 `namespace` 字段,让 Codex.app 客户端能 dispatch 到对应 MCP server)。
+    fn lookup_namespace_for(&self, tool_name: &str) -> Option<&str> {
+        self.tool_namespace_map.get(tool_name).map(String::as_str)
+    }
+
+    /// 从 `original_request` 抽取一个字段;不存在时返回 fallback `Value`。
+    fn req_field_or<'a>(&'a self, key: &str, fallback: Value) -> Value {
+        self.original_request
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .cloned()
+            .unwrap_or(fallback)
+    }
+
+    /// 构造 envelope 共享部分(`response.created` / `response.in_progress` /
+    /// `response.completed` / `response.failed` 都用这一份字段集),对齐
+    /// mimo2codex `streamToSse.ts:75-105` `buildResponseSnapshot`。
+    fn build_envelope(&self, status: &str) -> Value {
+        // tools / tool_choice / parallel_tool_calls / reasoning / text /
+        // metadata / previous_response_id / instructions / temperature /
+        // top_p / max_output_tokens 12 个字段 + envelope 自带 id/object/
+        // status/model/created_at/truncation = 18 个字段。
+        json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created_at,
+            "status": status,
+            "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
+            "tools": self.req_field_or("tools", json!([])),
+            "tool_choice": self.req_field_or("tool_choice", json!("auto")),
+            "parallel_tool_calls": self.req_field_or("parallel_tool_calls", json!(true)),
+            "reasoning": self.req_field_or("reasoning", json!({"effort": null, "summary": null})),
+            "text": self.req_field_or("text", json!({"format": {"type": "text"}})),
+            "metadata": self.req_field_or("metadata", Value::Null),
+            "previous_response_id": self.req_field_or("previous_response_id", Value::Null),
+            "instructions": self.req_field_or("instructions", Value::Null),
+            "temperature": self.req_field_or("temperature", Value::Null),
+            "top_p": self.req_field_or("top_p", Value::Null),
+            "max_output_tokens": self.req_field_or("max_output_tokens", Value::Null),
+            "truncation": "disabled",
+        })
     }
 
     pub fn assistant_message(&self) -> Option<Value> {
@@ -249,22 +352,27 @@ impl ChatToResponsesConverter {
     /// 不发就会卡住;Codex CLI 0.x/1.x 实测能容忍但不应当依赖这条容忍。
     /// 与 Python pre-refactor `streaming_adapter.py:266-281`、litellm
     /// `streaming_iterator.py:434-444` 行为一致。
-    fn emit_lifecycle_open(&self, out: &mut Vec<u8>) {
-        let envelope = json!({
-            "id": self.response_id,
-            "object": "response",
-            "status": "in_progress",
-            "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
-        });
+    fn emit_lifecycle_open(&mut self, out: &mut Vec<u8>) {
+        // open 状态下 envelope 还没有 output / usage / incomplete_details /
+        // error,但已含 id/created_at/tools/tool_choice 等所有合规字段。
+        let mut envelope = self.build_envelope("in_progress");
+        envelope["output"] = json!([]);
+        envelope["usage"] = Value::Null;
+        envelope["incomplete_details"] = Value::Null;
+        envelope["error"] = Value::Null;
+        let created_payload = json!({"type": "response.created", "response": envelope.clone()});
+        let in_progress_payload = json!({"type": "response.in_progress", "response": envelope});
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.created",
-            json!({"type": "response.created", "response": envelope.clone()}),
+            created_payload,
         );
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.in_progress",
-            json!({"type": "response.in_progress", "response": envelope}),
+            in_progress_payload,
         );
     }
 
@@ -329,6 +437,15 @@ impl ChatToResponsesConverter {
             }
         }
 
+        // url citation annotations(MiMo / Kimi / 其他支持 web_search 的 provider
+        // 在 delta.annotations 里返回引用)。借鉴 mimo2codex `streamToSse.ts:338-352`:
+        // 每条 annotation 转换字段(`summary` → `snippet`)、push 到 active_annotations
+        // 累计、emit `response.output_text.annotation.added` event。前提是有 active
+        // message item(annotation 必须挂在 message 上),没有就先 open。
+        if !choice.delta.annotations.is_empty() {
+            self.handle_annotations_delta(&choice.delta.annotations, out);
+        }
+
         // tool_calls(可能与 content / reasoning 同帧;此处独立处理)
         for tc in &choice.delta.tool_calls {
             self.handle_tool_call_delta(tc, out);
@@ -383,20 +500,31 @@ impl ChatToResponsesConverter {
                     closed: false,
                 },
             );
+            // 如果 function name 来自 namespace 包(从 original_request.tools
+            // 反查表查到),给 item 加 `namespace` 字段 — Codex.app 客户端
+            // dispatch namespace 工具时这是必要字段(strings 实证 binary 含
+            // `dynamic tool namespace must not be empty for` 校验,缺字段会
+            // 报 `unsupported call: <name>`)。
+            let namespace = self.lookup_namespace_for(&name).map(str::to_owned);
+            let mut item = json!({
+                "type": "function_call",
+                "id": fc_id,
+                "call_id": call_id,
+                "name": name,
+                "arguments": "",
+                "status": "in_progress",
+            });
+            if let Some(ns) = namespace.as_ref() {
+                item["namespace"] = Value::String(ns.clone());
+            }
             emit_event(
                 out,
+                &mut self.sequence_number,
                 "response.output_item.added",
                 json!({
                     "type": "response.output_item.added",
                     "output_index": output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": fc_id,
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": "",
-                        "status": "in_progress",
-                    },
+                    "item": item,
                 }),
             );
         }
@@ -435,6 +563,7 @@ impl ChatToResponsesConverter {
                     let output_index = pending.output_index;
                     emit_event(
                         out,
+                        &mut self.sequence_number,
                         "response.function_call_arguments.delta",
                         json!({
                             "type": "response.function_call_arguments.delta",
@@ -449,36 +578,54 @@ impl ChatToResponsesConverter {
     }
 
     fn close_tool_call(&mut self, openai_index: u32, out: &mut Vec<u8>) {
-        let Some(pending) = self.tool_calls.get_mut(&openai_index) else {
-            return;
+        // 先把所有需要的字段 clone 出来,避免 mutable borrow 跟
+        // self.lookup_namespace_for 的 immutable borrow 冲突
+        let (fc_id, call_id, name, args_acc, output_index, already_closed) = {
+            let Some(pending) = self.tool_calls.get(&openai_index) else {
+                return;
+            };
+            (
+                pending.fc_id.clone(),
+                pending.call_id.clone(),
+                pending.name.clone(),
+                pending.args_acc.clone(),
+                pending.output_index,
+                pending.closed,
+            )
         };
-        if pending.closed {
+        if already_closed {
             return;
         }
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.function_call_arguments.done",
             json!({
                 "type": "response.function_call_arguments.done",
-                "item_id": pending.fc_id,
-                "output_index": pending.output_index,
-                "arguments": pending.args_acc,
+                "item_id": fc_id,
+                "output_index": output_index,
+                "arguments": args_acc,
             }),
         );
-        let item = json!({
+        let namespace = self.lookup_namespace_for(&name).map(str::to_owned);
+        let mut item = json!({
             "type": "function_call",
-            "id": pending.fc_id,
-            "call_id": pending.call_id,
-            "name": pending.name,
-            "arguments": pending.args_acc,
+            "id": fc_id,
+            "call_id": call_id,
+            "name": name,
+            "arguments": args_acc,
             "status": "completed",
         });
+        if let Some(ns) = namespace.as_ref() {
+            item["namespace"] = Value::String(ns.clone());
+        }
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_item.done",
             json!({
                 "type": "response.output_item.done",
-                "output_index": pending.output_index,
+                "output_index": output_index,
                 "item": item,
             }),
         );
@@ -486,13 +633,15 @@ impl ChatToResponsesConverter {
         // Codex CLI 发 function_call_output 时 repair_tool_call_ids 路径 B
         // 在前 assistant 找不到 call_id 时重建工具调用上下文。
         global_tool_call_cache().save(
-            &pending.call_id,
+            &call_id,
             ToolCallEntry {
-                name: pending.name.clone(),
-                arguments: pending.args_acc.clone(),
+                name: name.clone(),
+                arguments: args_acc.clone(),
             },
         );
-        pending.closed = true;
+        if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+            pending.closed = true;
+        }
     }
 
     fn emit_reasoning_delta(&mut self, text: &str, out: &mut Vec<u8>) {
@@ -502,6 +651,7 @@ impl ChatToResponsesConverter {
         self.reasoning_acc.push_str(text);
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.reasoning_summary_text.delta",
             json!({
                 "type": "response.reasoning_summary_text.delta",
@@ -526,6 +676,7 @@ impl ChatToResponsesConverter {
         self.text_acc.push_str(text);
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_text.delta",
             json!({
                 "type": "response.output_text.delta",
@@ -551,6 +702,45 @@ impl ChatToResponsesConverter {
             return;
         }
         self.drain_think_tag_buffer(out, true);
+    }
+
+    /// 处理 chat completions stream 的 `delta.annotations` 字段(URL citation)。
+    /// 借鉴 mimo2codex `streamToSse.ts:338-352`:
+    /// 1. annotation 必须挂在 message item 上,没 active message 就先开
+    /// 2. 字段映射:`summary` → `snippet`,缺失字段(`type` / `url` / `title`)填默认
+    /// 3. 累计到 `active_annotations`(close message 时塞进 final item content[0].annotations)
+    /// 4. emit `response.output_text.annotation.added`(逐 annotation 一个事件)
+    fn handle_annotations_delta(&mut self, annotations: &[Value], out: &mut Vec<u8>) {
+        if annotations.is_empty() {
+            return;
+        }
+        // annotations 必须挂在 message 上;reasoning open 时先 close,然后 open message
+        if self.reasoning_open && !self.reasoning_closed {
+            self.close_reasoning(out);
+        }
+        if !self.message_open {
+            self.open_message(out);
+        }
+        for annotation in annotations {
+            let translated = translate_annotation(annotation);
+            let annotation_index = self.active_annotations.len();
+            self.active_annotations.push(translated.clone());
+            let item_id = self.message_id.clone();
+            let output_index = self.message_index;
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_text.annotation.added",
+                json!({
+                    "type": "response.output_text.annotation.added",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "annotation_index": annotation_index,
+                    "annotation": translated,
+                }),
+            );
+        }
     }
 
     /// MiniMax 原生 OpenAI-compatible 格式会把 thinking 写进
@@ -620,15 +810,19 @@ impl ChatToResponsesConverter {
         }
     }
 
-    fn tool_call_item_completed(pending: &PendingToolCall) -> Value {
-        json!({
+    fn tool_call_item_completed(&self, pending: &PendingToolCall) -> Value {
+        let mut item = json!({
             "type": "function_call",
             "id": pending.fc_id,
             "call_id": pending.call_id,
             "name": pending.name,
             "arguments": pending.args_acc,
             "status": "completed",
-        })
+        });
+        if let Some(ns) = self.lookup_namespace_for(&pending.name) {
+            item["namespace"] = Value::String(ns.to_owned());
+        }
+        item
     }
 
     fn open_reasoning(&mut self, out: &mut Vec<u8>) {
@@ -637,6 +831,7 @@ impl ChatToResponsesConverter {
         self.next_output_index += 1;
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_item.added",
             json!({
                 "type": "response.output_item.added",
@@ -653,6 +848,7 @@ impl ChatToResponsesConverter {
         );
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.reasoning_summary_part.added",
             json!({
                 "type": "response.reasoning_summary_part.added",
@@ -669,11 +865,12 @@ impl ChatToResponsesConverter {
         // (只在 `/transcript` 命令可见)。OpenAI o1/o3 自带 section header,
         // 但 Kimi for Coding / DeepSeek thinking 等纯文本流默认无 `**`,
         // 不补 prefix 就会被整段隐藏。详见
-        // `docs/kimi-reasoning-truncation-investigation.md` §5.4 根因结论。
+        // `docs/investigation/kimi-reasoning-truncation.md` §5.4 根因结论。
         const REASONING_HEADER: &str = "**Thinking**\n\n";
         self.reasoning_acc.push_str(REASONING_HEADER);
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.reasoning_summary_text.delta",
             json!({
                 "type": "response.reasoning_summary_text.delta",
@@ -688,6 +885,7 @@ impl ChatToResponsesConverter {
     fn close_reasoning(&mut self, out: &mut Vec<u8>) {
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.reasoning_summary_text.done",
             json!({
                 "type": "response.reasoning_summary_text.done",
@@ -699,6 +897,7 @@ impl ChatToResponsesConverter {
         );
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.reasoning_summary_part.done",
             json!({
                 "type": "response.reasoning_summary_part.done",
@@ -711,13 +910,16 @@ impl ChatToResponsesConverter {
                 },
             }),
         );
+        let reasoning_item = self.reasoning_item_completed();
+        let reasoning_index = self.reasoning_index;
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_item.done",
             json!({
                 "type": "response.output_item.done",
-                "output_index": self.reasoning_index,
-                "item": self.reasoning_item_completed(),
+                "output_index": reasoning_index,
+                "item": reasoning_item,
             }),
         );
         self.reasoning_closed = true;
@@ -743,6 +945,7 @@ impl ChatToResponsesConverter {
         self.next_output_index += 1;
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_item.added",
             json!({
                 "type": "response.output_item.added",
@@ -758,6 +961,7 @@ impl ChatToResponsesConverter {
         );
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.content_part.added",
             json!({
                 "type": "response.content_part.added",
@@ -772,6 +976,7 @@ impl ChatToResponsesConverter {
     fn close_message(&mut self, out: &mut Vec<u8>) {
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_text.done",
             json!({
                 "type": "response.output_text.done",
@@ -781,8 +986,14 @@ impl ChatToResponsesConverter {
                 "text": self.text_acc,
             }),
         );
+        // close 时 part / final item 的 annotations 用累计的实际值
+        // (open 时是 `[]` 因为还没 annotation,delta.annotations 处理时累计到
+        // self.active_annotations,close 时塞回)。借鉴 mimo2codex
+        // `streamToSse.ts:230-256` `finalizeActive` 的 message 分支。
+        let annotations = Value::Array(self.active_annotations.clone());
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.content_part.done",
             json!({
                 "type": "response.content_part.done",
@@ -792,17 +1003,20 @@ impl ChatToResponsesConverter {
                 "part": {
                     "type": "output_text",
                     "text": self.text_acc,
-                    "annotations": [],
+                    "annotations": annotations,
                 },
             }),
         );
+        let message_item = self.message_item_completed();
+        let message_index = self.message_index;
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_item.done",
             json!({
                 "type": "response.output_item.done",
-                "output_index": self.message_index,
-                "item": self.message_item_completed(),
+                "output_index": message_index,
+                "item": message_item,
             }),
         );
         self.message_closed = true;
@@ -817,7 +1031,10 @@ impl ChatToResponsesConverter {
             "content": [{
                 "type": "output_text",
                 "text": self.text_acc,
-                "annotations": [],
+                // 累计 url citations(delta.annotations 解析后)。借鉴
+                // mimo2codex `streamToSse.ts:245-251` `finalItem` 的 message
+                // 分支结构。
+                "annotations": Value::Array(self.active_annotations.clone()),
             }],
         })
     }
@@ -843,6 +1060,11 @@ impl ChatToResponsesConverter {
             self.close_tool_call(idx, out);
         }
 
+        // finish_reason → status / incomplete_details 映射。保留现有 5 路径
+        // 行为(Codex CLI 实测能容忍 `response.completed status:incomplete`)。
+        // mimo2codex `streamToSse.ts:403-411` 走 `response.failed` 路径需要
+        // 区分 "EOF 中断" vs "真上游错误",当前 converter 拿不到这个上下文,
+        // 留 follow-up 处理(单独 PR + 改 stream.rs 错误流路径标记)。
         let (status, incomplete_details) = match (self.finish_reason.as_deref(), from_done) {
             (Some("stop") | Some("tool_calls") | Some("function_call"), _) => {
                 ("completed", Value::Null)
@@ -863,28 +1085,31 @@ impl ChatToResponsesConverter {
             all_items.push((self.message_index, self.message_item_completed()));
         }
         for tc in self.tool_calls.values() {
-            all_items.push((tc.output_index, Self::tool_call_item_completed(tc)));
+            all_items.push((tc.output_index, self.tool_call_item_completed(tc)));
         }
         all_items.sort_by_key(|(idx, _)| *idx);
         let output_items: Vec<Value> = all_items.into_iter().map(|(_, v)| v).collect();
 
-        let mut completed = json!({
-            "type": "response.completed",
-            "response": {
-                "id": self.response_id,
-                "object": "response",
-                "status": status,
-                "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
-                "output": output_items,
-                "incomplete_details": incomplete_details,
-            },
-        });
+        let mut envelope = self.build_envelope(status);
+        envelope["output"] = Value::Array(output_items);
+        envelope["incomplete_details"] = incomplete_details;
+        envelope["error"] = Value::Null;
         // Codex CLI 反序列化 `ResponseCompleted` 时 usage 中的 `input_tokens` /
         // `output_tokens` / `total_tokens` 是必填,缺一帧就整流断开重连。Chat
         // 上游的 `prompt_tokens` / `completion_tokens` 与 Responses 的字段名
         // 不同,部分 provider 也可能完全不发 usage,这里统一规范化。
-        completed["response"]["usage"] = normalize_usage_to_responses_shape(self.usage.clone());
-        emit_event(out, "response.completed", completed);
+        envelope["usage"] = normalize_usage_to_responses_shape(self.usage.clone());
+
+        let final_payload = json!({
+            "type": "response.completed",
+            "response": envelope,
+        });
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.completed",
+            final_payload,
+        );
         self.state = State::Done;
     }
 }
@@ -984,12 +1209,47 @@ fn normalize_usage_to_responses_shape(usage: Option<Value>) -> Value {
     Value::Object(out)
 }
 
-fn emit_event(out: &mut Vec<u8>, event_name: &str, payload: Value) {
-    let line = format!(
-        "event: {event_name}\ndata: {}\n\n",
-        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into())
+/// 写一帧 SSE event。`seq` 是 `ChatToResponsesConverter::sequence_number` 的可变
+/// 引用 —— 函数自动把当前值塞进 payload `sequence_number` 字段并 +1。借鉴
+/// mimo2codex `streamToSse.ts:71-72` `sequence_number: state.nextSeq()`,严格
+/// Responses 协议客户端依赖此字段确保事件不丢 / 不乱序。
+/// 把 chat completions `delta.annotations[]` 单条 annotation(MiMo / Kimi /
+/// 其他 provider 模型回答里 URL citation 的载体)翻译成 Responses API 的
+/// `response.output_text.annotation.added` event 里的 annotation 形态。
+///
+/// 借鉴 mimo2codex `streamToSse.ts:156-163` `translateAnnotation`:
+/// - `type` 默认 `"url_citation"`(对齐 OpenAI Responses API 标准 annotation type)
+/// - `url` / `title` 缺失填空字符串(严格协议客户端不容缺字段)
+/// - **`summary` → `snippet`**(mimo2codex 重命名,跟 OpenAI Responses
+///   url_citation annotation schema 对齐;summary 在 OpenAI 标准里没有,
+///   snippet 是其引用预览的字段名)
+fn translate_annotation(a: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    let atype = a
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("url_citation");
+    out.insert("type".into(), Value::String(atype.to_owned()));
+    out.insert(
+        "url".into(),
+        a.get("url")
+            .cloned()
+            .unwrap_or_else(|| Value::String(String::new())),
     );
-    out.extend_from_slice(line.as_bytes());
+    out.insert(
+        "title".into(),
+        a.get("title")
+            .cloned()
+            .unwrap_or_else(|| Value::String(String::new())),
+    );
+    if let Some(summary) = a.get("summary") {
+        out.insert("snippet".into(), summary.clone());
+    }
+    Value::Object(out)
+}
+
+fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, payload: Value) {
+    emit_sse_event(out, seq, event_name, payload);
 }
 
 fn drain_one_frame(buf: &mut BytesMut) -> Option<Bytes> {
@@ -1073,6 +1333,14 @@ struct ChatDelta {
     /// 文本 / reasoning 全丢。这里走 Option 兜底再 flatten 回空 Vec。
     #[serde(default, deserialize_with = "deserialize_null_or_missing_to_empty_vec")]
     tool_calls: Vec<ChatToolCallDelta>,
+    /// MiMo / Kimi / 其他 chat 上游在模型回答里引用网页 / 文档时,通过
+    /// `delta.annotations` 增量返回 url citations。OpenAI 标准 chat
+    /// completions 也支持(web_search 启用后),所有 provider 通用。
+    /// 借鉴 mimo2codex `streamToSse.ts:338-352` 解析 + emit
+    /// `response.output_text.annotation.added` event。
+    /// 注释跟其他可空字段对齐,允许 null / missing 兜底为空 Vec。
+    #[serde(default, deserialize_with = "deserialize_null_or_missing_to_empty_vec")]
+    annotations: Vec<Value>,
     /// 旧版 Chat Completions 单工具调用增量。OpenAI 后续改为
     /// `tool_calls[]`,但 1.0.x 已把 `finish_reason=function_call` 视为完成,
     /// 这里把流式 delta 直接转成 index=0 的 function_call item。
@@ -1252,6 +1520,466 @@ mod tests {
         assert_eq!(events[0].1["response"]["status"], "in_progress");
         assert_eq!(events[0].1["response"]["model"], "mock");
         assert_eq!(events[1].1["response"]["model"], "mock");
+    }
+
+    // ── envelope tools 字段(MCP namespace 反向路由)──
+    // 借鉴 mimo2codex streamToSse.ts:102 / respToResponses.ts:117。Codex CLI
+    // 用响应 envelope 里的 tools 数组 + (namespace, function.name) 复合主键
+    // 反向路由 namespace 包装的 MCP 工具 function_call。
+
+    #[test]
+    fn envelope_includes_original_tools_in_lifecycle_events() {
+        let original_tools = json!([
+            {"type": "function", "name": "shell"},
+            {"type": "namespace", "name": "mcp__notion__", "tools": [
+                {"type": "function", "name": "notion_search"}
+            ]}
+        ]);
+        let original_request = json!({
+            "model": "kimi",
+            "tools": original_tools.clone(),
+        });
+        let mut c =
+            ChatToResponsesConverter::new_with_ids("resp_x".into(), "msg_x".into(), "rs_x".into())
+                .with_original_request(Some(original_request));
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"model":"kimi","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        // response.created envelope 含完整原始 tools(未展平的 namespace)
+        let created = events
+            .iter()
+            .find(|(n, _)| n == "response.created")
+            .expect("response.created emitted");
+        assert_eq!(
+            created.1["response"]["tools"], original_tools,
+            "response.created envelope 必须含原始 tools 数组,Codex CLI 据此反向路由"
+        );
+
+        // response.in_progress 同 envelope
+        let in_progress = events
+            .iter()
+            .find(|(n, _)| n == "response.in_progress")
+            .expect("response.in_progress emitted");
+        assert_eq!(in_progress.1["response"]["tools"], original_tools);
+
+        // response.completed 也含 tools
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .expect("response.completed emitted");
+        assert_eq!(completed.1["response"]["tools"], original_tools);
+    }
+
+    #[test]
+    fn envelope_includes_all_responses_api_fields_for_protocol_compliance() {
+        // 严格 Responses 协议客户端期待 envelope 含 16+ 字段。借鉴 mimo2codex
+        // streamToSse.ts:75-105 buildResponseSnapshot 全字段策略。
+        let original_request = json!({
+            "model": "kimi-for-coding",
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "high", "summary": null},
+            "text": {"format": {"type": "text"}},
+            "metadata": {"trace_id": "abc"},
+            "previous_response_id": "resp_prev_xyz",
+            "instructions": "You are helpful.",
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 2048,
+        });
+        let mut c =
+            ChatToResponsesConverter::new_with_ids("resp_x".into(), "msg_x".into(), "rs_x".into())
+                .with_original_request(Some(original_request.clone()));
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"model":"kimi","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        for (event_name, expected_status) in [
+            ("response.created", "in_progress"),
+            ("response.in_progress", "in_progress"),
+            ("response.completed", "completed"),
+        ] {
+            let ev = events
+                .iter()
+                .find(|(n, _)| n == event_name)
+                .unwrap_or_else(|| panic!("{event_name} not emitted"));
+            let resp = &ev.1["response"];
+            assert_eq!(resp["status"], expected_status);
+            // 全字段必须存在(即使 null)以满足严格协议解析
+            for field in [
+                "id",
+                "object",
+                "created_at",
+                "status",
+                "model",
+                "tools",
+                "tool_choice",
+                "parallel_tool_calls",
+                "reasoning",
+                "text",
+                "metadata",
+                "previous_response_id",
+                "instructions",
+                "temperature",
+                "top_p",
+                "max_output_tokens",
+                "truncation",
+                "output",
+                "usage",
+                "incomplete_details",
+                "error",
+            ] {
+                assert!(
+                    resp.get(field).is_some(),
+                    "{event_name} envelope missing field `{field}`\nactual: {resp}"
+                );
+            }
+            // 关键字段值回灌正确
+            assert_eq!(resp["tool_choice"], "auto");
+            assert_eq!(resp["parallel_tool_calls"], true);
+            assert_eq!(resp["reasoning"]["effort"], "high");
+            assert_eq!(resp["temperature"], 0.7);
+            assert_eq!(resp["previous_response_id"], "resp_prev_xyz");
+            assert_eq!(resp["truncation"], "disabled");
+            assert!(
+                resp["created_at"].as_u64().is_some(),
+                "created_at must be unix seconds"
+            );
+        }
+    }
+
+    #[test]
+    fn function_call_item_includes_namespace_field_when_tool_came_from_namespace_pack() {
+        // 关键修复:Codex.app 客户端 dispatch namespace 工具时必须读 `namespace`
+        // 字段(strings 实证 binary 含 `dynamic tool namespace must not be empty`
+        // 校验)。converter 扫 original_request.tools 里 namespace 包,建反查表,
+        // emit function_call output 时给 item 加 namespace。
+        let original_request = json!({
+            "model": "kimi",
+            "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "namespace", "name": "mcp__notion__", "tools": [
+                    {"type": "function", "name": "notion_search"},
+                    {"type": "function", "name": "notion_create_pages"},
+                ]},
+                {"type": "namespace", "name": "mcp__figma__", "tools": [
+                    {"type": "function", "name": "whoami"},
+                ]},
+            ]
+        });
+        let mut c =
+            ChatToResponsesConverter::new_with_ids("resp_x".into(), "msg_x".into(), "rs_x".into())
+                .with_original_request(Some(original_request));
+        let mut all = Vec::new();
+        // 模型生成 tool_call: notion_search
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"notion_search","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        // response.output_item.added 的 item 必须含 namespace = mcp__notion__
+        let added = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.added"
+                    && p["item"].get("type").and_then(|v| v.as_str()) == Some("function_call")
+            })
+            .expect("function_call output_item.added emitted");
+        assert_eq!(
+            added.1["item"]["namespace"], "mcp__notion__",
+            "function_call.added item 必须含 namespace 字段(Codex.app dispatch 必要)"
+        );
+        assert_eq!(added.1["item"]["name"], "notion_search");
+
+        // response.output_item.done 同理
+        let done = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.done"
+                    && p["item"].get("type").and_then(|v| v.as_str()) == Some("function_call")
+            })
+            .expect("function_call output_item.done emitted");
+        assert_eq!(done.1["item"]["namespace"], "mcp__notion__");
+
+        // response.completed 里的 output 数组 final item 也要含 namespace
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .expect("response.completed emitted");
+        let final_output = completed.1["response"]["output"].as_array().unwrap();
+        let final_fc = final_output
+            .iter()
+            .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
+            .expect("function_call in completed output");
+        assert_eq!(final_fc["namespace"], "mcp__notion__");
+    }
+
+    #[test]
+    fn function_call_item_omits_namespace_when_tool_is_top_level_function() {
+        // 顶级 function(非 namespace 包内层),item 不应含 namespace 字段,
+        // 否则 Codex.app 可能把它误当 dynamic tool 路由到不存在的 server。
+        let original_request = json!({
+            "model": "kimi",
+            "tools": [{"type": "function", "name": "shell"}]
+        });
+        let mut c =
+            ChatToResponsesConverter::new_with_ids("resp_x".into(), "msg_x".into(), "rs_x".into())
+                .with_original_request(Some(original_request));
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"shell","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let added = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.added"
+                    && p["item"].get("type").and_then(|v| v.as_str()) == Some("function_call")
+            })
+            .unwrap();
+        assert!(
+            added.1["item"].get("namespace").is_none(),
+            "顶级 function 不应有 namespace 字段;got: {}",
+            added.1["item"]
+        );
+    }
+
+    // ── delta.annotations → response.output_text.annotation.added 通用入站处理
+    // 借鉴 mimo2codex `streamToSse.ts:156-163, 338-352` 1:1 复刻,跨所有 provider
+    // 通用(任何 chat 上游模型回答里 URL 引用都会用 delta.annotations 携带)。
+
+    #[test]
+    fn delta_annotations_emit_url_citation_event_with_summary_renamed_to_snippet() {
+        // 关键字段重命名:`summary` → `snippet`(对齐 OpenAI Responses url_citation
+        // schema,mimo2codex `streamToSse.ts:161` 同样做)
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"see ref"}}]}
+
+"#,
+        ));
+        // 单 chunk 含 1 个 annotation,带 summary 字段
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"annotations":[{"type":"url_citation","url":"https://example.com/x","title":"Example","summary":"Brief excerpt"}]}}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let added = events
+            .iter()
+            .find(|(n, _)| n == "response.output_text.annotation.added")
+            .expect("annotation.added emitted");
+        assert_eq!(added.1["annotation"]["type"], "url_citation");
+        assert_eq!(added.1["annotation"]["url"], "https://example.com/x");
+        assert_eq!(added.1["annotation"]["title"], "Example");
+        assert_eq!(
+            added.1["annotation"]["snippet"], "Brief excerpt",
+            "summary 字段必须被重命名为 snippet"
+        );
+        assert!(
+            added.1["annotation"].get("summary").is_none(),
+            "原 summary 字段不该出现在 Responses 端 annotation 里"
+        );
+        assert_eq!(added.1["annotation_index"], 0);
+        assert_eq!(added.1["content_index"], 0);
+    }
+
+    #[test]
+    fn multiple_annotations_in_one_chunk_each_get_unique_increasing_index() {
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}
+
+"#,
+        ));
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"annotations":[{"type":"url_citation","url":"https://a.com","title":"A"},{"url":"https://b.com","title":"B"}]}}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let indices: Vec<i64> = events
+            .iter()
+            .filter(|(n, _)| n == "response.output_text.annotation.added")
+            .map(|(_, p)| p["annotation_index"].as_i64().unwrap())
+            .collect();
+        assert_eq!(indices, vec![0, 1], "多 annotation 索引单调递增 0,1,...");
+        // 第 2 条没传 type 字段,默认 "url_citation"
+        let second = events
+            .iter()
+            .filter(|(n, _)| n == "response.output_text.annotation.added")
+            .nth(1)
+            .unwrap();
+        assert_eq!(second.1["annotation"]["type"], "url_citation");
+        assert_eq!(second.1["annotation"]["url"], "https://b.com");
+    }
+
+    #[test]
+    fn final_message_item_includes_accumulated_annotations() {
+        // close 时 final message item 的 content[0].annotations 必须含累积的所有
+        // annotation,不再是写死 `[]`。借鉴 mimo2codex `streamToSse.ts:245-251`
+        // `finalItem` 的 message 分支结构。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"hello"}}]}
+
+"#,
+        ));
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"annotations":[{"url":"https://x.com","title":"X"}]}}]}
+
+"#,
+        ));
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let final_msg = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "message")
+            .expect("message in output");
+        let annotations = final_msg["content"][0]["annotations"]
+            .as_array()
+            .expect("annotations array");
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0]["url"], "https://x.com");
+        assert_eq!(annotations[0]["type"], "url_citation");
+    }
+
+    #[test]
+    fn annotations_open_message_item_when_none_active() {
+        // delta.annotations 出现时如果还没有 active message,自动 open 一个
+        // (annotation 必须挂在 message 上)。借鉴 mimo2codex `streamToSse.ts:339`:
+        // `if (state.activeKind !== "message") openMessage(sink, state)`。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        // 直接发只含 annotation 的 chunk(无 content delta)
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"annotations":[{"url":"https://only.com","title":"Only"}]}}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        // 应该 open 了 message item
+        let msg_added = events
+            .iter()
+            .find(|(n, p)| n == "response.output_item.added" && p["item"]["type"] == "message")
+            .expect("message output_item should be opened for orphan annotations");
+        assert_eq!(msg_added.1["item"]["role"], "assistant");
+        // 然后 emit annotation
+        let annot = events
+            .iter()
+            .find(|(n, _)| n == "response.output_text.annotation.added")
+            .expect("annotation event emitted after message open");
+        assert_eq!(annot.1["annotation"]["url"], "https://only.com");
+    }
+
+    #[test]
+    fn no_annotations_means_final_message_annotations_stays_empty() {
+        // 普通对话(无 annotation),final message annotations 是 [],跟旧行为一致
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"plain text"},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let final_msg = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "message")
+            .unwrap();
+        assert_eq!(final_msg["content"][0]["annotations"], json!([]));
+    }
+
+    #[test]
+    fn every_sse_event_has_monotonically_increasing_sequence_number() {
+        // 借鉴 mimo2codex streamToSse.ts:71-72 sequence_number: state.nextSeq()。
+        // 每个 SSE event payload 必须含 sequence_number 字段,且整流单调递增。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"model":"mock","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let mut prev: i64 = -1;
+        for (name, payload) in &events {
+            let seq = payload["sequence_number"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("event {name} missing sequence_number: {payload}"));
+            assert!(seq > prev, "{name} sequence_number {seq} not > prev {prev}");
+            prev = seq;
+        }
+        assert_eq!(events[0].1["sequence_number"], 0);
+    }
+
+    #[test]
+    fn envelope_tools_default_to_empty_array_when_unset() {
+        // 没调 with_original_tools 时 envelope tools 字段必须存在且为 [],
+        // 对齐 mimo2codex `state.req.tools ?? []`,严格 Responses 协议客户端
+        // 不容缺字段。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"model":"mock","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let created = events
+            .iter()
+            .find(|(n, _)| n == "response.created")
+            .unwrap();
+        assert_eq!(created.1["response"]["tools"], json!([]));
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        assert_eq!(completed.1["response"]["tools"], json!([]));
     }
 
     #[test]
@@ -1543,7 +2271,10 @@ data: {"choices":[{"index":0,"delta":{"content":" more</think>final"},"finish_re
         let out = c.feed(b"data: [DONE]\n\n");
         let events = parse_emitted(&out);
         let completed = &events.last().unwrap().1["response"];
-        assert_eq!(completed["output"][0]["summary"][0]["text"], "**Thinking**\n\nx");
+        assert_eq!(
+            completed["output"][0]["summary"][0]["text"],
+            "**Thinking**\n\nx"
+        );
         assert_eq!(completed["output"][1]["content"][0]["text"], "y");
     }
 
@@ -1953,6 +2684,50 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
         assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 1);
         assert!(usage.get("prompt_tokens_details").is_none());
         assert!(usage.get("completion_tokens_details").is_none());
+    }
+
+    /// Mimo 上游实测会发 `prompt_tokens_details: {}`(空对象,无 `cached_tokens`)。
+    /// Codex CLI 0.128.0-alpha.1 严格 parse `ResponseCompleted` 必须有
+    /// `usage.input_tokens_details.cached_tokens`,缺字段会触发"stream
+    /// disconnected" → 5 次重连重试 → 30s Mimo 推理被打 5 遍 ≈ 150s 卡顿
+    /// (2026-05-07 实测 fake_proxy + codex exec --json 复现)。本测试锁定:
+    /// 即使上游 details 是空对象或缺,我们 emit 都补 `cached_tokens: 0` /
+    /// `reasoning_tokens: 0` 默认值。
+    #[test]
+    fn empty_upstream_details_get_default_cached_and_reasoning_fields() {
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        // Mimo 实测形态:prompt_tokens_details 是空 {},completion_tokens_details
+        // 不发(整字段缺)。
+        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":54,\"completion_tokens\":1042,\"total_tokens\":1096,\"prompt_tokens_details\":{}}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(
+            usage["input_tokens_details"]["cached_tokens"], 0,
+            "上游 prompt_tokens_details 空时必须默认 cached_tokens=0"
+        );
+        assert_eq!(
+            usage["output_tokens_details"]["reasoning_tokens"], 0,
+            "上游缺 completion_tokens_details 时必须默认 reasoning_tokens=0"
+        );
+    }
+
+    #[test]
+    fn missing_subdetails_entirely_still_emit_required_fields() {
+        // 极端场景:上游 usage 完全没有 *_tokens_details 任何形态。
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 0);
     }
 
     // ── null 容忍(MiMo 真实帧形态)─────────────────────────────────────
