@@ -3,6 +3,8 @@ import {
   AlertTriangle,
   Check,
   DatabaseBackup,
+  Eye,
+  EyeOff,
   FileCode2,
   FolderPlus,
   LogOut,
@@ -62,6 +64,7 @@ import type {
 } from "./types";
 
 const profileNamePattern = /^[a-zA-Z0-9_-]{1,64}$/;
+const secretDots = "●●●●●●●●●●";
 
 type GatewayProviderForm = {
   id: string;
@@ -150,6 +153,9 @@ function App() {
   const [gatewayRestartRequired, setGatewayRestartRequired] = useState(false);
   const [openCodeProviderForm, setOpenCodeProviderForm] = useState<OpenCodeProviderForm | null>(null);
   const [openCodeModelForm, setOpenCodeModelForm] = useState<OpenCodeModelForm | null>(null);
+  const [showGatewayApiKey, setShowGatewayApiKey] = useState(false);
+  const [showGatewayProviderApiKey, setShowGatewayProviderApiKey] = useState(false);
+  const [showOpenCodeProviderApiKey, setShowOpenCodeProviderApiKey] = useState(false);
 
   const tool = useMemo(() => tools.find((item) => item.id === toolId), [tools, toolId]);
   const activeFile = useMemo(() => files.find((file) => file.id === activeFileId) ?? files[0], [files, activeFileId]);
@@ -236,6 +242,7 @@ function App() {
       const [config, statusData, logs] = await Promise.all([getGatewayConfig(), getGatewayStatus(), getGatewayLogs()]);
       setGatewayConfig(config);
       setGatewayStatus(statusData);
+      setShowGatewayApiKey(false);
       if (!statusData.running) {
         setGatewayRestartRequired(false);
       }
@@ -482,6 +489,7 @@ function App() {
   }
 
   function openGatewayProviderForm(provider?: GatewayConfig["providers"][number]) {
+    setShowGatewayProviderApiKey(false);
     if (!provider) {
       setGatewayProviderForm(emptyGatewayProviderForm);
       return;
@@ -490,7 +498,7 @@ function App() {
       id: provider.id,
       name: provider.name,
       baseUrl: provider.baseUrl,
-      apiKey: "",
+      apiKey: provider.apiKey || "",
       authScheme: provider.authScheme || "bearer",
       apiFormat: provider.apiFormat || "openai_chat",
       defaultModel: provider.models?.default || "",
@@ -599,6 +607,7 @@ function App() {
   }
 
   function openOpenCodeProviderForm() {
+    setShowOpenCodeProviderApiKey(false);
     setOpenCodeProviderForm(emptyOpenCodeProviderForm);
   }
 
@@ -999,7 +1008,18 @@ function App() {
                   </div>
                   <div>
                     <span>Gateway Key</span>
-                    <strong>{gatewayConfig?.gatewayApiKey ?? "-"}</strong>
+                    <div className="secret-row">
+                      <strong>{showGatewayApiKey ? gatewayConfig?.gatewayApiKey || "-" : gatewayConfig?.gatewayApiKey ? secretDots : "-"}</strong>
+                      <button
+                        type="button"
+                        className="secret-toggle"
+                        onClick={() => setShowGatewayApiKey((current) => !current)}
+                        disabled={!gatewayConfig?.gatewayApiKey}
+                        title={showGatewayApiKey ? "隐藏 Key" : "显示 Key"}
+                      >
+                        {showGatewayApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                      </button>
+                    </div>
                   </div>
                 </div>
               </section>
@@ -1162,12 +1182,22 @@ function App() {
               </label>
               <label>
                 API Key
-                <input
-                  value={gatewayProviderForm.apiKey}
-                  onChange={(event) => updateGatewayProviderForm("apiKey", event.target.value)}
-                  placeholder={gatewayProviderForm.id ? "留空则保持原 API Key" : "sk-..."}
-                  type="password"
-                />
+                <div className="secret-input-wrap">
+                  <input
+                    value={gatewayProviderForm.apiKey}
+                    onChange={(event) => updateGatewayProviderForm("apiKey", event.target.value)}
+                    placeholder={gatewayProviderForm.id ? "留空则保持原 API Key" : "sk-..."}
+                    type={showGatewayProviderApiKey ? "text" : "password"}
+                  />
+                  <button
+                    type="button"
+                    className="secret-toggle input"
+                    onClick={() => setShowGatewayProviderApiKey((current) => !current)}
+                    title={showGatewayProviderApiKey ? "隐藏 Key" : "显示 Key"}
+                  >
+                    {showGatewayProviderApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                  </button>
+                </div>
               </label>
               <label>
                 默认模型
@@ -1257,12 +1287,22 @@ function App() {
               </label>
               <label>
                 API Key
-                <input
-                  value={openCodeProviderForm.apiKey}
-                  onChange={(event) => updateOpenCodeProviderForm("apiKey", event.target.value)}
-                  placeholder="sk-..."
-                  type="password"
-                />
+                <div className="secret-input-wrap">
+                  <input
+                    value={openCodeProviderForm.apiKey}
+                    onChange={(event) => updateOpenCodeProviderForm("apiKey", event.target.value)}
+                    placeholder="sk-..."
+                    type={showOpenCodeProviderApiKey ? "text" : "password"}
+                  />
+                  <button
+                    type="button"
+                    className="secret-toggle input"
+                    onClick={() => setShowOpenCodeProviderApiKey((current) => !current)}
+                    title={showOpenCodeProviderApiKey ? "隐藏 Key" : "显示 Key"}
+                  >
+                    {showOpenCodeProviderApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                  </button>
+                </div>
               </label>
               <label>
                 初始模型 ID

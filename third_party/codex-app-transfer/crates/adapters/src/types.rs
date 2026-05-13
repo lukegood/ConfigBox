@@ -20,6 +20,16 @@ pub enum AdapterError {
     BodyDecode(#[from] serde_json::Error),
     #[error("internal: {0}")]
     Internal(String),
+    /// `previous_response_id` 在 session cache 未命中,且当前 input 不足以
+    /// 独立构成完整对话(messages 为空)。对齐 OpenAI Responses API 服务端
+    /// 真实行为(LM Studio bug tracker #1188、Microsoft semantic-kernel #13128
+    /// 等多源验证):返回 HTTP 400 + `code: "previous_response_not_found"`。
+    ///
+    /// proxy 层 IntoResponse 会把它转成 SDK 兼容的标准 OpenAI 错误体,Codex
+    /// CLI 看到 400 立即 fail-fast(不会进 5xx / transport timeout 重试路径),
+    /// 把延迟从分钟级降到秒级。
+    #[error("previous_response_not_found: {previous_response_id}")]
+    PreviousResponseNotFound { previous_response_id: String },
 }
 
 /// 单次请求经过 adapter 后,proxy 拿到的"出站计划".
@@ -34,6 +44,25 @@ pub struct RequestPlan {
     /// outbound response, so future `previous_response_id` requests can restore
     /// history.
     pub response_session: Option<ResponseSessionPlan>,
+    /// 是否是 `/responses/compact` 请求(由 Responses adapter 转换成 chat
+    /// completions 模拟 compact 端点)。`transform_response_stream` 据此选择
+    /// 直接 SSE 转换还是包装成 `{"output":[{"type":"compaction",...}]}` 响应。
+    pub is_compact: bool,
+    /// 原入站 Responses API request 的**完整 body**(未经任何展平 / 协议转换)。
+    /// chat→responses SSE 状态机用它构造合规 envelope:`response.created` /
+    /// `response.in_progress` / `response.completed` 三个生命周期事件的
+    /// `response` 对象需要回灌 `tools` / `parallel_tool_calls` / `tool_choice`
+    /// / `reasoning` / `text` / `metadata` / `previous_response_id` /
+    /// `instructions` / `temperature` / `top_p` / `max_output_tokens` /
+    /// `truncation` 等十多个字段(借鉴 mimo2codex `streamToSse.ts:75-105`
+    /// `buildResponseSnapshot`)。
+    ///
+    /// 关键作用是 `tools` 字段:Codex CLI 客户端用 envelope.tools + `(namespace,
+    /// function.name)` 复合主键路由模型生成的 function_call 到正确的 MCP server。
+    /// 缺这个字段时,namespace 包装的 MCP 工具调用会 "unsupported call"。
+    ///
+    /// openai_chat 路径不涉及此字段(入站本来就是 chat 格式,无 namespace 包装),留 None。
+    pub original_responses_request: Option<Value>,
 }
 
 #[derive(Debug, Clone)]

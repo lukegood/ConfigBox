@@ -534,6 +534,45 @@ select {
   letter-spacing: 0;
 }
 
+.secret-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.secret-row strong {
+  flex: 1 1 auto;
+}
+
+.secret-toggle {
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.secret-toggle.input {
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+}
+
+.secret-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.secret-input-wrap input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .provider-table {
   display: grid;
   gap: 7px;

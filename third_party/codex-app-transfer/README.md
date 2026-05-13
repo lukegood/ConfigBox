@@ -7,7 +7,7 @@ Source: https://github.com/Cmochance/codex-app-transfer
 
 License: MIT. See `LICENSE.txt`.
 
-Only the proxy, protocol adapters, registry, Codex integration helpers, and
-ConfigBox's headless gateway binary are kept here. Desktop/Tauri UI, docs,
+Only the proxy, protocol adapters, registry, Gemini OAuth helper, Codex
+integration helpers, and ConfigBox's headless gateway binary are kept here. Desktop/Tauri UI, docs,
 release tooling, screenshots, feedback worker, and other non-runtime assets are
 intentionally excluded from this vendored copy.

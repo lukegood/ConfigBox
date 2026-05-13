@@ -37,14 +37,44 @@ pub struct ResolvedProvider {
 pub enum AuthScheme {
     Bearer,
     XApiKey,
+    /// Google AI Studio Gemini API:`x-goog-api-key: <api_key>` header.
+    /// LiteLLM 注释(`common_utils.py:402`):API key 不放 URL,放 header
+    /// 防 traceback 泄露。
+    GoogleApiKey,
+    /// Google Cloud Code Assist OAuth 2.0:`Authorization: Bearer <oauth_access_token>`,
+    /// 但 access_token 不在 provider.api_key 里 — 由 `gemini_oauth::TokenStore`
+    /// 持久化 + `ensure_valid_access_token` 在请求时 load + auto refresh。
+    GoogleOauthCloudCode,
+    /// Antigravity OAuth — 跟 GoogleOauthCloudCode 共用 `cloudcode-pa` 上游端点
+    /// 但 OAuth 身份不同(client_id / scopes / UA / metadata)+ token 文件独立
+    /// (`~/.codex-app-transfer/antigravity-oauth.json`)。`gemini_oauth::antigravity::*`
+    /// 处理 flow / refresh / bootstrap;forward.rs 用此 scheme 路由到 antigravity
+    /// token store + 注入 antigravity UA / X-Goog-Api-Client。
+    GoogleOauthAntigravity,
+    /// grok.com Web 后端 cookie 鉴权:`Cookie: sso=<JWT>; sso-rw=<JWT>; cf_clearance=<token>`
+    /// + `x-statsig-id` + `x-xai-request-id`(详见 `crates/adapters/src/grok_web/auth.rs`)。
+    ///
+    /// Cookie 不在 provider.api_key,而在 `provider.extra["grokWeb"]["cookies"]` JSON object。
+    GrokCookie,
     /// 不写鉴权头(上游免认证 / 走 cookie 等少见情况).
     None,
 }
 
 impl AuthScheme {
     pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "x-api-key" | "x_api_key" | "xapikey" | "apikey" => AuthScheme::XApiKey,
+        // 统一 normalize:trim + lowercase + dash→underscore,所有 alias 不再单独
+        // 列 dash 形态(对齐 AdapterRegistry::lookup 同样 normalize)。
+        let normalized = s.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "x_api_key" | "xapikey" | "apikey" => AuthScheme::XApiKey,
+            "google_api_key" | "x_goog_api_key" | "google" | "gemini" => AuthScheme::GoogleApiKey,
+            "google_oauth_cloud_code" | "google_oauth" | "gemini_cli_oauth" | "gemini_oauth" => {
+                AuthScheme::GoogleOauthCloudCode
+            }
+            "google_oauth_antigravity" | "antigravity_oauth" | "antigravity" => {
+                AuthScheme::GoogleOauthAntigravity
+            }
+            "grok_cookie" | "grok" | "grok_web" => AuthScheme::GrokCookie,
             "" | "none" | "no" => AuthScheme::None,
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)
             _ => AuthScheme::Bearer,
@@ -192,30 +222,52 @@ impl ProviderResolver for StaticResolver {
                 HeaderValue::from_str(&v_substituted),
             ) {
                 (Ok(name), Ok(val)) => {
-                    extras.append(name, val);
+                    // insert 而非 append:provider.extra_headers 是 IndexMap
+                    // 不会有 dup key,但 insert 更准确表达"该 provider 的
+                    // X 头就这一个值"的意图,防止后续重构有人误把 resolver
+                    // 里某段循环加 dup,导致出站 HeaderMap 里同名多值。
+                    extras.insert(name, val);
                 }
                 (Err(e), _) => telemetry.logs.add(
                     "WARN",
                     format!(
-                        "跳过 extraHeader provider={} {k:?}: 头名非法 ({e})",
+                        "skip extraHeader provider={} {k:?}: header name invalid ({e})",
                         provider.id
                     ),
                 ),
                 (_, Err(e)) => telemetry.logs.add(
                     "WARN",
                     format!(
-                        "跳过 extraHeader provider={} {k:?}: 头值非法 ({e}),检查 api_key 是否含换行/非 ASCII",
+                        "skip extraHeader provider={} {k:?}: header value invalid ({e}); check api_key for newlines / non-ASCII",
                         provider.id
                     ),
                 ),
             }
         }
 
+        // **OAuth provider baseUrl 强制覆盖**:Cloud Code Assist OAuth 系两个
+        // provider 的上游 host 固定,不允许用户自定义(防 user 改成无效 host
+        // 或老的 prod host 撞 429 配额池)。
+        // - gemini-cli: prod cloudcode-pa(CLIProxyAPI `gc_exec.go:36`)
+        // - antigravity: **daily-cloudcode-pa**(CLIProxyAPI
+        //   `antigravityBaseURLFallbackOrder` chat 路径主 host;prod 仅 fallback)
+        // 2026-05-11 实测 user 用 prod 命中 429,daily 配额池独立 + 更宽。
+        // user-saved provider.baseUrl 漂移(旧 preset)在这里自动 self-heal,
+        // 不依赖 user 手动改 / 删 + 重加
+        let auth_scheme = AuthScheme::parse(&provider.auth_scheme);
+        let upstream_base = match auth_scheme {
+            AuthScheme::GoogleOauthCloudCode => "https://cloudcode-pa.googleapis.com".to_string(),
+            AuthScheme::GoogleOauthAntigravity => {
+                "https://daily-cloudcode-pa.googleapis.com".to_string()
+            }
+            _ => provider.base_url.clone(),
+        };
+
         Ok(ResolvedProvider {
             provider_id: provider.id.clone(),
-            upstream_base: provider.base_url.clone(),
+            upstream_base,
             api_key: provider.api_key.clone(),
-            auth_scheme: AuthScheme::parse(&provider.auth_scheme),
+            auth_scheme,
             extra_headers: extras,
             rewritten_model,
             provider: Arc::new(provider.clone()),
@@ -299,8 +351,62 @@ mod tests {
         assert_eq!(AuthScheme::parse("bearer"), AuthScheme::Bearer);
         assert_eq!(AuthScheme::parse("Bearer"), AuthScheme::Bearer);
         assert_eq!(AuthScheme::parse("x-api-key"), AuthScheme::XApiKey);
+        assert_eq!(
+            AuthScheme::parse("google_api_key"),
+            AuthScheme::GoogleApiKey
+        );
+        assert_eq!(
+            AuthScheme::parse("x-goog-api-key"),
+            AuthScheme::GoogleApiKey
+        );
+        assert_eq!(AuthScheme::parse("gemini"), AuthScheme::GoogleApiKey);
         assert_eq!(AuthScheme::parse(""), AuthScheme::None);
         assert_eq!(AuthScheme::parse("unknown"), AuthScheme::Bearer);
+
+        // **Critical** test gap(2026-05-11 修):4 个 GoogleOauthCloudCode alias
+        // 全部明确 lock 防 typo / refactor 把它们误归 Bearer 导致 401(provider.api_key
+        // 字段为空,Bearer 注入空 token,silent fail)。
+        assert_eq!(
+            AuthScheme::parse("google_oauth_cloud_code"),
+            AuthScheme::GoogleOauthCloudCode
+        );
+        assert_eq!(
+            AuthScheme::parse("google_oauth"),
+            AuthScheme::GoogleOauthCloudCode
+        );
+        assert_eq!(
+            AuthScheme::parse("gemini_cli_oauth"),
+            AuthScheme::GoogleOauthCloudCode
+        );
+        assert_eq!(
+            AuthScheme::parse("gemini_oauth"),
+            AuthScheme::GoogleOauthCloudCode
+        );
+        // 大小写 / dash 混用都识别(parse 内部 to_ascii_lowercase + replace '-' '_')
+        assert_eq!(
+            AuthScheme::parse("Google-OAuth-Cloud-Code"),
+            AuthScheme::GoogleOauthCloudCode
+        );
+
+        // Antigravity 3 别名(2026-05-11 加 antigravity provider):任何一个误归
+        // Bearer 都会让 forward.rs 跳过 ensure_valid_antigravity_token + 不注入 UA
+        // → 上游静默 401 / 配额错 bucket
+        assert_eq!(
+            AuthScheme::parse("google_oauth_antigravity"),
+            AuthScheme::GoogleOauthAntigravity
+        );
+        assert_eq!(
+            AuthScheme::parse("antigravity_oauth"),
+            AuthScheme::GoogleOauthAntigravity
+        );
+        assert_eq!(
+            AuthScheme::parse("antigravity"),
+            AuthScheme::GoogleOauthAntigravity
+        );
+        assert_eq!(
+            AuthScheme::parse("Google-OAuth-Antigravity"),
+            AuthScheme::GoogleOauthAntigravity
+        );
     }
 
     #[test]
