@@ -10,28 +10,37 @@
   </p>
 </div>
 
-ConfigBox is a Dockerized web management tool for viewing, editing, and switching Claude Code, Codex, and OpenCode configuration files from your browser. ConfigBox includes Codex forwarding capabilities, allowing third-party models to connect to Codex. ConfigBox supports Linux, macOS, and Windows.
+## Why ConfigBox :raising_hand:
 
-## Recent Updates
+- A web-based tool that requires no software installation. Browser is all you need.
 
-:loudspeaker: 2026.05.06 v0.2.0, improved Codex configuration support
+- Built on Docker, easy to use. No need to worry about cross-platform compatibility.
 
-:loudspeaker: 2026.05.07 v0.3.3, added built-in Codex forwarding based on [Cmochance/codex-app-transfer](https://github.com/Cmochance/codex-app-transfer), allowing Chinese and other third-party models to connect to Codex; fixed MiniMax forwarding errors and frontend issues
+- Simple, practical, and efficient features. Rapid response to user needs. **PRs and code contributions are warmly welcome!**
 
-:loudspeaker: 2026.05.09 v0.4.0, added platform-specific Docker deployment directories for Linux, macOS, and Windows, plus bilingual README and cross-platform build instructions
+## What It Does :muscle:
 
-:loudspeaker: 2026.05.10 v0.5.0, added OpenCode support
+- ConfigBox is a Dockerized web management tool for visually managing and switching Claude Code, Codex, and OpenCode configuration files from your browser.
 
-## Screenshot
+- Includes Codex forwarding capabilities, supporting third-party models such as GLM, Deepseek, and Kimi connecting to Codex. Built-in Codex forwarding based on [Cmochance/codex-app-transfer](https://github.com/Cmochance/codex-app-transfer) with ongoing updates tracking upstream.
+
+- Supports Linux, macOS, and Windows. Supports Claude Code, Codex, and OpenCode.
+
+**Contributions and PRs are welcome — become a contributor! :raising_hand:**
+
+## Version Updates :sunny:
+
+:loudspeaker: 2026.05.14 Released v0.5.2, synced upstream codex-app-transfer, fixed some Gateway frontend issues.
+
+## Screenshot :camera:
 
 <img src="yanshi.png" alt="ConfigBox screenshot" width="800">
 
-## Requirements
+## Requirements :mag_right:
 
 - Docker installed
-- Host `.claude`, `.codex`, and `.configbox` directories available for Docker bind mounts
 
-## Installation
+## Installation :hammer:
 
 ### Option 1: Use the Published Image
 
@@ -56,17 +65,14 @@ mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configb
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
 [ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
 ```
-
 - Find your user id:
-
 ```bash
 id -u
 id -g
 ```
-
 - Edit environment variables
 
-Edit `.env`, replace `yourname` with your username, and set `CONFIGBOX_UID` / `CONFIGBOX_GID` to the output of `id -u` / `id -g` above. These values are required on Linux; if they are missing, Docker Compose fails early instead of letting the container fail later with directory permission errors.
+Edit `.env`, replace `yourname` with your username, and set `CONFIGBOX_UID` / `CONFIGBOX_GID` to the output of `id -u` / `id -g` above. These values are required on Linux; omitting them will cause errors.
 
 - Set the login password
 
@@ -76,7 +82,6 @@ docker run --rm -it --user "$(id -u):$(id -g)" -v "$PWD:/work" cloudcollector/co
 ```
 
 - Start the image
-
 ```bash
 docker compose up -d
 ```
@@ -148,7 +153,7 @@ if (!(Test-Path "$env:USERPROFILE\.config\opencode\config.json")) { '{"$schema":
 
 - Edit environment variables
 
-Edit `.env` and replace `C:/Users/yourname` with your user directory. Use forward slashes in Windows paths, for example `C:/Users/Alice/.codex`.
+Edit `.env` and replace `C:/Users/yourname` with your user directory. Windows paths must use forward slashes, e.g. `C:/Users/Alice/.codex`.
 
 - Set the login password
 
@@ -165,21 +170,19 @@ docker compose up -d
 
 </details>
 
-Open after startup:
+After starting, visit:
 
 ```text
 http://127.0.0.1:8787
 ```
 
-For a remote host, use:
+If deployed on a remote host, visit:
 
 ```text
 http://HOST_IP:8787
 ```
 
-### Option 2: Build From Source With Docker
-
-Local builds compile the frontend, backend image, and bundled `codex-gateway` inside Docker. Enter the matching platform directory, prepare `.env`, then layer `docker-compose.build.yml`.
+### Option 2: Build from Source with Docker
 
 <details>
 <summary><strong>Linux</strong></summary>
@@ -212,7 +215,7 @@ id -g
 
 - Edit environment variables
 
-Edit `.env`, replace `yourname` with your username, and set `CONFIGBOX_UID` / `CONFIGBOX_GID` to the output of `id -u` / `id -g` above. These values are required on Linux; if they are missing, Docker Compose fails early instead of letting the container fail later with directory permission errors.
+Edit `.env`, replace `yourname` with your username, and set `CONFIGBOX_UID` / `CONFIGBOX_GID` to the output of `id -u` / `id -g` above. These values are required on Linux; omitting them will cause errors.
 
 - Build the image
 
@@ -306,7 +309,7 @@ if (!(Test-Path "$env:USERPROFILE\.config\opencode\config.json")) { '{"$schema":
 
 - Edit environment variables
 
-Edit `.env` and replace `C:/Users/yourname` with your user directory. Use forward slashes in Windows paths, for example `C:/Users/Alice/.codex`.
+Edit `.env` and replace `C:/Users/yourname` with your user directory. Windows paths must use forward slashes, e.g. `C:/Users/Alice/.codex`.
 
 - Build the image
 
@@ -329,29 +332,20 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
 
 </details>
 
-If dependency downloads are slow during Docker builds, adjust these values in the platform `.env` file:
-
-```env
-NPM_REGISTRY=https://registry.npmmirror.com
-PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
-```
-
-## Environment Variables
-
-Each platform directory has its own `.env.example`. Main variables:
+## Environment Variables :battery:
 
 | Variable | Description |
-| --- | --- |
-| `CLAUDE_DIR` | Host Claude Code config directory, mounted to `/config/claude` |
+|---|---|
+| `CLAUDE_DIR` | Host Claude config directory, mounted to `/config/claude` |
 | `CODEX_DIR` | Host Codex config directory, mounted to `/config/codex` |
 | `OPENCODE_DIR` | Host OpenCode config directory, mounted to `/config/opencode` |
-| `CONFIGBOX_DATA_DIR` | Profiles, backups, gateway config, and logs |
-| `CONFIGBOX_UID` / `CONFIGBOX_GID` | Linux only. Required container user, usually `id -u` / `id -g` |
+| `CONFIGBOX_DATA_DIR` | ConfigBox profiles, backups, gateway config and logs directory |
+| `CONFIGBOX_UID` / `CONFIGBOX_GID` | Linux only, container runtime user, required, recommended to set to `id -u` / `id -g` |
 | `APP_USERNAME` | Web login username |
-| `APP_PASSWORD_HASH` | Recommended web login password hash |
+| `APP_PASSWORD_HASH` | Web login password hash, recommended |
 | `SESSION_SECRET` | Cookie signing secret |
 | `APP_COOKIE_SECURE` | Set to `true` behind HTTPS reverse proxies |
-| `CODEX_GATEWAY_PORT` | Host port for Codex Gateway |
+| `CODEX_GATEWAY_PORT` | Codex Gateway host port |
 | `CODEX_GATEWAY_PUBLIC_HOST` | Gateway hostname written to Codex config, default `127.0.0.1` |
 
 Recommended authentication settings:
@@ -365,7 +359,7 @@ SESSION_SECRET=a-long-random-secret
 
 For long-term use, prefer `APP_PASSWORD_HASH` instead of plaintext `APP_PASSWORD`.
 
-## Remote Access
+## Remote Access :key:
 
 Default ports:
 
@@ -375,7 +369,7 @@ ports:
   - "127.0.0.1:18080:18080"
 ```
 
-The Web UI is available on `8787`. Codex Gateway is mapped to host `127.0.0.1:18080` by default, intended for Codex CLI or VS Code Codex running on the same machine.
+The Web UI is available on `8787`. Codex Gateway is mapped to host `127.0.0.1:18080` by default, intended for Codex CLI or VS Code Codex plugin running on the same machine.
 
 For HTTPS reverse proxies:
 
@@ -389,7 +383,7 @@ For plain HTTP, SSH tunnels, or VS Code Ports forwarding:
 APP_COOKIE_SECURE=false
 ```
 
-## Usage
+## Usage :floppy_disk:
 
 ### Active Config
 
@@ -414,7 +408,7 @@ profiles/claude/
 profiles/codex/
 ```
 
-Activating a Profile overwrites the real config files. A Codex Profile stores and activates both `auth.json` and `config.toml` together.
+Click a `Profile` to edit it. Click `Activate` to overwrite the real config files with that Profile, completing the config switch. A Codex Profile stores and activates both `auth.json` and `config.toml` together.
 
 ### OpenCode Provider / Model Editing
 
@@ -422,13 +416,13 @@ Choose `OpenCode` on the left to edit the full `config.json` directly. When the 
 
 ### Codex Gateway for Third-Party Models
 
-Choose `Codex`, then open `Gateway`. The gateway forwards Codex Responses API requests to OpenAI Chat-compatible upstream providers.
+Choose `Codex`, then open `Gateway`. The Gateway forwards Codex's Responses API requests to OpenAI Chat compatible upstreams.
 
 ```text
-Add Provider -> Start Gateway -> Use it in Codex / VS Code Codex extension
+Add Provider -> Start Gateway -> Use in Codex / VS Code Codex plugin
 ```
 
-When started, ConfigBox clears previous gateway logs, starts local `codex-gateway`, and writes `.codex/auth.json` plus `config.toml`. When stopped, it stops `codex-gateway` and restores the previous Codex config.
+When you click `Start`, ConfigBox clears previous Gateway logs, starts the local `codex-gateway`, and automatically writes `.codex/auth.json` and `config.toml`. When you click `Stop`, it stops the local `codex-gateway` and restores the Codex config to its pre-start state.
 
 Gateway logs are stored on the host:
 
@@ -436,7 +430,7 @@ Gateway logs are stored on the host:
 CONFIGBOX_DATA_DIR/codex-gateway/logs/
 ```
 
-## Mounts
+## Data Mounts :cd:
 
 Container paths:
 
@@ -459,18 +453,18 @@ OPENCODE_DIR       -> /config/opencode
 CONFIGBOX_DATA_DIR -> /data
 ```
 
-## API Check
+## API Authentication :pencil2:
 
 The API still supports Basic Auth for command-line checks:
 
 ```bash
-curl -u admin:your-password http://127.0.0.1:8787/api/tools
-curl -u admin:your-password http://127.0.0.1:8787/api/configs/codex/active
+curl -u admin:your_password http://127.0.0.1:8787/api/tools
+curl -u admin:your_password http://127.0.0.1:8787/api/configs/codex/active
 ```
 
-The browser UI uses `/api/login` and an HttpOnly cookie.
+The browser UI uses `/api/login` and HttpOnly Cookies.
 
-## FAQ
+## FAQ :green_book:
 
 ### How should Windows paths be written?
 
@@ -483,11 +477,11 @@ OPENCODE_DIR=C:/Users/yourname/.config/opencode
 CONFIGBOX_DATA_DIR=C:/Users/yourname/.configbox
 ```
 
-If you run Docker Engine inside WSL2 and want to manage Windows user directories, use WSL paths such as `/mnt/c/Users/yourname/.codex`.
+If you run Docker Engine inside WSL2 and want to manage Windows user directories, you can use WSL paths like `/mnt/c/Users/yourname/.codex`.
 
 ### What if Windows/macOS mounted directories are not writable?
 
-Check that your Docker runtime is allowed to share your user directory. Docker Desktop, OrbStack, Colima, and similar tools may have separate file-sharing settings.
+Make sure Docker runtime allows sharing your user directory. Docker Desktop and similar tools may have directory sharing or file access permission settings.
 
 ### What if Linux containers keep restarting with /data permission errors?
 
@@ -507,7 +501,7 @@ NPM_REGISTRY=
 PIP_INDEX_URL=
 ```
 
-## Security
+## Security :microscope:
 
 ConfigBox can view and edit sensitive config files. Treat it as an administrator tool.
 
@@ -519,9 +513,9 @@ Recommendations:
 - Restrict access with firewall or security-group rules whenever possible
 - Do not commit `.env`, `.claude`, `.codex`, `.config/opencode`, or `.configbox` to public repositories
 
-## Credits
+## Credits & Community :golf:
 
-- ConfigBox's Codex Gateway forwarding is based on [Cmochance/codex-app-transfer](https://github.com/Cmochance/codex-app-transfer). Thanks to the author for the open-source work.
+- ConfigBox's Codex Gateway forwarding is based on [Cmochance/codex-app-transfer](https://github.com/Cmochance/codex-app-transfer). Thanks to the author for the open-source contribution.
 
 <a href="https://linux.do">
   <img src="https://ldimg.ldcstore.com/integer/20260425_linuxdo_vtx01n.png" alt="linuxdo">
