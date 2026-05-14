@@ -12,7 +12,7 @@
 
 ## 为什么选择ConfigBox :raising_hand:
 
-- Web端的工具，无需安装任何软件。Brower is all的践行者。
+- Web端的工具，无需安装任何软件。浏览器提供一切服务的践行者。
 
 - 基于Docker，更容易使用。无需考虑跨平台换工具的问题。
 
