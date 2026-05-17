@@ -347,7 +347,7 @@ PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 | `CLAUDE_DIR` | 宿主机 Claude Code 配置目录，挂载到容器 `/config/claude` |
 | `CODEX_DIR` | 宿主机 Codex 配置目录，挂载到容器 `/config/codex` |
 | `OPENCODE_DIR` | 宿主机 OpenCode 配置目录，挂载到容器 `/config/opencode` |
-| `CONFIGBOX_DATA_DIR` | ConfigBox 的 profiles、backups、gateway 配置和日志目录 |
+| `CONFIGBOX_DATA_DIR` | ConfigBox 的 profiles、history、gateway 配置和日志目录 |
 | `CONFIGBOX_UID` / `CONFIGBOX_GID` | Linux 专用，容器运行用户，必填，建议设置为 `id -u` / `id -g` |
 | `APP_USERNAME` | Web 登录用户名 |
 | `APP_PASSWORD_HASH` | Web 登录密码哈希，推荐使用 |
@@ -393,11 +393,11 @@ APP_COOKIE_SECURE=false
 
 ## 使用教程 :floppy_disk:
 
-### 查看当前配置
+### Profiles 与 History
 
 <img src="yanshi.png" alt="ConfigBox screenshot" width="800">
 
-左侧选择 `Claude`、`Codex` 或 `OpenCode`，点击 `当前配置`。这里编辑的是当前真实生效配置：
+ConfigBox 现在以 `Profile` 作为唯一配置真源。左侧选择 `Claude`、`Codex` 或 `OpenCode` 后，直接编辑对应 Profile；点击 `启用` 时，系统会把该 Profile 投影到真实生效文件中：
 
 ```text
 Claude -> .claude/settings.json
@@ -405,22 +405,20 @@ Codex  -> .codex/auth.json + .codex/config.toml
 OpenCode -> .config/opencode/config.json
 ```
 
-点击 `保存` 时，系统会校验 JSON/TOML、备份旧版本，然后原子写入新版本。如果文件在页面打开后被外部终端修改，保存时会提示冲突，避免覆盖外部修改。
-
-### 配置切换和 Profiles
-
-Profile 是你主动保存的配置方案，可保存多套可切换配置。Profile 默认存放在宿主机 `CONFIGBOX_DATA_DIR` 下：
+Profile 默认存放在宿主机 `CONFIGBOX_DATA_DIR` 下：
 
 ```text
 profiles/claude/
 profiles/codex/
+history/claude/
+history/codex/
 ```
 
-点击某个 `Profile` 后可以编辑它。点击 `启用` 时，系统会把该 `Profile` 覆盖到真实配置文件中，完成配置切换。Codex 的一个 Profile 会同时保存 `auth.json` 和 `config.toml`。
+保存 Profile 时，系统会先把旧版本写入 `History`，再校验 JSON/TOML 并原子写入新版本；如果这个 Profile 当前已启用，真实配置文件会同步更新。每个 Profile 都可以拥有多条历史记录，左侧 `History` 会按时间线展示，并在标签中标明归属的 Profile。Codex 的一个 Profile 会同时保存 `auth.json` 和 `config.toml`。
 
 ### OpenCode Provider / Model 编辑
 
-左侧选择 `OpenCode` 后，可以直接编辑完整 `config.json`。当前配置或 Profile 处于可编辑状态时，编辑器上方会显示 OpenCode 配置助手，可通过按钮添加 Provider 或 Model。添加动作会先写入编辑器内容，确认无误后点击 `保存` 才会写入真实文件。
+左侧选择 `OpenCode` 后，可以直接编辑 Profile 中的完整 `config.json`。Profile 处于可编辑状态时，编辑器上方会显示 OpenCode 配置助手，可通过按钮添加 Provider 或 Model。添加动作会先写入编辑器内容，确认无误后点击 `保存` 才会写入 Profile；若该 Profile 已启用，真实文件也会同步更新。
 
 ### Codex Gateway 接入第三方模型
 
@@ -467,7 +465,7 @@ API 仍支持 Basic Auth，便于命令行检查：
 
 ```bash
 curl -u admin:你的密码 http://127.0.0.1:8787/api/tools
-curl -u admin:你的密码 http://127.0.0.1:8787/api/configs/codex/active
+curl -u admin:你的密码 http://127.0.0.1:8787/api/profiles/codex
 ```
 
 浏览器 UI 使用 `/api/login` 和 HttpOnly Cookie。

@@ -24,25 +24,23 @@ import {
   addGatewayProvider,
   clearGatewayLogs,
   clearAuth,
-  clearBackups,
+  clearHistory,
   createProfile,
-  deleteBackup,
+  deleteHistory,
   deleteGatewayProvider,
   deleteProfile,
   getGatewayConfig,
   getGatewayLogs,
   getGatewayStatus,
-  getActiveConfig,
-  getBackup,
+  getHistory,
   getProfile,
   getTools,
   hasAuth,
-  listBackups,
+  listHistory,
   listProfiles,
   me,
-  restoreBackup,
+  restoreHistory,
   restartGateway,
-  saveActiveConfig,
   saveProfile,
   setAuth,
   startGateway,
@@ -50,12 +48,11 @@ import {
   updateGatewayProvider
 } from "./api";
 import type {
-  ActiveConfig,
-  BackupDoc,
-  BackupItem,
   ConfigFile,
   GatewayConfig,
   GatewayStatus,
+  HistoryDoc,
+  HistoryItem,
   ProfileDoc,
   ProfileItem,
   Tool,
@@ -130,15 +127,15 @@ function App() {
   const [tools, setTools] = useState<Tool[]>([]);
   const [toolId, setToolId] = useState<ToolId>("claude");
   const [profiles, setProfiles] = useState<ProfileItem[]>([]);
-  const [backups, setBackups] = useState<BackupItem[]>([]);
-  const [mode, setMode] = useState<ViewMode>("active");
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [mode, setMode] = useState<ViewMode>("profile");
   const [selectedProfile, setSelectedProfile] = useState("");
-  const [selectedBackup, setSelectedBackup] = useState("");
+  const [selectedHistory, setSelectedHistory] = useState<{ profileName: string; name: string } | null>(null);
   const [files, setFiles] = useState<ConfigFile[]>([]);
   const [savedFiles, setSavedFiles] = useState<ConfigFile[]>([]);
   const [activeFileId, setActiveFileId] = useState("");
   const [mtime, setMtime] = useState<number | null>(null);
-  const [title, setTitle] = useState("当前配置");
+  const [title, setTitle] = useState("Profile");
   const [status, setStatus] = useState("准备就绪");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -161,14 +158,13 @@ function App() {
   const activeContent = activeFile?.content ?? "";
   const openCodeStats = useMemo(() => summarizeOpenCodeConfig(activeContent), [activeContent]);
   const dirty = filesChanged(files, savedFiles);
-  const readonly = mode === "backup" || mode === "gateway";
-  const showOpenCodeAssistant =
-    toolId === "opencode" && mode !== "backup" && mode !== "gateway" && activeFile?.format === "json";
+  const readonly = mode === "history" || mode === "gateway";
+  const showOpenCodeAssistant = toolId === "opencode" && mode === "profile" && activeFile?.format === "json";
   const sensitive = files.some((file) => /api[_-]?key|token|secret|password/i.test(file.content));
   const contentLength = files.reduce((sum, file) => sum + file.content.length, 0);
 
   function applyDocument(
-    doc: ActiveConfig | ProfileDoc | BackupDoc,
+    doc: ProfileDoc | HistoryDoc,
     nextTitle: string,
     nextStatus: string,
     preferredFileId = activeFileId
@@ -203,9 +199,10 @@ function App() {
   }
 
   async function loadLists(nextTool = toolId) {
-    const [profileItems, backupItems] = await Promise.all([listProfiles(nextTool), listBackups(nextTool)]);
+    const [profileItems, historyItems] = await Promise.all([listProfiles(nextTool), listHistory(nextTool)]);
     setProfiles(profileItems);
-    setBackups(backupItems);
+    setHistory(historyItems);
+    return profileItems;
   }
 
   async function loadTool(nextTool: ToolId) {
@@ -213,12 +210,16 @@ function App() {
     setError("");
     try {
       setToolId(nextTool);
-      await loadLists(nextTool);
-      const active = await getActiveConfig(nextTool);
-      setMode("active");
-      setSelectedProfile("");
-      setSelectedBackup("");
-      applyDocument(active, "当前配置", "已加载当前配置", "");
+      const profileItems = await loadLists(nextTool);
+      const activeProfile = profileItems.find((item) => item.active) ?? profileItems[0];
+      if (!activeProfile) {
+        throw new Error("未找到可用 Profile");
+      }
+      const doc = await getProfile(nextTool, activeProfile.name);
+      setMode("profile");
+      setSelectedProfile(activeProfile.name);
+      setSelectedHistory(null);
+      applyDocument(doc, `Profile: ${activeProfile.name}`, "已加载已启用 Profile", "");
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
     } finally {
@@ -226,12 +227,15 @@ function App() {
     }
   }
 
-  async function loadActive() {
-    const active = await getActiveConfig(toolId);
-    setMode("active");
-    setSelectedProfile("");
-    setSelectedBackup("");
-    applyDocument(active, "当前配置", "已重新加载");
+  async function reloadSelectedProfile() {
+    const fallback = profiles.find((item) => item.active) ?? profiles[0];
+    const name = selectedProfile || fallback?.name;
+    if (!name) return;
+    const doc = await getProfile(toolId, name);
+    setMode("profile");
+    setSelectedProfile(name);
+    setSelectedHistory(null);
+    applyDocument(doc, `Profile: ${name}`, "已重新加载");
   }
 
   async function loadGateway() {
@@ -248,7 +252,7 @@ function App() {
       setGatewayLogBytes({ current: logs.currentBytes, max: logs.maxBytes });
       setMode("gateway");
       setSelectedProfile("");
-      setSelectedBackup("");
+      setSelectedHistory(null);
       setTitle("Gateway");
       setStatus(statusData.running ? "Gateway 运行中" : "Gateway 未启动");
     } catch (err) {
@@ -265,7 +269,7 @@ function App() {
       const doc = await getProfile(toolId, name);
       setMode("profile");
       setSelectedProfile(name);
-      setSelectedBackup("");
+      setSelectedHistory(null);
       applyDocument(doc, `Profile: ${name}`, "已加载 Profile");
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载 Profile 失败");
@@ -274,17 +278,17 @@ function App() {
     }
   }
 
-  async function loadBackup(name: string) {
+  async function loadHistoryEntry(profileName: string, name: string) {
     setLoading(true);
     setError("");
     try {
-      const doc = await getBackup(toolId, name);
-      setMode("backup");
-      setSelectedBackup(name);
+      const doc = await getHistory(toolId, profileName, name);
+      setMode("history");
+      setSelectedHistory({ profileName, name });
       setSelectedProfile("");
-      applyDocument(doc, `Backup: ${name}`, "已加载备份");
+      applyDocument(doc, `History: ${profileName}`, "已加载历史版本");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "加载备份失败");
+      setError(err instanceof Error ? err.message : "加载历史版本失败");
     } finally {
       setLoading(false);
     }
@@ -310,17 +314,13 @@ function App() {
   }
 
   async function handleSave() {
+    if (mode !== "profile" || !selectedProfile) return;
     setLoading(true);
     setError("");
     try {
       const preferredFileId = activeFileId;
-      if (mode === "active") {
-        const saved = await saveActiveConfig(toolId, files, mtime);
-        applyDocument(saved, "当前配置", "已保存，旧版本已备份", preferredFileId);
-      } else if (mode === "profile" && selectedProfile) {
-        const saved = await saveProfile(toolId, selectedProfile, files);
-        applyDocument(saved, `Profile: ${selectedProfile}`, "Profile 已保存", preferredFileId);
-      }
+      const saved = await saveProfile(toolId, selectedProfile, files);
+      applyDocument(saved, `Profile: ${selectedProfile}`, "Profile 已保存，旧版本已写入 History", preferredFileId);
       await loadLists();
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存失败");
@@ -355,8 +355,11 @@ function App() {
     setError("");
     try {
       await deleteProfile(toolId, selectedProfile);
-      await loadLists();
-      await loadActive();
+      const profileItems = await loadLists();
+      const nextProfile = profileItems.find((item) => item.active) ?? profileItems[0];
+      if (nextProfile) {
+        await loadProfile(nextProfile.name);
+      }
       setStatus("Profile 已删除");
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除失败");
@@ -372,9 +375,9 @@ function App() {
     try {
       const active = await activateProfile(toolId, selectedProfile);
       await loadLists();
-      setMode("active");
-      setSelectedProfile("");
-      applyDocument(active, "当前配置", `已启用 Profile: ${selectedProfile}`);
+      setMode("profile");
+      setSelectedHistory(null);
+      applyDocument(active, `Profile: ${selectedProfile}`, `已启用 Profile: ${selectedProfile}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "启用失败");
     } finally {
@@ -382,16 +385,19 @@ function App() {
     }
   }
 
-  async function handleRestoreBackup() {
-    if (!selectedBackup || !window.confirm(`恢复备份 "${selectedBackup}"？`)) return;
+  async function handleRestoreHistory() {
+    if (!selectedHistory) return;
+    const { profileName, name } = selectedHistory;
+    if (!window.confirm(`恢复 ${profileName} 的历史版本 "${name}"？`)) return;
     setLoading(true);
     setError("");
     try {
-      const active = await restoreBackup(toolId, selectedBackup);
+      const restored = await restoreHistory(toolId, profileName, name);
       await loadLists();
-      setMode("active");
-      setSelectedBackup("");
-      applyDocument(active, "当前配置", "备份已恢复，恢复前版本也已备份");
+      setMode("profile");
+      setSelectedProfile(profileName);
+      setSelectedHistory(null);
+      applyDocument(restored, `Profile: ${profileName}`, "历史版本已恢复，恢复前版本也已写入 History");
     } catch (err) {
       setError(err instanceof Error ? err.message : "恢复失败");
     } finally {
@@ -399,37 +405,39 @@ function App() {
     }
   }
 
-  async function handleDeleteBackup() {
-    if (!selectedBackup || !window.confirm(`删除备份 "${selectedBackup}"？`)) return;
+  async function handleDeleteHistory() {
+    if (!selectedHistory) return;
+    const { profileName, name } = selectedHistory;
+    if (!window.confirm(`删除 ${profileName} 的历史版本 "${name}"？`)) return;
     setLoading(true);
     setError("");
     try {
-      await deleteBackup(toolId, selectedBackup);
+      await deleteHistory(toolId, profileName, name);
       await loadLists();
-      await loadActive();
-      setStatus("备份已删除");
+      await reloadSelectedProfile();
+      setStatus("历史版本已删除");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除备份失败");
+      setError(err instanceof Error ? err.message : "删除历史版本失败");
     } finally {
       setLoading(false);
     }
   }
 
-  async function handleClearBackups() {
-    if (!backups.length) return;
-    if (!window.confirm(`删除 ${tool?.name || toolId} 的全部 ${backups.length} 个备份？`)) return;
+  async function handleClearHistory() {
+    if (!history.length) return;
+    if (!window.confirm(`删除 ${tool?.name || toolId} 的全部 ${history.length} 条历史版本？`)) return;
     setLoading(true);
     setError("");
     try {
-      await clearBackups(toolId);
+      await clearHistory(toolId);
       await loadLists();
-      if (mode === "backup") {
-        await loadActive();
+      if (mode === "history") {
+        await reloadSelectedProfile();
       }
-      setSelectedBackup("");
-      setStatus("全部备份已删除");
+      setSelectedHistory(null);
+      setStatus("全部历史版本已删除");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "清空备份失败");
+      setError(err instanceof Error ? err.message : "清空历史版本失败");
     } finally {
       setLoading(false);
     }
@@ -813,23 +821,20 @@ function App() {
           ))}
         </div>
 
-        <section className="nav-section">
-          <button className={mode === "active" ? "nav-item selected" : "nav-item"} onClick={loadActive}>
-            当前配置
-          </button>
-          {toolId === "codex" ? (
+        {toolId === "codex" ? (
+          <section className="nav-section">
             <button className={mode === "gateway" ? "nav-item selected" : "nav-item"} onClick={loadGateway}>
               <span>Gateway</span>
               <PlugZap size={15} />
             </button>
-          ) : null}
-        </section>
+          </section>
+        ) : null}
 
         <section className="nav-section">
           <div className="section-title">
             <span>Profiles</span>
             <div className="mini-actions">
-              <button title="从当前配置创建 Profile" onClick={() => handleCreateProfile("active")}>
+              <button title="从已启用 Profile 创建" onClick={() => handleCreateProfile("active")}>
                 <FolderPlus size={15} />
               </button>
               <button title="创建空 Profile" onClick={() => handleCreateProfile("empty")}>
@@ -851,32 +856,39 @@ function App() {
           </div>
         </section>
 
-        <section className="nav-section backups">
+        <section className="nav-section history">
           <div className="section-title">
-            <span>Backups</span>
+            <span>History</span>
             <div className="mini-actions">
               <span className="section-icon">
                 <DatabaseBackup size={15} />
               </span>
               <button
                 className="danger"
-                title="删除全部备份"
-                onClick={handleClearBackups}
-                disabled={loading || backups.length === 0}
+                title="删除全部历史"
+                onClick={handleClearHistory}
+                disabled={loading || history.length === 0}
               >
                 <Trash2 size={15} />
               </button>
             </div>
           </div>
           <div className="scroll-list">
-            {backups.map((item) => (
+            {history.map((item) => (
               <button
-                key={item.name}
-                className={mode === "backup" && selectedBackup === item.name ? "nav-item selected" : "nav-item"}
-                onClick={() => loadBackup(item.name)}
-                title={formatTime(item.mtime)}
+                key={`${item.profileName}-${item.name}`}
+                className={
+                  mode === "history" &&
+                  selectedHistory?.profileName === item.profileName &&
+                  selectedHistory.name === item.name
+                    ? "nav-item selected"
+                    : "nav-item"
+                }
+                onClick={() => loadHistoryEntry(item.profileName, item.name)}
+                title={`${item.profileName} · ${formatTime(item.mtime)}`}
               >
-                {item.name}
+                <span>{item.profileName}</span>
+                <span>{formatTime(item.mtime)}</span>
               </button>
             ))}
           </div>
@@ -892,7 +904,9 @@ function App() {
             <p>
               {mode === "gateway"
                 ? "管理 Providers 与运行日志"
-                : `${tool?.pathLabel} · ${files.map((file) => file.format.toUpperCase()).join(" + ")}`}
+                : mode === "history"
+                  ? `历史版本属于 Profile: ${selectedHistory?.profileName ?? "-"}`
+                  : `${tool?.pathLabel} · ${files.map((file) => file.format.toUpperCase()).join(" + ")}`}
             </p>
           </div>
           <div className="actions">
@@ -934,7 +948,7 @@ function App() {
                   <Check size={16} />
                   格式化
                 </button>
-                <button onClick={loadActive} disabled={loading} title="重新加载">
+                <button onClick={reloadSelectedProfile} disabled={loading} title="重新加载">
                   <RefreshCcw size={16} />
                   重载
                 </button>
@@ -955,13 +969,13 @@ function App() {
                 </button>
               </>
             ) : null}
-            {mode === "backup" ? (
+            {mode === "history" ? (
               <>
-                <button onClick={handleRestoreBackup} disabled={loading} title="恢复备份">
+                <button onClick={handleRestoreHistory} disabled={loading} title="恢复历史版本">
                   <Play size={16} />
                   恢复
                 </button>
-                <button className="danger" onClick={handleDeleteBackup} disabled={loading} title="删除备份">
+                <button className="danger" onClick={handleDeleteHistory} disabled={loading} title="删除历史版本">
                   <Trash2 size={16} />
                 </button>
               </>
@@ -984,7 +998,7 @@ function App() {
           ) : (
             <>
               <span className={dirty ? "dirty-dot" : "clean-dot"} />
-              <span>{dirty ? "未保存" : "已同步"}</span>
+              <span>{mode === "history" ? "只读历史" : dirty ? "未保存" : "已同步"}</span>
               <span>{contentLength} 字符</span>
               <span>{status}</span>
               <span>{mtime ? formatTime(mtime) : "无 mtime"}</span>
@@ -1120,7 +1134,7 @@ function App() {
               ) : null}
               <div className="editor-wrap">
                 <Editor
-                  key={`${toolId}-${mode}-${selectedProfile}-${selectedBackup}-${activeFile?.id ?? "file"}`}
+                  key={`${toolId}-${mode}-${selectedProfile}-${selectedHistory?.profileName ?? ""}-${selectedHistory?.name ?? ""}-${activeFile?.id ?? "file"}`}
                   height="100%"
                   value={activeContent}
                   onChange={(value) => updateActiveContent(value ?? "")}
@@ -1384,7 +1398,7 @@ function App() {
   );
 }
 
-function normalizeDocFiles(doc: ActiveConfig | ProfileDoc | BackupDoc): ConfigFile[] {
+function normalizeDocFiles(doc: ProfileDoc | HistoryDoc): ConfigFile[] {
   if (doc.files?.length) {
     return doc.files;
   }
@@ -1396,7 +1410,7 @@ function normalizeDocFiles(doc: ActiveConfig | ProfileDoc | BackupDoc): ConfigFi
       content: doc.content,
       format: doc.format,
       mtime: doc.mtime,
-      pathLabel: "pathLabel" in doc ? doc.pathLabel : ""
+      pathLabel: ""
     }
   ];
 }

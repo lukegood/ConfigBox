@@ -12,14 +12,14 @@ from filelock import FileLock, Timeout
 
 from .errors import APIError
 from .registry import DATA_DIR, TOOLS, ToolConfig, ToolFile
-from .validators import validate_backup_name, validate_content, validate_profile_name
+from .validators import validate_content, validate_history_entry_name, validate_profile_name
 
 
 STATE_PATH = DATA_DIR / "state.json"
 
 
-def backup_retention() -> int:
-    raw = os.getenv("BACKUP_RETENTION", "50")
+def history_retention() -> int:
+    raw = os.getenv("HISTORY_RETENTION", "50")
     try:
         return max(1, int(raw))
     except ValueError:
@@ -42,12 +42,14 @@ def ensure_dirs(tool: ToolConfig) -> None:
     for file in tool.files:
         file.active_path.parent.mkdir(parents=True, exist_ok=True)
     tool.profile_dir.mkdir(parents=True, exist_ok=True)
-    tool.backup_dir.mkdir(parents=True, exist_ok=True)
+    tool.history_dir.mkdir(parents=True, exist_ok=True)
     tool.lock_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def ensure_all() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    state = read_state()
+    state_changed = False
     for tool in TOOLS.values():
         ensure_dirs(tool)
         for file in tool.files:
@@ -55,9 +57,16 @@ def ensure_all() -> None:
                 atomic_write(file.active_path, default_file_content(file))
         migrate_legacy_profiles(tool)
         if not profile_exists(tool, "default"):
-            write_profile_files(tool, "default", read_active_contents(tool))
-    if not STATE_PATH.exists():
-        atomic_write(STATE_PATH, json.dumps({}, indent=2) + "\n")
+            write_profile_files(tool, "default", read_runtime_contents(tool))
+        active_name = state.get(tool.id, {}).get("activeProfile")
+        if not active_name or not profile_exists(tool, active_name):
+            state[tool.id] = {
+                "activeProfile": "default",
+                "lastActivatedAt": datetime.now(timezone.utc).isoformat(),
+            }
+            state_changed = True
+    if not STATE_PATH.exists() or state_changed:
+        write_state(state)
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -141,63 +150,16 @@ def file_response(file: ToolFile, content: str, mtime: float | None) -> dict:
     }
 
 
-def read_active_contents(tool: ToolConfig) -> dict[str, str]:
+def read_runtime_contents(tool: ToolConfig) -> dict[str, str]:
     return {
         file.id: read_text_or_default(file.active_path, default_file_content(file))
         for file in tool.files
     }
 
 
-def read_active(tool: ToolConfig) -> dict:
-    ensure_dirs(tool)
-    contents = read_active_contents(tool)
-    files = [
-        file_response(file, contents[file.id], file_mtime(file.active_path))
-        for file in tool.files
-    ]
-    primary = files[0]
-    return {
-        "tool": tool.id,
-        "content": primary["content"],
-        "format": primary["format"],
-        "mtime": primary["mtime"],
-        "pathLabel": tool.path_label,
-        "files": files,
-    }
-
-
-def save_active(
-    tool: ToolConfig,
-    content: str | None,
-    last_known_mtime: float | None,
-    files: list[dict[str, Any]] | None = None,
-) -> dict:
-    incoming = normalize_incoming_contents(tool, content, files)
-    known_mtimes = normalize_known_mtimes(tool, last_known_mtime, files)
-    validate_contents(tool, incoming)
-    ensure_dirs(tool)
-    try:
-        with lock_for(tool):
-            for file_id in incoming:
-                file = tool.file_by_id(file_id)
-                current_mtime = file_mtime(file.active_path)
-                known_mtime = known_mtimes.get(file_id)
-                if (
-                    known_mtime is not None
-                    and current_mtime is not None
-                    and abs(current_mtime - known_mtime) > 0.0001
-                ):
-                    raise APIError(
-                        "CONFLICT_MODIFIED_EXTERNALLY",
-                        "File was modified outside the web UI. Reload before saving.",
-                        409,
-                    )
-            backup_active(tool, "save")
-            for file_id, file_content in incoming.items():
-                atomic_write(tool.file_by_id(file_id).active_path, file_content)
-    except Timeout as exc:
-        raise APIError("LOCK_TIMEOUT", "Timed out waiting for the file lock.", 423) from exc
-    return read_active(tool)
+def sync_profile_to_runtime(tool: ToolConfig, contents: dict[str, str]) -> None:
+    for file in tool.files:
+        atomic_write(file.active_path, contents[file.id])
 
 
 def normalize_incoming_contents(
@@ -225,52 +187,15 @@ def normalize_incoming_contents(
     return incoming
 
 
-def normalize_known_mtimes(
-    tool: ToolConfig,
-    last_known_mtime: float | None,
-    files: list[dict[str, Any]] | None,
-) -> dict[str, float | None]:
+def normalize_known_mtimes(files: list[dict[str, Any]] | None) -> dict[str, float | None]:
     if files is None:
-        return {tool.primary_file.id: last_known_mtime}
+        return {}
     return {str(item.get("id", "")): item.get("lastKnownMtime") for item in files}
 
 
 def validate_contents(tool: ToolConfig, contents: dict[str, str]) -> None:
     for file_id, content in contents.items():
         validate_content(tool.file_by_id(file_id).format, content)
-
-
-def backup_active(tool: ToolConfig, reason: str = "manual") -> Path | None:
-    ensure_dirs(tool)
-    existing_files = [file for file in tool.files if file.active_path.exists()]
-    if not existing_files:
-        return None
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-    if not is_multi_file(tool):
-        src = tool.primary_file.active_path
-        dst = tool.backup_dir / f"{src.name}.{ts}.{reason}.bak"
-        atomic_write(dst, src.read_text(encoding="utf-8"))
-    else:
-        dst = tool.backup_dir / f"{tool.id}.{ts}.{reason}.bak"
-        dst.mkdir(parents=True, exist_ok=False)
-        for file in existing_files:
-            atomic_write(dst / file.filename, file.active_path.read_text(encoding="utf-8"))
-        fsync_dir(dst.parent)
-    prune_backups(tool)
-    return dst
-
-
-def prune_backups(tool: ToolConfig) -> None:
-    backups = sorted(
-        [path for path in tool.backup_dir.iterdir() if path.is_file() or path.is_dir()],
-        key=tree_mtime,
-        reverse=True,
-    )
-    for old_path in backups[backup_retention() :]:
-        if old_path.is_dir():
-            shutil.rmtree(old_path)
-        else:
-            old_path.unlink(missing_ok=True)
 
 
 def profile_path(tool: ToolConfig, name: str) -> Path:
@@ -313,7 +238,7 @@ def migrate_legacy_profiles(tool: ToolConfig) -> None:
         next_path = profile_path(tool, name)
         if next_path.exists():
             continue
-        contents = read_active_contents(tool)
+        contents = read_runtime_contents(tool)
         contents[tool.primary_file.id] = legacy_path.read_text(encoding="utf-8")
         validate_contents(tool, contents)
         write_profile_files(tool, name, contents)
@@ -329,10 +254,18 @@ def write_profile_files(tool: ToolConfig, name: str, contents: dict[str, str]) -
         atomic_write(path, contents.get(tool.primary_file.id, default_content(tool)))
 
 
+def active_profile_name(tool: ToolConfig) -> str:
+    state = read_state().get(tool.id, {})
+    name = state.get("activeProfile")
+    if isinstance(name, str) and profile_exists(tool, name):
+        return name
+    return "default"
+
+
 def list_profiles(tool: ToolConfig) -> list[dict]:
     ensure_dirs(tool)
     migrate_legacy_profiles(tool)
-    state = read_state().get(tool.id, {})
+    active_name = active_profile_name(tool)
     items: dict[str, dict] = {}
     if is_multi_file(tool):
         for path in sorted(tool.profile_dir.iterdir()):
@@ -342,7 +275,7 @@ def list_profiles(tool: ToolConfig) -> list[dict]:
             items[name] = {
                 "name": name,
                 "mtime": tree_mtime(path),
-                "active": state.get("activeProfile") == name,
+                "active": active_name == name,
             }
     for path in sorted(tool.profile_dir.glob(f"*{tool.ext}")):
         name = path.name[: -len(tool.ext)]
@@ -351,7 +284,7 @@ def list_profiles(tool: ToolConfig) -> list[dict]:
         items[name] = {
             "name": name,
             "mtime": file_mtime(path),
-            "active": state.get("activeProfile") == name,
+            "active": active_name == name,
         }
     return sorted(items.values(), key=lambda item: item["name"])
 
@@ -369,9 +302,9 @@ def read_profile_contents(tool: ToolConfig, name: str) -> tuple[dict[str, str], 
     if legacy_path.exists() and legacy_path.is_file():
         contents = {tool.primary_file.id: legacy_path.read_text(encoding="utf-8")}
         if is_multi_file(tool):
-            active_contents = read_active_contents(tool)
+            runtime_contents = read_runtime_contents(tool)
             for file in tool.files[1:]:
-                contents[file.id] = active_contents[file.id]
+                contents[file.id] = runtime_contents[file.id]
         return contents, file_mtime(legacy_path)
 
     raise APIError("PROFILE_NOT_FOUND", "Profile not found.", 404)
@@ -410,12 +343,9 @@ def create_profile(
             if profile_exists(tool, name):
                 raise APIError("PROFILE_EXISTS", "Profile already exists.", 409)
             if source == "active":
-                profile_contents = read_active_contents(tool)
+                profile_contents, _ = read_profile_contents(tool, active_profile_name(tool))
             elif source == "content":
-                profile_contents = {
-                    file.id: default_file_content(file)
-                    for file in tool.files
-                }
+                profile_contents = {file.id: default_file_content(file) for file in tool.files}
                 profile_contents.update(normalize_incoming_contents(tool, content, files))
             else:
                 profile_contents = {file.id: default_file_content(file) for file in tool.files}
@@ -424,6 +354,24 @@ def create_profile(
     except Timeout as exc:
         raise APIError("LOCK_TIMEOUT", "Timed out waiting for the file lock.", 423) from exc
     return read_profile(tool, name)
+
+
+def ensure_profile_not_modified(tool: ToolConfig, name: str, files: list[dict[str, Any]] | None) -> None:
+    known_mtimes = normalize_known_mtimes(files)
+    for file_id, known_mtime in known_mtimes.items():
+        if known_mtime is None:
+            continue
+        try:
+            file = tool.file_by_id(file_id)
+        except KeyError:
+            continue
+        current_mtime = file_mtime(profile_file_path(tool, name, file))
+        if current_mtime is not None and abs(current_mtime - known_mtime) > 0.0001:
+            raise APIError(
+                "CONFLICT_MODIFIED_EXTERNALLY",
+                "Profile was modified outside the web UI. Reload before saving.",
+                409,
+            )
 
 
 def save_profile(
@@ -438,10 +386,15 @@ def save_profile(
         with lock_for(tool):
             if not profile_exists(tool, name):
                 raise APIError("PROFILE_NOT_FOUND", "Profile not found.", 404)
+            ensure_profile_not_modified(tool, name, files)
             existing, _ = read_profile_contents(tool, name)
-            existing.update(normalize_incoming_contents(tool, content, files))
-            validate_contents(tool, existing)
-            write_profile_files(tool, name, existing)
+            next_contents = dict(existing)
+            next_contents.update(normalize_incoming_contents(tool, content, files))
+            validate_contents(tool, next_contents)
+            create_history_entry(tool, name, "save", existing)
+            write_profile_files(tool, name, next_contents)
+            if active_profile_name(tool) == name:
+                sync_profile_to_runtime(tool, next_contents)
     except Timeout as exc:
         raise APIError("LOCK_TIMEOUT", "Timed out waiting for the file lock.", 423) from exc
     return read_profile(tool, name)
@@ -450,8 +403,7 @@ def save_profile(
 def delete_profile(tool: ToolConfig, name: str) -> None:
     ensure_dirs(tool)
     migrate_legacy_profiles(tool)
-    state = read_state().get(tool.id, {})
-    if state.get("activeProfile") == name:
+    if active_profile_name(tool) == name:
         raise APIError("PROFILE_ACTIVE", "Cannot delete the currently active profile.", 409)
     try:
         with lock_for(tool):
@@ -465,6 +417,9 @@ def delete_profile(tool: ToolConfig, name: str) -> None:
                 legacy_path.unlink()
             else:
                 raise APIError("PROFILE_NOT_FOUND", "Profile not found.", 404)
+            profile_history = history_profile_path(tool, name)
+            if profile_history.exists():
+                shutil.rmtree(profile_history)
     except Timeout as exc:
         raise APIError("LOCK_TIMEOUT", "Timed out waiting for the file lock.", 423) from exc
 
@@ -475,9 +430,7 @@ def activate_profile(tool: ToolConfig, name: str) -> dict:
     ensure_dirs(tool)
     try:
         with lock_for(tool):
-            backup_active(tool, "activate")
-            for file in tool.files:
-                atomic_write(file.active_path, contents[file.id])
+            sync_profile_to_runtime(tool, contents)
             state = read_state()
             state[tool.id] = {
                 "activeProfile": name,
@@ -486,22 +439,106 @@ def activate_profile(tool: ToolConfig, name: str) -> dict:
             write_state(state)
     except Timeout as exc:
         raise APIError("LOCK_TIMEOUT", "Timed out waiting for the file lock.", 423) from exc
-    return read_active(tool)
+    return read_profile(tool, name)
 
 
-def list_backups(tool: ToolConfig) -> list[dict]:
+def history_profile_path(tool: ToolConfig, profile_name: str) -> Path:
+    validate_profile_name(profile_name)
+    return tool.history_dir / profile_name
+
+
+def history_entry_path(tool: ToolConfig, profile_name: str, entry_name: str) -> Path:
+    validate_history_entry_name(entry_name)
+    path = history_profile_path(tool, profile_name) / entry_name
+    try:
+        path.resolve().relative_to(tool.history_dir.resolve())
+    except ValueError as exc:
+        raise APIError("INVALID_HISTORY_ENTRY", "Invalid history entry name.", 400) from exc
+    return path
+
+
+def create_history_entry(
+    tool: ToolConfig,
+    profile_name: str,
+    reason: str,
+    contents: dict[str, str] | None = None,
+) -> Path:
+    contents = contents or read_profile_contents(tool, profile_name)[0]
+    validate_contents(tool, contents)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    entry_name = f"{ts}.{reason}"
+    path = history_entry_path(tool, profile_name, entry_name)
+    path.mkdir(parents=True, exist_ok=False)
+    for file in tool.files:
+        atomic_write(path / file.filename, contents[file.id])
+    atomic_write(
+        path / "meta.json",
+        json.dumps(
+            {
+                "profileName": profile_name,
+                "reason": reason,
+                "createdAt": datetime.now(timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+    )
+    fsync_dir(path.parent)
+    prune_history(tool, profile_name)
+    return path
+
+
+def prune_history(tool: ToolConfig, profile_name: str) -> None:
+    root = history_profile_path(tool, profile_name)
+    if not root.exists():
+        return
+    entries = sorted([path for path in root.iterdir() if path.is_dir()], key=tree_mtime, reverse=True)
+    for old_path in entries[history_retention() :]:
+        shutil.rmtree(old_path)
+
+
+def list_history(tool: ToolConfig) -> list[dict]:
     ensure_dirs(tool)
-    backups = []
-    for path in sorted(tool.backup_dir.iterdir(), key=tree_mtime, reverse=True):
-        if path.is_file() or path.is_dir():
-            backups.append({"name": path.name, "mtime": tree_mtime(path), "size": tree_size(path)})
-    return backups
+    entries: list[dict] = []
+    for profile_root in sorted(tool.history_dir.iterdir()):
+        if not profile_root.is_dir():
+            continue
+        profile_name = profile_root.name
+        try:
+            validate_profile_name(profile_name)
+        except APIError:
+            continue
+        for path in sorted(profile_root.iterdir(), key=tree_mtime, reverse=True):
+            if not path.is_dir():
+                continue
+            entries.append(
+                {
+                    "profileName": profile_name,
+                    "name": path.name,
+                    "mtime": tree_mtime(path),
+                    "size": tree_size(path),
+                    "reason": read_history_reason(path),
+                }
+            )
+    return sorted(entries, key=lambda item: item["mtime"] or 0, reverse=True)
 
 
-def clear_backups(tool: ToolConfig) -> int:
+def read_history_reason(path: Path) -> str:
+    meta_path = path / "meta.json"
+    if not meta_path.exists():
+        return "save"
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8") or "{}")
+    except json.JSONDecodeError:
+        return "save"
+    return str(data.get("reason") or "save")
+
+
+def clear_history(tool: ToolConfig) -> int:
     ensure_dirs(tool)
     removed = 0
-    for path in list(tool.backup_dir.iterdir()):
+    for path in list(tool.history_dir.iterdir()):
         if path.is_dir():
             shutil.rmtree(path)
             removed += 1
@@ -511,50 +548,39 @@ def clear_backups(tool: ToolConfig) -> int:
     return removed
 
 
-def backup_path(tool: ToolConfig, name: str) -> Path:
-    validate_backup_name(name)
-    path = tool.backup_dir / name
-    try:
-        path.resolve().relative_to(tool.backup_dir.resolve())
-    except ValueError as exc:
-        raise APIError("INVALID_BACKUP_NAME", "Invalid backup name.", 400) from exc
-    return path
-
-
-def read_backup_contents(tool: ToolConfig, name: str) -> tuple[dict[str, str], float | None, Path]:
-    path = backup_path(tool, name)
-    if not path.exists() or not (path.is_file() or path.is_dir()):
-        raise APIError("BACKUP_NOT_FOUND", "Backup not found.", 404)
-    if path.is_dir():
-        contents = {
-            file.id: read_text_or_default(path / file.filename, default_file_content(file))
-            for file in tool.files
-        }
-        return contents, tree_mtime(path), path
-    return {tool.primary_file.id: path.read_text(encoding="utf-8")}, file_mtime(path), path
-
-
-def delete_backup(tool: ToolConfig, name: str) -> None:
-    path = backup_path(tool, name)
-    if not path.exists() or not (path.is_file() or path.is_dir()):
-        raise APIError("BACKUP_NOT_FOUND", "Backup not found.", 404)
-    if path.is_dir():
-        shutil.rmtree(path)
-    else:
-        path.unlink(missing_ok=True)
-
-
-def read_backup(tool: ToolConfig, name: str) -> dict:
-    contents, mtime, path = read_backup_contents(tool, name)
-    files = [
-        file_response(file, contents[file.id], file_mtime(path / file.filename) if path.is_dir() else file_mtime(path))
+def read_history_contents(
+    tool: ToolConfig,
+    profile_name: str,
+    entry_name: str,
+) -> tuple[dict[str, str], float | None, Path]:
+    path = history_entry_path(tool, profile_name, entry_name)
+    if not path.exists() or not path.is_dir():
+        raise APIError("HISTORY_NOT_FOUND", "History entry not found.", 404)
+    contents = {
+        file.id: read_text_or_default(path / file.filename, default_file_content(file))
         for file in tool.files
-        if file.id in contents
+    }
+    return contents, tree_mtime(path), path
+
+
+def delete_history(tool: ToolConfig, profile_name: str, entry_name: str) -> None:
+    path = history_entry_path(tool, profile_name, entry_name)
+    if not path.exists() or not path.is_dir():
+        raise APIError("HISTORY_NOT_FOUND", "History entry not found.", 404)
+    shutil.rmtree(path)
+
+
+def read_history(tool: ToolConfig, profile_name: str, entry_name: str) -> dict:
+    contents, mtime, path = read_history_contents(tool, profile_name, entry_name)
+    files = [
+        file_response(file, contents[file.id], file_mtime(path / file.filename))
+        for file in tool.files
     ]
     primary = files[0]
     return {
         "tool": tool.id,
-        "name": name,
+        "profileName": profile_name,
+        "name": entry_name,
         "content": primary["content"],
         "format": primary["format"],
         "mtime": mtime,
@@ -562,18 +588,22 @@ def read_backup(tool: ToolConfig, name: str) -> dict:
     }
 
 
-def restore_backup(tool: ToolConfig, name: str) -> dict:
-    contents, _, _ = read_backup_contents(tool, name)
+def restore_history(tool: ToolConfig, profile_name: str, entry_name: str) -> dict:
+    contents, _, _ = read_history_contents(tool, profile_name, entry_name)
     validate_contents(tool, contents)
     ensure_dirs(tool)
     try:
         with lock_for(tool):
-            backup_active(tool, "restore")
-            for file_id, content in contents.items():
-                atomic_write(tool.file_by_id(file_id).active_path, content)
+            if not profile_exists(tool, profile_name):
+                raise APIError("PROFILE_NOT_FOUND", "Profile not found.", 404)
+            current_contents, _ = read_profile_contents(tool, profile_name)
+            create_history_entry(tool, profile_name, "restore", current_contents)
+            write_profile_files(tool, profile_name, contents)
+            if active_profile_name(tool) == profile_name:
+                sync_profile_to_runtime(tool, contents)
     except Timeout as exc:
         raise APIError("LOCK_TIMEOUT", "Timed out waiting for the file lock.", 423) from exc
-    return read_active(tool)
+    return read_profile(tool, profile_name)
 
 
 def read_state() -> dict:

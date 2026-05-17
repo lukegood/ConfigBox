@@ -32,7 +32,7 @@ class ToolConfig:
     id: str
     name: str
     profile_dir: Path
-    backup_dir: Path
+    history_dir: Path
     lock_path: Path
     files: tuple[ToolFile, ...]
 
@@ -73,7 +73,7 @@ TOOLS: dict[str, ToolConfig] = {
         id="claude",
         name="Claude",
         profile_dir=DATA_DIR / "profiles" / "claude",
-        backup_dir=DATA_DIR / "backups" / "claude",
+        history_dir=DATA_DIR / "history" / "claude",
         lock_path=DATA_DIR / "locks" / "claude.lock",
         files=(
             ToolFile(
@@ -89,7 +89,7 @@ TOOLS: dict[str, ToolConfig] = {
         id="codex",
         name="Codex",
         profile_dir=DATA_DIR / "profiles" / "codex",
-        backup_dir=DATA_DIR / "backups" / "codex",
+        history_dir=DATA_DIR / "history" / "codex",
         lock_path=DATA_DIR / "locks" / "codex.lock",
         files=(
             ToolFile(
@@ -112,7 +112,7 @@ TOOLS: dict[str, ToolConfig] = {
         id="opencode",
         name="OpenCode",
         profile_dir=DATA_DIR / "profiles" / "opencode",
-        backup_dir=DATA_DIR / "backups" / "opencode",
+        history_dir=DATA_DIR / "history" / "opencode",
         lock_path=DATA_DIR / "locks" / "opencode.lock",
         files=(
             ToolFile(

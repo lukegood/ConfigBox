@@ -9,7 +9,7 @@ from .errors import APIError
 
 
 PROFILE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
-BACKUP_NAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,180}$")
+HISTORY_ENTRY_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,180}$")
 
 
 def validate_profile_name(name: str) -> None:
@@ -21,11 +21,11 @@ def validate_profile_name(name: str) -> None:
         )
 
 
-def validate_backup_name(name: str) -> None:
-    if not BACKUP_NAME_RE.fullmatch(name):
-        raise APIError("INVALID_BACKUP_NAME", "Invalid backup name.", 400)
+def validate_history_entry_name(name: str) -> None:
+    if not HISTORY_ENTRY_RE.fullmatch(name):
+        raise APIError("INVALID_HISTORY_ENTRY", "Invalid history entry name.", 400)
     if "/" in name or "\\" in name or ".." in name or name.startswith("."):
-        raise APIError("INVALID_BACKUP_NAME", "Invalid backup name.", 400)
+        raise APIError("INVALID_HISTORY_ENTRY", "Invalid history entry name.", 400)
 
 
 def validate_content(fmt: str, content: str) -> None:

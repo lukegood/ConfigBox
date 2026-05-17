@@ -215,7 +215,7 @@ select {
   min-width: 0;
 }
 
-.nav-section.backups {
+.nav-section.history {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   min-height: 0;
@@ -280,7 +280,7 @@ select {
   padding-right: 2px;
 }
 
-.nav-section:not(.backups) .scroll-list {
+.nav-section:not(.history) .scroll-list {
   max-height: 220px;
 }
 
@@ -293,7 +293,7 @@ select {
 }
 
 .nav-item span:first-child,
-.backups .nav-item {
+.history .nav-item {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
