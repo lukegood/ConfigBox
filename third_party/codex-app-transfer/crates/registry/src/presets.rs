@@ -34,15 +34,15 @@ mod tests {
 
     #[test]
     fn presets_count_matches_python() {
-        // 当前 12 条 builtin presets:
+        // 当前 13 条 builtin presets:
         // deepseek / kimi / kimi-code / xiaomi-mimo-payg / xiaomi-mimo-token-plan
-        // / zhipu / bailian / minimax / grok-web / google-ai-studio
+        // / zhipu / bailian / bailian-token-plan / minimax / grok-web / google-ai-studio
         // / gemini-cli-oauth / antigravity-oauth
         // (2026-05-10 加 Google AI Studio Gemini preset)
         // (2026-05-11 加 Gemini CLI OAuth login preset)
         // (2026-05-11 加 Antigravity OAuth preset)
         // (2026-05-12 加 Grok Web 反代 preset,见 R1 Plan A)
-        assert_eq!(builtin_presets().len(), 12);
+        assert_eq!(builtin_presets().len(), 13);
     }
 
     #[test]
@@ -87,6 +87,28 @@ mod tests {
         assert!(
             default_model.starts_with("gemini-3"),
             "default model 必须是 Gemini 3.x 系列(2026-05 主流),实际:{default_model}"
+        );
+    }
+
+    #[test]
+    fn bailian_token_plan_preset_uses_openai_chat_format() {
+        // 百炼 Token Plan 的 `/compatible-mode/v1` 入口实际只支持 OpenAI Chat
+        // Completions 兼容(参考 docsUrl `help.aliyun.com/zh/model-studio/
+        // token-plan-quickstart`),不支持 `/v1/responses`。
+        // apiFormat 必须是 openai_chat 走 ResponsesAdapter 做协议转换,不能配
+        // responses 走 passthrough 直传(否则上游必返 404/invalid)。
+        let p = builtin_presets()
+            .iter()
+            .find(|p| p["id"] == "bailian-token-plan")
+            .expect("bailian-token-plan preset must exist as builtin entry")
+            .clone();
+        assert_eq!(
+            p["apiFormat"], "openai_chat",
+            "百炼 Token Plan 上游只支持 chat completions 兼容,必须配 openai_chat 走协议转换"
+        );
+        assert_eq!(
+            p["baseUrl"],
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
         );
     }
 

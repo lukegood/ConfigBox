@@ -122,7 +122,7 @@ The user started by asking to review the auth module for race conditions. I read
 /// 抄自 `openai/codex` 仓库 `codex-rs/core/templates/compact/summary_prefix.md` (Apache-2).
 /// Codex CLI 反序列化 compact 响应后,通过 `is_summary_message`(`startswith(PREFIX)`)
 /// 识别这段文本是 compaction summary 并接管历史回放。**前缀必须保持字面一致**。
-const COMPACT_SUMMARY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
+pub(crate) const COMPACT_SUMMARY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
 
 /// `COMPACT_USER_MESSAGE_MAX_TOKENS` from `codex-rs/core/src/compact.rs:48`.
 const COMPACT_MAX_OUTPUT_TOKENS: u32 = 20_000;
@@ -589,6 +589,10 @@ async fn collect_and_wrap_compact_body(
             AdapterError::Internal("compact upstream missing choices[0].message.content".to_owned())
         })?;
 
+    compact_response_body_from_summary_text(raw)
+}
+
+pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u8>, AdapterError> {
     // B1:抽 `<summary>...</summary>` tag 内容(配合 v2.0.12 prompt 强制
     // `<analysis>` + `<summary>` 二段输出),无 tag 时容错回退原文。
     // 不抽 analysis 部分,避免污染下一轮 history(模型 chain-of-thought

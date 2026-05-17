@@ -12,6 +12,7 @@
 //! - body 中的 model 字段是否被剥掉 `<slug>/` 前缀
 
 use std::{
+    io::Write,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -22,6 +23,7 @@ use codex_app_transfer_registry::Provider;
 use futures_util::{SinkExt, StreamExt};
 use indexmap::IndexMap;
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{
     connect_async,
@@ -88,6 +90,58 @@ fn chat_sse_capture_mock(calls: Arc<Mutex<Vec<serde_json::Value>>>) -> Router {
                 "data: {\"id\":\"chatcmpl_test\",\"model\":\"mock-chat\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
                 "data: {\"id\":\"chatcmpl_test\",\"model\":\"mock-chat\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
                 "data: [DONE]\n\n",
+            );
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(payload))
+                .unwrap()
+        }
+    }))
+}
+
+fn anthropic_sse_capture_mock(calls: Arc<Mutex<Vec<serde_json::Value>>>) -> Router {
+    Router::new().fallback(any(move |req: Request| {
+        let calls = calls.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let bytes = axum::body::to_bytes(body, usize::MAX)
+                .await
+                .unwrap_or_default();
+            let mut headers_map = serde_json::Map::new();
+            let mut headers_all: serde_json::Map<String, serde_json::Value> =
+                serde_json::Map::new();
+            for (k, v) in parts.headers.iter() {
+                let name = k.as_str().to_owned();
+                let value = v.to_str().unwrap_or("").to_owned();
+                headers_map.insert(name.clone(), serde_json::Value::String(value.clone()));
+                headers_all
+                    .entry(name)
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::Value::String(value));
+            }
+            calls.lock().unwrap().push(json!({
+                "method": parts.method.as_str(),
+                "path": parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"),
+                "headers": headers_map,
+                "headers_all": headers_all,
+                "body": String::from_utf8_lossy(&bytes),
+            }));
+            let payload = concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
             );
             Response::builder()
                 .status(200)
@@ -186,6 +240,28 @@ async fn body_json(resp: reqwest::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn agent_debug_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    let payload = json!({
+        "sessionId": "bf3f9f",
+        "runId": "pre-fix",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/alysechen/alysechen/github/codex-app-transfer/.cursor/debug-bf3f9f.log")
+    {
+        let _ = writeln!(f, "{}", payload);
+    }
+}
+
 #[tokio::test]
 async fn successful_forward_updates_proxy_telemetry() {
     let before = proxy_telemetry().stats.snapshot();
@@ -213,6 +289,64 @@ async fn successful_forward_updates_proxy_telemetry() {
     assert!(logs
         .iter()
         .any(|entry| entry.level == "SUCCESS" && entry.message == "upstream status 200"));
+}
+
+#[tokio::test]
+async fn anthropic_messages_forward_injects_adapter_protocol_headers() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn(anthropic_sse_capture_mock(calls.clone())).await;
+    let mut claude = provider(
+        "claude-provider",
+        &format!("http://{upstream}/v1"),
+        "sk-claude",
+        "bearer",
+        &[],
+    );
+    claude.api_format = "anthropic".into();
+    let resolver = Arc::new(StaticResolver::new(
+        Some("cas_test_gw".into()),
+        vec![claude],
+        Some("claude-provider".into()),
+    ));
+    let proxy = spawn(build_router(resolver)).await;
+
+    let resp = client()
+        .post(format!("http://{proxy}/v1/responses"))
+        .header("authorization", "Bearer cas_test_gw")
+        .header("anthropic-version", "stale-client-value")
+        .header("content-type", "text/plain")
+        .body(
+            json!({
+                "model": "claude-provider/claude-3-5-sonnet-latest",
+                "stream": true,
+                "input": [{"type":"message","role":"user","content":"hi"}]
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.bytes().await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0];
+    assert_eq!(call["path"], "/v1/messages");
+    assert_eq!(call["headers"]["anthropic-version"], "2023-06-01");
+    assert_eq!(call["headers"]["content-type"], "application/json");
+    assert_eq!(
+        call["headers_all"]["anthropic-version"]
+            .as_array()
+            .expect("anthropic-version header list")
+            .len(),
+        1
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(call["body"].as_str().expect("captured body")).unwrap();
+    assert_eq!(body["model"], "claude-3-5-sonnet-latest");
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["messages"][0]["role"], "user");
 }
 
 #[tokio::test]
@@ -665,6 +799,84 @@ async fn websocket_responses_route_uses_legacy_responses_conversion() {
     assert_eq!(calls[0]["path"], "/v1/chat/completions");
     let body: serde_json::Value = serde_json::from_str(calls[0]["body"].as_str().unwrap()).unwrap();
     assert_eq!(body["model"], "kimi-for-coding");
+    assert_eq!(body["stream"], true);
+    assert!(body["messages"].is_array());
+}
+
+#[tokio::test]
+async fn qwen_openai_chat_provider_responses_route_rewrites_and_auths() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn(chat_sse_capture_mock(calls.clone())).await;
+    let mut qwen = provider(
+        "bailian",
+        &format!("http://{upstream}/v1"),
+        "sk-qwen-upstream",
+        "bearer",
+        &[],
+    );
+    qwen.models.insert("default".into(), "qwen3.6-plus".into());
+    let resolver = Arc::new(StaticResolver::new(
+        Some("cas_test_qwen_gateway".into()),
+        vec![qwen],
+        Some("bailian".into()),
+    ));
+    let proxy = spawn(build_router(resolver)).await;
+
+    // #region agent log
+    agent_debug_log(
+        "H3",
+        "crates/proxy/tests/auth_and_routing.rs:qwen_openai_chat_provider_responses_route_rewrites_and_auths:before_request",
+        "sending qwen responses request through proxy",
+        json!({
+            "proxyAddr": proxy.to_string(),
+            "incomingGatewayAuth": "Bearer cas_test_qwen_gateway",
+            "requestModel": "gpt-5.5",
+        }),
+    );
+    // #endregion
+
+    let resp = client()
+        .post(format!("http://{proxy}/v1/responses"))
+        .header("authorization", "Bearer cas_test_qwen_gateway")
+        .header("content-type", "application/json")
+        .body(
+            json!({
+                "model": "gpt-5.5",
+                "input": "hello qwen",
+                "stream": true
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.text().await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let method = calls[0]["method"].as_str().unwrap_or_default();
+    let path = calls[0]["path"].as_str().unwrap_or_default();
+    let body: serde_json::Value = serde_json::from_str(calls[0]["body"].as_str().unwrap()).unwrap();
+
+    // #region agent log
+    agent_debug_log(
+        "H4",
+        "crates/proxy/tests/auth_and_routing.rs:qwen_openai_chat_provider_responses_route_rewrites_and_auths:upstream_capture",
+        "captured upstream request for qwen",
+        json!({
+            "method": method,
+            "path": path,
+            "rewrittenModel": body["model"],
+            "stream": body["stream"],
+            "hasMessagesArray": body["messages"].is_array(),
+        }),
+    );
+    // #endregion
+
+    assert_eq!(method, "POST");
+    assert_eq!(path, "/v1/chat/completions");
+    assert_eq!(body["model"], "qwen3.6-plus");
     assert_eq!(body["stream"], true);
     assert!(body["messages"].is_array());
 }

@@ -66,8 +66,12 @@ export type GatewayProvider = {
   apiFormat: string;
   authScheme: string;
   models: Record<string, string>;
+  extraHeaders?: Record<string, string>;
+  modelCapabilities?: Record<string, unknown>;
+  requestOptions?: Record<string, unknown>;
   apiKey?: string;
   hasApiKey?: boolean;
+  hasGrokWeb?: boolean;
 };
 
 export type GatewayConfig = {
@@ -96,4 +100,13 @@ export type GatewayStatus = {
   providerCount: number;
   codexRestored?: boolean;
   codexApplied?: boolean;
+};
+
+export type OAuthStatus = {
+  loggedIn: boolean;
+  email?: string | null;
+  projectId?: string | null;
+  expiresAt?: number | null;
+  shouldRefresh?: boolean;
+  cancelled?: boolean;
 };

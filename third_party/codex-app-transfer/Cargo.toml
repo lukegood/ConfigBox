@@ -7,7 +7,6 @@ members = [
     "crates/registry",
     "crates/proxy",
     "crates/adapters",
-    "crates/codex_integration",
     "crates/gemini_oauth",
     "crates/gateway",
 ]

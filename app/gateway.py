@@ -11,8 +11,8 @@ from collections.abc import MutableMapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import tomlkit
 
@@ -34,7 +34,53 @@ DEFAULT_PROXY_PORT = int(os.getenv("CODEX_GATEWAY_PORT", "18080"))
 GATEWAY_LOG_MAX_MB = int(os.getenv("GATEWAY_LOG_MAX_MB", "50"))
 CONFIGBOX_GATEWAY_PROVIDER = "configbox_gateway"
 MANAGED_AUTH_KEYS = ("auth_mode", "OPENAI_API_KEY")
-MANAGED_ROOT_KEYS = ("model_provider", "model", "openai_base_url")
+MANAGED_ROOT_KEYS = (
+    "model_provider",
+    "model",
+    "openai_base_url",
+    "model_context_window",
+    "model_catalog_json",
+)
+MODEL_CATALOG_FILENAME = "codex-model-catalog.json"
+DEFAULT_CONTEXT_WINDOW = 258_400
+ONE_M_CONTEXT_WINDOW = 1_000_000
+AUTO_COMPACT_TRIGGER_PERCENT = 80
+DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
+MODEL_SLOT_TO_CODEX_ID = {
+    "gpt_5_5": "gpt-5.5",
+    "gpt_5_4": "gpt-5.4",
+    "gpt_5_4_mini": "gpt-5.4-mini",
+    "gpt_5_3_codex": "gpt-5.3-codex",
+    "gpt_5_2": "gpt-5.2",
+}
+DOCUMENTED_CONTEXT_WINDOWS = {
+    "deepseek-v4-pro": ONE_M_CONTEXT_WINDOW,
+    "deepseek-v4-flash": ONE_M_CONTEXT_WINDOW,
+    "kimi-for-coding": 262_144,
+    "kimi-k2.5": 262_144,
+    "kimi-k2.6": 262_144,
+    "kimi-2.6": 262_144,
+    "moonshot-v1-8k": 8_192,
+    "moonshot-v1-8k-vision-preview": 8_192,
+    "moonshot-v1-32k": 32_768,
+    "moonshot-v1-32k-vision-preview": 32_768,
+    "moonshot-v1-128k": 131_072,
+    "moonshot-v1-auto": 131_072,
+    "moonshot-v1-128k-vision-preview": 131_072,
+    "mimo-v2-pro": ONE_M_CONTEXT_WINDOW,
+    "mimo-v2.5": ONE_M_CONTEXT_WINDOW,
+    "mimo-v2.5-pro": ONE_M_CONTEXT_WINDOW,
+    "mimo-v2-flash": 262_144,
+    "mimo-v2-omni": 262_144,
+    "glm-5.1": 200_000,
+    "glm-4.7": 200_000,
+    "qwen3.6-plus": ONE_M_CONTEXT_WINDOW,
+    "qwen3.6-flash": ONE_M_CONTEXT_WINDOW,
+    "minimax-m2.7": 204_800,
+    "gemini-3.1-flash-lite": ONE_M_CONTEXT_WINDOW,
+    "gemini-2.5-flash": ONE_M_CONTEXT_WINDOW,
+    "gemini-3-flash": ONE_M_CONTEXT_WINDOW,
+}
 
 _process: subprocess.Popen[str] | None = None
 
@@ -130,7 +176,8 @@ def public_provider(provider: dict[str, Any]) -> dict[str, Any]:
     result["hasApiKey"] = bool(api_key)
     if "extraHeaders" in result:
         result["extraHeadersPresent"] = True
-        result.pop("extraHeaders", None)
+    grok_web = result.pop("grokWeb", None)
+    result["hasGrokWeb"] = has_grok_web_credentials(grok_web)
     return result
 
 
@@ -157,32 +204,149 @@ def normalize_provider(payload: dict[str, Any], existing_id: str | None = None) 
     default_model = str(models.get("default") or payload.get("defaultModel") or "").strip()
     if default_model and not models.get("default"):
         models = {**models, "default": default_model}
-    return {
+    extra_headers = normalize_string_map(payload.get("extraHeaders"), "extraHeaders")
+    model_capabilities = normalize_object_map(payload.get("modelCapabilities"), "modelCapabilities")
+    request_options = normalize_object_map(payload.get("requestOptions"), "requestOptions")
+    api_format = normalize_api_format(str(payload.get("apiFormat") or "openai_chat"))
+    grok_web = normalize_grok_web(payload.get("grokWeb"))
+    if api_format == "grok_web" and not has_grok_web_credentials(grok_web):
+        raise APIError(
+            "INVALID_PROVIDER",
+            "grok_web requires grokWeb.cookies.sso.",
+            400,
+        )
+    normalized = {
         "id": provider_id,
         "name": name,
         "baseUrl": base_url.rstrip("/"),
-        "authScheme": str(payload.get("authScheme") or "bearer"),
-        "apiFormat": normalize_api_format(str(payload.get("apiFormat") or "openai_chat")),
+        "authScheme": str(payload.get("authScheme") or recommended_auth_scheme(api_format)),
+        "apiFormat": api_format,
         "apiKey": str(payload.get("apiKey") or ""),
         "models": normalize_models(models),
-        "extraHeaders": dict(payload.get("extraHeaders") or {}),
-        "modelCapabilities": dict(payload.get("modelCapabilities") or {}),
-        "requestOptions": dict(payload.get("requestOptions") or {}),
+        "extraHeaders": extra_headers,
+        "modelCapabilities": model_capabilities,
+        "requestOptions": request_options,
         "isBuiltin": bool(payload.get("isBuiltin", False)),
         "sortIndex": int(payload.get("sortIndex") or 0),
     }
+    if grok_web is not None:
+        normalized["grokWeb"] = grok_web
+    return normalized
 
 
 def normalize_api_format(value: str) -> str:
-    lowered = value.strip().lower()
+    lowered = value.strip().lower().replace("-", "_")
     if lowered in {"openai", "openai_chat", "chat_completions"}:
         return "openai_chat"
-    return "responses"
+    if lowered in {"responses", "openai_responses"}:
+        return "responses"
+    if lowered in {
+        "anthropic_messages",
+        "anthropic",
+        "claude",
+        "messages",
+        "claude_messages",
+    }:
+        return "anthropic_messages"
+    if lowered in {"gemini_native", "google_ai_studio", "gemini"}:
+        return "gemini_native"
+    if lowered in {"gemini_cli_oauth", "gemini_cli", "google_oauth_cloud_code"}:
+        return "gemini_cli_oauth"
+    if lowered in {"antigravity_oauth", "antigravity", "google_oauth_antigravity"}:
+        return "antigravity_oauth"
+    if lowered in {"grok_web", "grok"}:
+        return "grok_web"
+    return "openai_chat"
 
 
 def normalize_models(models: dict[str, Any]) -> dict[str, str]:
-    slots = ("default", "gpt_5_5", "gpt_5_4", "gpt_5_4_mini", "gpt_5_3_codex", "gpt_5_2")
-    return {slot: str(models.get(slot) or "").strip() for slot in slots}
+    normalized: dict[str, str] = {}
+    for raw_key, raw_value in models.items():
+        key = str(raw_key).strip()
+        value = str(raw_value or "").strip()
+        if key:
+            normalized[key] = value
+    for slot in ("default", *MODEL_SLOT_TO_CODEX_ID.keys()):
+        normalized.setdefault(slot, "")
+    return normalized
+
+
+def recommended_auth_scheme(api_format: str) -> str:
+    if api_format == "gemini_native":
+        return "google_api_key"
+    if api_format == "gemini_cli_oauth":
+        return "google_oauth_cloud_code"
+    if api_format == "antigravity_oauth":
+        return "google_oauth_antigravity"
+    if api_format == "grok_web":
+        return "grok_cookie"
+    return "bearer"
+
+
+def normalize_string_map(value: Any, field: str) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise APIError("INVALID_PROVIDER", f"{field} must be an object.", 400)
+    normalized: dict[str, str] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        if not isinstance(raw_value, str):
+            raise APIError("INVALID_PROVIDER", f"{field}.{key} must be a string.", 400)
+        if any(ch in key for ch in "\r\n:") or any(ch in raw_value for ch in "\r\n"):
+            raise APIError("INVALID_PROVIDER", f"{field}.{key} contains invalid header characters.", 400)
+        normalized[key] = raw_value
+    return normalized
+
+
+def normalize_object_map(value: Any, field: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise APIError("INVALID_PROVIDER", f"{field} must be an object.", 400)
+    return dict(value)
+
+
+def normalize_grok_web(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise APIError("INVALID_PROVIDER", "grokWeb must be an object.", 400)
+    cookies = value.get("cookies")
+    if cookies is not None and not isinstance(cookies, dict):
+        raise APIError("INVALID_PROVIDER", "grokWeb.cookies must be an object.", 400)
+    normalized: dict[str, Any] = {}
+    if isinstance(cookies, dict):
+        normalized_cookies: dict[str, str] = {}
+        for raw_key, raw_value in cookies.items():
+            key = str(raw_key).strip()
+            if not key:
+                continue
+            if not isinstance(raw_value, str):
+                raise APIError("INVALID_PROVIDER", f"grokWeb.cookies.{key} must be a string.", 400)
+            normalized_cookies[key] = raw_value
+        if normalized_cookies:
+            normalized["cookies"] = normalized_cookies
+    for field in ("statsigId", "userAgent"):
+        if field not in value:
+            continue
+        raw = value[field]
+        if not isinstance(raw, str):
+            raise APIError("INVALID_PROVIDER", f"grokWeb.{field} must be a string.", 400)
+        if raw:
+            normalized[field] = raw
+    return normalized
+
+
+def has_grok_web_credentials(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    cookies = value.get("cookies")
+    if not isinstance(cookies, dict):
+        return False
+    return bool(str(cookies.get("sso") or "").strip())
 
 
 def fresh_provider_id() -> str:
@@ -373,6 +537,48 @@ def is_port_healthy(port: int) -> bool:
         return False
 
 
+def oauth_admin_request(path: str, method: str = "GET") -> dict[str, Any]:
+    port = proxy_port()
+    if not is_port_healthy(port):
+        raise APIError("GATEWAY_NOT_RUNNING", "Start Gateway before using OAuth login.", 409)
+    request = Request(
+        f"http://127.0.0.1:{port}{path}",
+        method=method,
+        headers={"Accept": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=305) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        message = payload.get("error") or payload.get("message") or str(exc)
+        raise APIError("OAUTH_FAILED", str(message), exc.code) from exc
+    except (OSError, URLError) as exc:
+        raise APIError("OAUTH_FAILED", f"OAuth admin request failed: {exc}", 502) from exc
+    return payload if isinstance(payload, dict) else {}
+
+
+def oauth_status(kind: str) -> dict[str, Any]:
+    return oauth_admin_request(oauth_path(kind, "status"))
+
+
+def oauth_login(kind: str) -> dict[str, Any]:
+    return oauth_admin_request(oauth_path(kind, "login"), "POST")
+
+
+def oauth_logout(kind: str) -> dict[str, Any]:
+    return oauth_admin_request(oauth_path(kind, "logout"), "DELETE")
+
+
+def oauth_path(kind: str, action: str) -> str:
+    if kind not in {"gemini", "antigravity"}:
+        raise APIError("INVALID_OAUTH_KIND", "Unsupported OAuth provider.", 404)
+    return f"/__admin/{kind}-oauth/{action}"
+
+
 def public_base_url(port: int) -> str:
     return f"http://{CODEX_GATEWAY_PUBLIC_HOST}:{port}"
 
@@ -394,14 +600,20 @@ def snapshot_path() -> Path:
     return GATEWAY_DIR / "codex-snapshot.json"
 
 
+def model_catalog_path() -> Path:
+    return GATEWAY_DIR / MODEL_CATALOG_FILENAME
+
+
 def apply_codex() -> dict[str, Any]:
     config = read_config()
     provider = active_provider(config)
     if provider is None:
         raise APIError("NO_GATEWAY_PROVIDER", "Add a gateway provider before applying.", 400)
+    applied_model = preferred_model(provider)
     ensure_snapshot()
     apply_auth(config)
-    apply_toml(config, provider)
+    apply_toml(config, provider, applied_model)
+    record_applied_state(applied_model)
     return {
         "success": True,
         "authJsonPath": str(codex_auth_path()),
@@ -428,7 +640,17 @@ def ensure_snapshot() -> None:
             for key in MANAGED_ROOT_KEYS
         },
         "gatewayProvider": table_snapshot(config_doc),
+        "applied": {},
     }
+    atomic_write(path, json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n")
+
+
+def record_applied_state(applied_model: str) -> None:
+    path = snapshot_path()
+    if not path.exists():
+        return
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot["applied"] = {"model": applied_model}
     atomic_write(path, json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n")
 
 
@@ -475,14 +697,21 @@ def apply_auth(config: dict[str, Any]) -> None:
     atomic_write(path, json.dumps(auth, indent=2, ensure_ascii=False) + "\n")
 
 
-def apply_toml(config: dict[str, Any], provider: dict[str, Any]) -> None:
+def apply_toml(config: dict[str, Any], provider: dict[str, Any], applied_model: str) -> None:
     path = codex_config_path()
     doc = read_toml_doc(path)
     port = proxy_port(config)
     base_url = public_base_url(port)
+    catalog_models = build_catalog_models(provider)
+    write_model_catalog(catalog_models)
     doc["model_provider"] = CONFIGBOX_GATEWAY_PROVIDER
-    doc["model"] = preferred_model(provider)
+    doc["model"] = applied_model
     doc["openai_base_url"] = base_url
+    doc["model_catalog_json"] = str(model_catalog_path().resolve())
+    if default_model_context_window(provider) >= ONE_M_CONTEXT_WINDOW:
+        doc["model_context_window"] = ONE_M_CONTEXT_WINDOW
+    else:
+        doc.pop("model_context_window", None)
     providers = doc.get("model_providers")
     if not isinstance(providers, MutableMapping):
         providers = tomlkit.table()
@@ -521,6 +750,7 @@ def restore_codex() -> dict[str, Any]:
     snapshot = json.loads(path.read_text(encoding="utf-8"))
     restore_auth(snapshot)
     restore_toml(snapshot)
+    model_catalog_path().unlink(missing_ok=True)
     path.unlink(missing_ok=True)
     return {
         "success": True,
@@ -550,7 +780,12 @@ def restore_auth(snapshot: dict[str, Any]) -> None:
 def restore_toml(snapshot: dict[str, Any]) -> None:
     path = codex_config_path()
     doc = read_toml_doc(path)
+    applied_model = dict(snapshot.get("applied") or {}).get("model")
     for key, entry in dict(snapshot.get("config") or {}).items():
+        if key == "model" and applied_model is not None:
+            current_model = plain_value(doc.get("model"))
+            if current_model != applied_model:
+                continue
         if entry.get("exists"):
             doc[key] = entry.get("value")
         else:
@@ -566,6 +801,228 @@ def restore_toml(snapshot: dict[str, Any]) -> None:
         if not providers:
             doc.pop("model_providers", None)
     atomic_write(path, tomlkit.dumps(doc))
+
+
+def write_model_catalog(models: list[dict[str, Any]]) -> None:
+    path = model_catalog_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(path, json.dumps({"models": models}, indent=2, ensure_ascii=False) + "\n")
+
+
+def build_catalog_models(provider: dict[str, Any]) -> list[dict[str, Any]]:
+    models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
+    default_model = clean_model_id(str(models.get("default") or ""))
+    entries: list[dict[str, Any]] = []
+    for slot, codex_id in MODEL_SLOT_TO_CODEX_ID.items():
+        target = clean_model_id(str(models.get(slot) or default_model))
+        entries.append(
+            catalog_model(
+                codex_id,
+                str(provider.get("name") or provider.get("id") or "Gateway"),
+                target or codex_id,
+                context_window_for_model(provider, target or default_model),
+            )
+        )
+    if default_model and not any(entry["slug"] == default_model for entry in entries):
+        entries.append(
+            catalog_model(
+                default_model,
+                str(provider.get("name") or provider.get("id") or "Gateway"),
+                default_model,
+                context_window_for_model(provider, default_model),
+            )
+        )
+    return entries
+
+
+def default_model_context_window(provider: dict[str, Any]) -> int:
+    models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
+    return context_window_for_model(provider, clean_model_id(str(models.get("default") or "")))
+
+
+def context_window_for_model(provider: dict[str, Any], model: str) -> int:
+    clean = clean_model_id(model)
+    explicit = explicit_context_window(provider, clean)
+    if explicit is not None:
+        return explicit
+    documented = DOCUMENTED_CONTEXT_WINDOWS.get(clean.lower())
+    if documented is not None:
+        return documented
+    if model_supports_1m(provider, clean):
+        return ONE_M_CONTEXT_WINDOW
+    return DEFAULT_CONTEXT_WINDOW
+
+
+def explicit_context_window(provider: dict[str, Any], model: str) -> int | None:
+    caps = provider.get("modelCapabilities")
+    if not isinstance(caps, dict):
+        return None
+    for key, value in caps.items():
+        if str(key).strip().lower() != model.lower() or not isinstance(value, dict):
+            continue
+        raw = value.get("context_window")
+        if isinstance(raw, int) and raw >= 1024:
+            return raw
+    return None
+
+
+def model_supports_1m(provider: dict[str, Any], model: str) -> bool:
+    if has_internal_one_m_suffix(model):
+        return True
+    caps = provider.get("modelCapabilities")
+    if not isinstance(caps, dict):
+        return False
+    for key, value in caps.items():
+        if str(key).strip().lower() != clean_model_id(model).lower() or not isinstance(value, dict):
+            continue
+        if value.get("supports1m") is True:
+            return True
+        raw = value.get("context_window")
+        if isinstance(raw, int) and raw >= ONE_M_CONTEXT_WINDOW:
+            return True
+    return False
+
+
+def has_internal_one_m_suffix(model: str) -> bool:
+    return model.strip().lower().endswith("[1m]")
+
+
+def clean_model_id(model: str) -> str:
+    stripped = model.strip()
+    if has_internal_one_m_suffix(stripped):
+        return stripped[: stripped.lower().rfind("[1m]")].rstrip()
+    return stripped
+
+
+def catalog_model(slug: str, provider_name: str, target_model: str, context_window: int) -> dict[str, Any]:
+    entry = builtin_catalog_template(slug) or generic_catalog_template()
+    entry.update(
+        {
+            "slug": slug,
+            "display_name": f"{provider_name} / {target_model}",
+            "description": f"Routed through ConfigBox Gateway as {provider_name} / {target_model}.",
+            "context_window": context_window,
+            "max_context_window": context_window,
+            "effective_context_window_percent": DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
+            "auto_compact_token_limit": context_window * AUTO_COMPACT_TRIGGER_PERCENT // 100,
+        }
+    )
+    return entry
+
+
+def builtin_catalog_template(slug: str) -> dict[str, Any] | None:
+    templates = {
+        "gpt-5.5": {
+            "display_name": "GPT-5.5",
+            "default_reasoning_level": "medium",
+            "priority": 0,
+            "web_search_tool_type": "text_and_image",
+            "supports_image_detail_original": True,
+        },
+        "gpt-5.4": {
+            "display_name": "gpt-5.4",
+            "default_reasoning_level": "xhigh",
+            "priority": 2,
+            "web_search_tool_type": "text_and_image",
+            "supports_image_detail_original": True,
+        },
+        "gpt-5.4-mini": {
+            "display_name": "GPT-5.4-Mini",
+            "default_reasoning_level": "medium",
+            "priority": 4,
+            "web_search_tool_type": "text_and_image",
+            "supports_image_detail_original": True,
+        },
+        "gpt-5.3-codex": {
+            "display_name": "gpt-5.3-codex",
+            "default_reasoning_level": "medium",
+            "priority": 6,
+            "web_search_tool_type": "text",
+            "supports_image_detail_original": True,
+        },
+        "gpt-5.2": {
+            "display_name": "gpt-5.2",
+            "default_reasoning_level": "medium",
+            "priority": 10,
+            "web_search_tool_type": "text",
+            "supports_image_detail_original": False,
+        },
+    }
+    template = templates.get(slug)
+    if template is None:
+        return None
+    return {
+        "slug": slug,
+        "display_name": template["display_name"],
+        "description": "",
+        "default_reasoning_level": template["default_reasoning_level"],
+        "supported_reasoning_levels": reasoning_levels(),
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": template["priority"],
+        "additional_speed_tiers": [],
+        "availability_nux": None,
+        "upgrade": None,
+        "base_instructions": "",
+        "supports_reasoning_summaries": True,
+        "default_reasoning_summary": "none",
+        "support_verbosity": True,
+        "default_verbosity": "low",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": template["web_search_tool_type"],
+        "truncation_policy": {"mode": "tokens", "limit": 10_000},
+        "supports_parallel_tool_calls": True,
+        "supports_image_detail_original": template["supports_image_detail_original"],
+        "context_window": 272_000,
+        "max_context_window": 272_000,
+        "effective_context_window_percent": DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": True,
+    }
+
+
+def generic_catalog_template() -> dict[str, Any]:
+    return {
+        "slug": "",
+        "display_name": "",
+        "description": "",
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": reasoning_levels()[:3],
+        "shell_type": "default",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 10,
+        "additional_speed_tiers": [],
+        "availability_nux": None,
+        "upgrade": None,
+        "base_instructions": "",
+        "supports_reasoning_summaries": False,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": False,
+        "default_verbosity": None,
+        "apply_patch_tool_type": None,
+        "web_search_tool_type": "text",
+        "truncation_policy": {"mode": "bytes", "limit": 4_000_000},
+        "supports_parallel_tool_calls": False,
+        "supports_image_detail_original": False,
+        "context_window": DEFAULT_CONTEXT_WINDOW,
+        "max_context_window": DEFAULT_CONTEXT_WINDOW,
+        "effective_context_window_percent": DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": False,
+    }
+
+
+def reasoning_levels() -> list[dict[str, str]]:
+    return [
+        {"effort": "low", "description": "Fast responses with lighter reasoning"},
+        {"effort": "medium", "description": "Balanced speed and reasoning depth"},
+        {"effort": "high", "description": "Greater reasoning depth for complex tasks"},
+        {"effort": "xhigh", "description": "Extra high reasoning depth for complex tasks"},
+    ]
 
 
 def read_logs(limit: int = 300) -> dict[str, Any]:

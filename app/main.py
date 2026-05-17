@@ -243,6 +243,21 @@ def gateway_restore(user: AuthUser = Depends(require_user)) -> dict:
     return gateway.restore_codex()
 
 
+@app.get("/api/gateway/oauth/{kind}/status")
+def gateway_oauth_status(kind: str, user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.oauth_status(kind)
+
+
+@app.post("/api/gateway/oauth/{kind}/login")
+def gateway_oauth_login(kind: str, user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.oauth_login(kind)
+
+
+@app.delete("/api/gateway/oauth/{kind}/logout")
+def gateway_oauth_logout(kind: str, user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.oauth_logout(kind)
+
+
 static_dir = Path(__file__).parent / "static"
 if static_dir.exists():
     app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")

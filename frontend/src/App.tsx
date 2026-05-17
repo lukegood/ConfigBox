@@ -31,6 +31,7 @@ import {
   deleteProfile,
   getGatewayConfig,
   getGatewayLogs,
+  getGatewayOAuthStatus,
   getGatewayStatus,
   getHistory,
   getProfile,
@@ -38,6 +39,8 @@ import {
   hasAuth,
   listHistory,
   listProfiles,
+  loginGatewayOAuth,
+  logoutGatewayOAuth,
   me,
   restoreHistory,
   restartGateway,
@@ -57,6 +60,7 @@ import type {
   ProfileItem,
   Tool,
   ToolId,
+  OAuthStatus,
   ViewMode
 } from "./types";
 
@@ -70,8 +74,23 @@ type GatewayProviderForm = {
   apiKey: string;
   authScheme: string;
   apiFormat: string;
-  defaultModel: string;
-  gpt53Model: string;
+  models: Record<string, string>;
+  customMappings: GatewayCustomMapping[];
+  extraHeadersJson: string;
+  modelCapabilitiesJson: string;
+  requestOptionsJson: string;
+  grokSso: string;
+  grokSsoRw: string;
+  grokCookieString: string;
+  grokCfClearance: string;
+  grokStatsigId: string;
+  grokUserAgent: string;
+};
+
+type GatewayCustomMapping = {
+  id: string;
+  key: string;
+  value: string;
 };
 
 type OpenCodeProviderForm = {
@@ -104,9 +123,49 @@ const emptyGatewayProviderForm: GatewayProviderForm = {
   apiKey: "",
   authScheme: "bearer",
   apiFormat: "openai_chat",
-  defaultModel: "",
-  gpt53Model: ""
+  models: emptyGatewayModels(),
+  customMappings: [],
+  extraHeadersJson: "{}",
+  modelCapabilitiesJson: "{}",
+  requestOptionsJson: "{}",
+  grokSso: "",
+  grokSsoRw: "",
+  grokCookieString: "",
+  grokCfClearance: "",
+  grokStatsigId: "",
+  grokUserAgent: ""
 };
+
+const gatewayModelSlots = [
+  { key: "default", label: "Default" },
+  { key: "gpt_5_5", label: "gpt-5.5" },
+  { key: "gpt_5_4", label: "gpt-5.4" },
+  { key: "gpt_5_4_mini", label: "gpt-5.4-mini" },
+  { key: "gpt_5_3_codex", label: "gpt-5.3-codex" },
+  { key: "gpt_5_2", label: "gpt-5.2" }
+] as const;
+
+const gatewayApiFormats = [
+  { value: "openai_chat", label: "OpenAI Chat" },
+  { value: "responses", label: "Responses" },
+  { value: "anthropic_messages", label: "Anthropic Messages" },
+  { value: "gemini_native", label: "Gemini Native" },
+  { value: "gemini_cli_oauth", label: "Gemini CLI (OAuth)" },
+  { value: "antigravity_oauth", label: "Antigravity (OAuth)" },
+  { value: "grok_web", label: "Grok Web" }
+] as const;
+
+const gatewayPredefinedModelKeys = new Set<string>(gatewayModelSlots.map((slot) => slot.key));
+let gatewayCustomMappingCounter = 0;
+
+function emptyGatewayModels(): Record<string, string> {
+  return Object.fromEntries(gatewayModelSlots.map((slot) => [slot.key, ""]));
+}
+
+function nextGatewayCustomMappingId() {
+  gatewayCustomMappingCounter += 1;
+  return `gateway-custom-${gatewayCustomMappingCounter}`;
+}
 
 const emptyOpenCodeProviderForm: OpenCodeProviderForm = {
   providerId: "",
@@ -148,6 +207,11 @@ function App() {
   const [gatewayLogBytes, setGatewayLogBytes] = useState({ current: 0, max: 0 });
   const [gatewayProviderForm, setGatewayProviderForm] = useState<GatewayProviderForm | null>(null);
   const [gatewayRestartRequired, setGatewayRestartRequired] = useState(false);
+  const [gatewayOAuthStatus, setGatewayOAuthStatus] = useState<Record<"gemini" | "antigravity", OAuthStatus | null>>({
+    gemini: null,
+    antigravity: null
+  });
+  const [gatewayOAuthBusy, setGatewayOAuthBusy] = useState<"gemini" | "antigravity" | null>(null);
   const [openCodeProviderForm, setOpenCodeProviderForm] = useState<OpenCodeProviderForm | null>(null);
   const [openCodeModelForm, setOpenCodeModelForm] = useState<OpenCodeModelForm | null>(null);
   const [showGatewayProviderApiKey, setShowGatewayProviderApiKey] = useState(false);
@@ -509,9 +573,24 @@ function App() {
   function openGatewayProviderForm(provider?: GatewayConfig["providers"][number]) {
     setShowGatewayProviderApiKey(false);
     if (!provider) {
-      setGatewayProviderForm(emptyGatewayProviderForm);
+      setGatewayProviderForm({
+        ...emptyGatewayProviderForm,
+        models: emptyGatewayModels(),
+        customMappings: []
+      });
       return;
     }
+    const models = { ...emptyGatewayModels() };
+    for (const slot of gatewayModelSlots) {
+      models[slot.key] = provider.models?.[slot.key] || "";
+    }
+    const customMappings = Object.entries(provider.models || {})
+      .filter(([key, value]) => !gatewayPredefinedModelKeys.has(key) && Boolean(value))
+      .map(([key, value]) => ({
+        id: nextGatewayCustomMappingId(),
+        key,
+        value
+      }));
     setGatewayProviderForm({
       id: provider.id,
       name: provider.name,
@@ -519,13 +598,89 @@ function App() {
       apiKey: provider.apiKey || "",
       authScheme: provider.authScheme || "bearer",
       apiFormat: provider.apiFormat || "openai_chat",
-      defaultModel: provider.models?.default || "",
-      gpt53Model: provider.models?.gpt_5_3_codex || provider.models?.default || ""
+      models,
+      customMappings,
+      extraHeadersJson: formatJson(providerExtraHeaders(provider)),
+      modelCapabilitiesJson: formatJson(provider.modelCapabilities || {}),
+      requestOptionsJson: formatJson(provider.requestOptions || {}),
+      grokSso: "",
+      grokSsoRw: "",
+      grokCookieString: "",
+      grokCfClearance: "",
+      grokStatsigId: "",
+      grokUserAgent: ""
     });
+    if (provider.apiFormat === "gemini_cli_oauth") {
+      void loadGatewayOAuth("gemini");
+    } else if (provider.apiFormat === "antigravity_oauth") {
+      void loadGatewayOAuth("antigravity");
+    }
   }
 
   function updateGatewayProviderForm(field: keyof GatewayProviderForm, value: string) {
-    setGatewayProviderForm((current) => (current ? { ...current, [field]: value } : current));
+    setGatewayProviderForm((current) => {
+      if (!current) return current;
+      if (field === "apiFormat") {
+        return {
+          ...current,
+          apiFormat: value,
+          authScheme: recommendedGatewayAuthScheme(value)
+        };
+      }
+      return { ...current, [field]: value };
+    });
+  }
+
+  function updateGatewayModel(slot: string, value: string) {
+    setGatewayProviderForm((current) =>
+      current
+        ? {
+            ...current,
+            models: {
+              ...current.models,
+              [slot]: value
+            }
+          }
+        : current
+    );
+  }
+
+  function addGatewayCustomMapping() {
+    setGatewayProviderForm((current) =>
+      current
+        ? {
+            ...current,
+            customMappings: [
+              ...current.customMappings,
+              { id: nextGatewayCustomMappingId(), key: "", value: "" }
+            ]
+          }
+        : current
+    );
+  }
+
+  function updateGatewayCustomMapping(id: string, field: "key" | "value", value: string) {
+    setGatewayProviderForm((current) =>
+      current
+        ? {
+            ...current,
+            customMappings: current.customMappings.map((mapping) =>
+              mapping.id === id ? { ...mapping, [field]: value } : mapping
+            )
+          }
+        : current
+    );
+  }
+
+  function removeGatewayCustomMapping(id: string) {
+    setGatewayProviderForm((current) =>
+      current
+        ? {
+            ...current,
+            customMappings: current.customMappings.filter((mapping) => mapping.id !== id)
+          }
+        : current
+    );
   }
 
   async function handleGatewayProviderSubmit(event: FormEvent) {
@@ -540,16 +695,34 @@ function App() {
     setError("");
     try {
       const wasRunning = Boolean(gatewayStatus?.running);
+      const extraHeaders = parseJsonObject(form.extraHeadersJson, "额外 Headers");
+      const modelCapabilities = parseJsonObject(form.modelCapabilitiesJson, "模型能力");
+      const requestOptions = parseJsonObject(form.requestOptionsJson, "请求选项");
+      const models = {
+        ...Object.fromEntries(
+          gatewayModelSlots.map((slot) => [slot.key, form.models[slot.key]?.trim() || ""])
+        )
+      };
+      for (const mapping of form.customMappings) {
+        const key = mapping.key.trim();
+        if (key) {
+          models[key] = mapping.value.trim();
+        }
+      }
       const payload: Record<string, unknown> = {
         name: form.name.trim(),
         baseUrl: form.baseUrl.trim(),
         apiFormat: form.apiFormat,
         authScheme: form.authScheme,
-        models: {
-          default: form.defaultModel.trim(),
-          gpt_5_3_codex: form.gpt53Model.trim() || form.defaultModel.trim()
-        }
+        models,
+        extraHeaders,
+        modelCapabilities,
+        requestOptions
       };
+      const grokWeb = collectGrokWebPayload(form);
+      if (grokWeb) {
+        payload.grokWeb = grokWeb;
+      }
       if (form.apiKey.trim()) {
         payload.apiKey = form.apiKey.trim();
       }
@@ -621,6 +794,49 @@ function App() {
       setError(err instanceof Error ? err.message : "清除日志失败");
     } finally {
       setLoading(false);
+    }
+  }
+
+  function selectedOAuthKind() {
+    if (gatewayProviderForm?.apiFormat === "gemini_cli_oauth") return "gemini";
+    if (gatewayProviderForm?.apiFormat === "antigravity_oauth") return "antigravity";
+    return null;
+  }
+
+  async function loadGatewayOAuth(kind: "gemini" | "antigravity") {
+    try {
+      const next = await getGatewayOAuthStatus(kind);
+      setGatewayOAuthStatus((current) => ({ ...current, [kind]: next }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载 OAuth 状态失败");
+    }
+  }
+
+  async function handleGatewayOAuthLogin(kind: "gemini" | "antigravity") {
+    setGatewayOAuthBusy(kind);
+    setError("");
+    try {
+      const next = await loginGatewayOAuth(kind);
+      setGatewayOAuthStatus((current) => ({ ...current, [kind]: next }));
+      setStatus(next.loggedIn ? `${oauthLabel(kind)} 已登录` : `${oauthLabel(kind)} 未登录`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "OAuth 登录失败");
+    } finally {
+      setGatewayOAuthBusy(null);
+    }
+  }
+
+  async function handleGatewayOAuthLogout(kind: "gemini" | "antigravity") {
+    setGatewayOAuthBusy(kind);
+    setError("");
+    try {
+      const next = await logoutGatewayOAuth(kind);
+      setGatewayOAuthStatus((current) => ({ ...current, [kind]: next }));
+      setStatus(`${oauthLabel(kind)} 已退出`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "OAuth 退出失败");
+    } finally {
+      setGatewayOAuthBusy(null);
     }
   }
 
@@ -1161,7 +1377,7 @@ function App() {
             <div className="modal-head">
               <div>
                 <h3>{gatewayProviderForm.id ? "编辑 Provider" : "添加 Provider"}</h3>
-                <p>OpenAI Chat 兼容上游</p>
+                <p>配置转发协议与模型映射</p>
               </div>
               <button type="button" onClick={() => setGatewayProviderForm(null)}>
                 关闭
@@ -1205,22 +1421,6 @@ function App() {
                 </div>
               </label>
               <label>
-                默认模型
-                <input
-                  value={gatewayProviderForm.defaultModel}
-                  onChange={(event) => updateGatewayProviderForm("defaultModel", event.target.value)}
-                  placeholder="deepseek-chat"
-                />
-              </label>
-              <label>
-                将Codex请求的模型映射为
-                <input
-                  value={gatewayProviderForm.gpt53Model}
-                  onChange={(event) => updateGatewayProviderForm("gpt53Model", event.target.value)}
-                  placeholder="deepseek-chat"
-                />
-              </label>
-              <label>
                 鉴权方式
                 <select
                   value={gatewayProviderForm.authScheme}
@@ -1231,7 +1431,234 @@ function App() {
                   <option value="none">None</option>
                 </select>
               </label>
+              <label>
+                协议类型
+                <select
+                  value={gatewayProviderForm.apiFormat}
+                  onChange={(event) => updateGatewayProviderForm("apiFormat", event.target.value)}
+                >
+                  {gatewayApiFormats.map((format) => (
+                    <option key={format.value} value={format.value}>
+                      {format.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
             </div>
+            {selectedOAuthKind() ? (
+              <section className="gateway-credential-section">
+                <div className="gateway-mapping-head">
+                  <div>
+                    <h4>{oauthLabel(selectedOAuthKind()!)} 登录</h4>
+                    <p>OAuth token 会保存到本机 token 文件；Gateway 运行后可在这里完成登录。</p>
+                  </div>
+                  <div className="mini-actions">
+                    <button
+                      type="button"
+                      onClick={() => loadGatewayOAuth(selectedOAuthKind()!)}
+                      disabled={loading || gatewayOAuthBusy !== null}
+                    >
+                      刷新状态
+                    </button>
+                    {gatewayOAuthStatus[selectedOAuthKind()!]?.loggedIn ? (
+                      <button
+                        type="button"
+                        onClick={() => handleGatewayOAuthLogout(selectedOAuthKind()!)}
+                        disabled={loading || gatewayOAuthBusy !== null}
+                      >
+                        退出
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => handleGatewayOAuthLogin(selectedOAuthKind()!)}
+                        disabled={loading || gatewayOAuthBusy !== null || !gatewayStatus?.running}
+                      >
+                        {gatewayOAuthBusy === selectedOAuthKind() ? "登录中..." : "登录"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="gateway-credential-meta">
+                  {gatewayOAuthStatus[selectedOAuthKind()!]?.loggedIn ? (
+                    <>
+                      <span>已登录</span>
+                      <span>{gatewayOAuthStatus[selectedOAuthKind()!]?.email || "未知账号"}</span>
+                      <span>{gatewayOAuthStatus[selectedOAuthKind()!]?.projectId || "无 project"}</span>
+                    </>
+                  ) : (
+                    <span>{gatewayStatus?.running ? "未登录" : "先启动 Gateway，再登录"}</span>
+                  )}
+                </div>
+                <p className="gateway-credential-hint">
+                  若浏览器没有自动打开，请到 Gateway 日志里复制 OAuth URL 手动访问。
+                </p>
+              </section>
+            ) : null}
+            {gatewayProviderForm.apiFormat === "grok_web" ? (
+              <section className="gateway-credential-section">
+                <div className="gateway-mapping-head">
+                  <div>
+                    <h4>Grok Web 凭证</h4>
+                    <p>
+                      需要浏览器 cookie 中的 <code>sso</code>；编辑已有 Provider 时留空会保留已保存凭证。
+                    </p>
+                  </div>
+                </div>
+                <div className="gateway-mapping-grid">
+                  <label>
+                    sso
+                    <input
+                      value={gatewayProviderForm.grokSso}
+                      onChange={(event) => updateGatewayProviderForm("grokSso", event.target.value)}
+                      placeholder={gatewayProviderForm.id ? "已保存则可留空" : "JWT"}
+                      type="password"
+                    />
+                  </label>
+                  <label>
+                    sso-rw
+                    <input
+                      value={gatewayProviderForm.grokSsoRw}
+                      onChange={(event) => updateGatewayProviderForm("grokSsoRw", event.target.value)}
+                      placeholder="可选，默认复用 sso"
+                      type="password"
+                    />
+                  </label>
+                  <label>
+                    cf_clearance
+                    <input
+                      value={gatewayProviderForm.grokCfClearance}
+                      onChange={(event) => updateGatewayProviderForm("grokCfClearance", event.target.value)}
+                      placeholder="可选"
+                      type="password"
+                    />
+                  </label>
+                  <label>
+                    x-statsig-id
+                    <input
+                      value={gatewayProviderForm.grokStatsigId}
+                      onChange={(event) => updateGatewayProviderForm("grokStatsigId", event.target.value)}
+                      placeholder="可选"
+                      type="password"
+                    />
+                  </label>
+                  <label className="span-two">
+                    完整 Cookie 字符串
+                    <textarea
+                      value={gatewayProviderForm.grokCookieString}
+                      onChange={(event) =>
+                        updateGatewayProviderForm("grokCookieString", event.target.value)
+                      }
+                      placeholder="__cf_bm=...; cf_clearance=...; ..."
+                    />
+                  </label>
+                  <label className="span-two">
+                    User-Agent override
+                    <input
+                      value={gatewayProviderForm.grokUserAgent}
+                      onChange={(event) => updateGatewayProviderForm("grokUserAgent", event.target.value)}
+                      placeholder="Mozilla/5.0 ..."
+                    />
+                  </label>
+                </div>
+              </section>
+            ) : null}
+            <section className="gateway-mapping-section">
+              <div className="gateway-mapping-head">
+                <div>
+                  <h4>模型映射</h4>
+                  <p>未设置的 Codex 模型会回退到 Default；这与上游行为一致。</p>
+                </div>
+                <button type="button" onClick={addGatewayCustomMapping}>
+                  + 自定义映射
+                </button>
+              </div>
+              <div className="gateway-mapping-grid">
+                {gatewayModelSlots.map((slot) => (
+                  <label key={slot.key}>
+                    {slot.label}
+                    <input
+                      value={gatewayProviderForm.models[slot.key] || ""}
+                      onChange={(event) => updateGatewayModel(slot.key, event.target.value)}
+                      placeholder={slot.key === "default" ? "deepseek-chat" : "留空则回退到 Default"}
+                    />
+                  </label>
+                ))}
+              </div>
+              {gatewayProviderForm.customMappings.length ? (
+                <div className="gateway-custom-mappings">
+                  {gatewayProviderForm.customMappings.map((mapping) => (
+                    <div className="gateway-custom-mapping-row" key={mapping.id}>
+                      <label>
+                        Codex 模型名
+                        <input
+                          value={mapping.key}
+                          onChange={(event) =>
+                            updateGatewayCustomMapping(mapping.id, "key", event.target.value)
+                          }
+                          placeholder="gpt-4o"
+                        />
+                      </label>
+                      <label>
+                        映射到
+                        <input
+                          value={mapping.value}
+                          onChange={(event) =>
+                            updateGatewayCustomMapping(mapping.id, "value", event.target.value)
+                          }
+                          placeholder="claude-haiku-4"
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="danger"
+                        onClick={() => removeGatewayCustomMapping(mapping.id)}
+                        title="删除自定义映射"
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </section>
+            <section className="gateway-advanced-section">
+              <div className="gateway-mapping-head">
+                <div>
+                  <h4>高级 Provider 字段</h4>
+                  <p>与上游一致保留 `extraHeaders`、`modelCapabilities`、`requestOptions`。</p>
+                </div>
+              </div>
+              <div className="gateway-json-grid">
+                <label>
+                  extraHeaders
+                  <textarea
+                    value={gatewayProviderForm.extraHeadersJson}
+                    onChange={(event) =>
+                      updateGatewayProviderForm("extraHeadersJson", event.target.value)
+                    }
+                  />
+                </label>
+                <label>
+                  modelCapabilities
+                  <textarea
+                    value={gatewayProviderForm.modelCapabilitiesJson}
+                    onChange={(event) =>
+                      updateGatewayProviderForm("modelCapabilitiesJson", event.target.value)
+                    }
+                  />
+                </label>
+                <label>
+                  requestOptions
+                  <textarea
+                    value={gatewayProviderForm.requestOptionsJson}
+                    onChange={(event) =>
+                      updateGatewayProviderForm("requestOptionsJson", event.target.value)
+                    }
+                  />
+                </label>
+              </div>
+            </section>
             <div className="modal-actions">
               <button type="button" onClick={() => setGatewayProviderForm(null)}>
                 取消
@@ -1492,6 +1919,47 @@ function trimOpenCodeProviderForm(form: OpenCodeProviderForm): OpenCodeProviderF
 
 function formatOpenCodeConfig(doc: Record<string, unknown>) {
   return JSON.stringify(doc, null, 2) + "\n";
+}
+
+function providerExtraHeaders(provider: GatewayConfig["providers"][number]) {
+  return provider.extraHeaders || {};
+}
+
+function formatJson(value: unknown) {
+  return JSON.stringify(value || {}, null, 2);
+}
+
+function parseJsonObject(value: string, label: string): Record<string, unknown> {
+  const parsed = JSON.parse(value || "{}");
+  if (!isPlainObject(parsed)) {
+    throw new Error(`${label} 必须是 JSON 对象`);
+  }
+  return parsed;
+}
+
+function collectGrokWebPayload(form: GatewayProviderForm) {
+  const cookies: Record<string, string> = {};
+  if (form.grokSso.trim()) cookies.sso = form.grokSso.trim();
+  if (form.grokSsoRw.trim()) cookies["sso-rw"] = form.grokSsoRw.trim();
+  if (form.grokCookieString.trim()) cookies.cookieString = form.grokCookieString.trim();
+  if (form.grokCfClearance.trim()) cookies.cf_clearance = form.grokCfClearance.trim();
+  const payload: Record<string, unknown> = {};
+  if (Object.keys(cookies).length) payload.cookies = cookies;
+  if (form.grokStatsigId.trim()) payload.statsigId = form.grokStatsigId.trim();
+  if (form.grokUserAgent.trim()) payload.userAgent = form.grokUserAgent.trim();
+  return Object.keys(payload).length ? payload : null;
+}
+
+function recommendedGatewayAuthScheme(apiFormat: string) {
+  if (apiFormat === "gemini_native") return "google_api_key";
+  if (apiFormat === "gemini_cli_oauth") return "google_oauth_cloud_code";
+  if (apiFormat === "antigravity_oauth") return "google_oauth_antigravity";
+  if (apiFormat === "grok_web") return "grok_cookie";
+  return "bearer";
+}
+
+function oauthLabel(kind: "gemini" | "antigravity") {
+  return kind === "gemini" ? "Gemini CLI OAuth" : "Antigravity OAuth";
 }
 
 export default App;

@@ -75,7 +75,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -164,13 +165,18 @@ label {
 }
 
 input,
-select {
+select,
+textarea {
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--input);
   color: var(--text);
   min-height: 40px;
   padding: 0 12px;
+}
+
+textarea {
+  padding: 10px 12px;
 }
 
 .app-shell {
@@ -676,6 +682,88 @@ select {
   margin: 18px 0;
 }
 
+.gateway-mapping-section {
+  display: grid;
+  gap: 14px;
+  margin: 18px 0;
+}
+
+.gateway-credential-section,
+.gateway-advanced-section {
+  display: grid;
+  gap: 14px;
+  margin: 18px 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.gateway-mapping-head,
+.gateway-custom-mapping-row {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.gateway-mapping-head h4 {
+  margin: 0;
+}
+
+.gateway-mapping-head p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.gateway-mapping-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.gateway-custom-mappings {
+  display: grid;
+  gap: 10px;
+}
+
+.gateway-custom-mapping-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+}
+
+.gateway-custom-mapping-row button {
+  min-height: 38px;
+}
+
+.gateway-credential-meta {
+  display: flex;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+
+.gateway-credential-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.gateway-json-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.gateway-json-grid textarea,
+.gateway-mapping-grid textarea {
+  min-height: 92px;
+  resize: vertical;
+}
+
+.span-two {
+  grid-column: span 2;
+}
+
 .modal-actions {
   justify-content: flex-end;
 }
@@ -715,8 +803,14 @@ select {
 
   .provider-row,
   .provider-form-grid,
+  .gateway-mapping-grid,
+  .gateway-custom-mapping-row,
   .opencode-helper {
     grid-template-columns: 1fr;
+  }
+
+  .span-two {
+    grid-column: auto;
   }
 
   .provider-actions,

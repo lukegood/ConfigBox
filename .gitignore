@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 frontend/node_modules/
 frontend/dist/
+
+# Rust build artifacts
+third_party/codex-app-transfer/target/

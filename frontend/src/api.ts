@@ -3,6 +3,7 @@ import type {
   GatewayConfig,
   GatewayProvider,
   GatewayStatus,
+  OAuthStatus,
   HistoryDoc,
   HistoryItem,
   ProfileDoc,
@@ -168,4 +169,16 @@ export async function deleteGatewayProvider(providerId: string) {
 
 export async function activateGatewayProvider(providerId: string) {
   return request<GatewayProvider>(`/api/gateway/providers/${providerId}/activate`, { method: "POST" });
+}
+
+export async function getGatewayOAuthStatus(kind: "gemini" | "antigravity") {
+  return request<OAuthStatus>(`/api/gateway/oauth/${kind}/status`);
+}
+
+export async function loginGatewayOAuth(kind: "gemini" | "antigravity") {
+  return request<OAuthStatus>(`/api/gateway/oauth/${kind}/login`, { method: "POST" });
+}
+
+export async function logoutGatewayOAuth(kind: "gemini" | "antigravity") {
+  return request<OAuthStatus>(`/api/gateway/oauth/${kind}/logout`, { method: "DELETE" });
 }
