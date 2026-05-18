@@ -116,26 +116,6 @@ type OpenCodeSummary = {
   providerIds: string[];
 };
 
-const emptyGatewayProviderForm: GatewayProviderForm = {
-  id: "",
-  name: "",
-  baseUrl: "",
-  apiKey: "",
-  authScheme: "bearer",
-  apiFormat: "openai_chat",
-  models: emptyGatewayModels(),
-  customMappings: [],
-  extraHeadersJson: "{}",
-  modelCapabilitiesJson: "{}",
-  requestOptionsJson: "{}",
-  grokSso: "",
-  grokSsoRw: "",
-  grokCookieString: "",
-  grokCfClearance: "",
-  grokStatsigId: "",
-  grokUserAgent: ""
-};
-
 const gatewayModelSlots = [
   { key: "default", label: "Default" },
   { key: "gpt_5_5", label: "gpt-5.5" },
@@ -166,6 +146,26 @@ function nextGatewayCustomMappingId() {
   gatewayCustomMappingCounter += 1;
   return `gateway-custom-${gatewayCustomMappingCounter}`;
 }
+
+const emptyGatewayProviderForm: GatewayProviderForm = {
+  id: "",
+  name: "",
+  baseUrl: "",
+  apiKey: "",
+  authScheme: "bearer",
+  apiFormat: "openai_chat",
+  models: emptyGatewayModels(),
+  customMappings: [],
+  extraHeadersJson: "{}",
+  modelCapabilitiesJson: "{}",
+  requestOptionsJson: "{}",
+  grokSso: "",
+  grokSsoRw: "",
+  grokCookieString: "",
+  grokCfClearance: "",
+  grokStatsigId: "",
+  grokUserAgent: ""
+};
 
 const emptyOpenCodeProviderForm: OpenCodeProviderForm = {
   providerId: "",
@@ -1452,7 +1452,7 @@ function App() {
                     <h4>{oauthLabel(selectedOAuthKind()!)} 登录</h4>
                     <p>OAuth token 会保存到本机 token 文件；Gateway 运行后可在这里完成登录。</p>
                   </div>
-                  <div className="mini-actions">
+                  <div className="gateway-oauth-actions">
                     <button
                       type="button"
                       onClick={() => loadGatewayOAuth(selectedOAuthKind()!)}
@@ -1567,7 +1567,7 @@ function App() {
               <div className="gateway-mapping-head">
                 <div>
                   <h4>模型映射</h4>
-                  <p>未设置的 Codex 模型会回退到 Default；这与上游行为一致。</p>
+                  <p>将 Codex 模型映射为指定模型。未设置则为 Default。</p>
                 </div>
                 <button type="button" onClick={addGatewayCustomMapping}>
                   + 自定义映射
@@ -1580,7 +1580,7 @@ function App() {
                     <input
                       value={gatewayProviderForm.models[slot.key] || ""}
                       onChange={(event) => updateGatewayModel(slot.key, event.target.value)}
-                      placeholder={slot.key === "default" ? "deepseek-chat" : "留空则回退到 Default"}
+                      placeholder={slot.key === "default" ? "deepseek-chat" : "留空则为 Default"}
                     />
                   </label>
                 ))}
@@ -1626,7 +1626,6 @@ function App() {
               <div className="gateway-mapping-head">
                 <div>
                   <h4>高级 Provider 字段</h4>
-                  <p>与上游一致保留 `extraHeaders`、`modelCapabilities`、`requestOptions`。</p>
                 </div>
               </div>
               <div className="gateway-json-grid">
