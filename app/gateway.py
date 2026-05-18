@@ -42,6 +42,7 @@ MANAGED_ROOT_KEYS = (
     "model_catalog_json",
 )
 MODEL_CATALOG_FILENAME = "codex-model-catalog.json"
+MODEL_CATALOG_CLIENT_PATH = os.getenv("CODEX_MODEL_CATALOG_CLIENT_PATH", "").strip()
 DEFAULT_CONTEXT_WINDOW = 258_400
 ONE_M_CONTEXT_WINDOW = 1_000_000
 AUTO_COMPACT_TRIGGER_PERCENT = 80
@@ -702,12 +703,12 @@ def apply_toml(config: dict[str, Any], provider: dict[str, Any], applied_model: 
     doc = read_toml_doc(path)
     port = proxy_port(config)
     base_url = public_base_url(port)
-    catalog_models = build_catalog_models(provider)
-    write_model_catalog(catalog_models)
     doc["model_provider"] = CONFIGBOX_GATEWAY_PROVIDER
     doc["model"] = applied_model
     doc["openai_base_url"] = base_url
-    doc["model_catalog_json"] = str(model_catalog_path().resolve())
+    catalog_models = build_catalog_models(provider)
+    write_model_catalog(catalog_models)
+    doc["model_catalog_json"] = model_catalog_client_path()
     if default_model_context_window(provider) >= ONE_M_CONTEXT_WINDOW:
         doc["model_context_window"] = ONE_M_CONTEXT_WINDOW
     else:
@@ -807,6 +808,12 @@ def write_model_catalog(models: list[dict[str, Any]]) -> None:
     path = model_catalog_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(path, json.dumps({"models": models}, indent=2, ensure_ascii=False) + "\n")
+
+
+def model_catalog_client_path() -> str:
+    if MODEL_CATALOG_CLIENT_PATH:
+        return MODEL_CATALOG_CLIENT_PATH
+    return str(model_catalog_path().resolve())
 
 
 def build_catalog_models(provider: dict[str, Any]) -> list[dict[str, Any]]:

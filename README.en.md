@@ -347,6 +347,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
 | `APP_COOKIE_SECURE` | Set to `true` behind HTTPS reverse proxies |
 | `CODEX_GATEWAY_PORT` | Codex Gateway host port |
 | `CODEX_GATEWAY_PUBLIC_HOST` | Gateway hostname written to Codex config, default `127.0.0.1` |
+| `CODEX_MODEL_CATALOG_CLIENT_PATH` | Model catalog path written into Codex config for host-side Codex / VS Code to read; Docker deployments set it automatically to host `CONFIGBOX_DATA_DIR/codex-gateway/codex-model-catalog.json` |
 
 Recommended authentication settings:
 
