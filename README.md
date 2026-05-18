@@ -30,7 +30,7 @@
 
 ## 版本更新 :sunny:
 
-:loudspeaker: 2026.05.14 发布 v0.5.2，同步上游codex-app-transfer，修复gateway的部分前端。
+:loudspeaker: 2026.05.18 发布 v0.5.3，重构配置切换逻辑，同步上游codex-app-transfer。
 
 ## 项目截图 :camera:
 
