@@ -23,6 +23,7 @@ def load_gateway(tmp_path: Path):
     os.environ["CODEX_CONFIG_TOML_PATH"] = str(codex_toml)
     os.environ["CODEX_GATEWAY_DIR"] = str(gateway_dir)
     os.environ["CODEX_GATEWAY_CONFIG_PATH"] = str(gateway_dir / "config.json")
+    os.environ.pop("CODEX_MODEL_CATALOG_CLIENT_PATH", None)
 
     for name in list(sys.modules):
         if name == "app" or name.startswith("app."):
@@ -70,6 +71,18 @@ def test_apply_codex_writes_catalog_and_context_window(tmp_path: Path):
     assert gpt55["display_name"] == "DeepSeek / deepseek-v4-pro"
     assert gpt55["context_window"] == 1_000_000
     assert gpt55["auto_compact_token_limit"] == 800_000
+
+
+def test_apply_codex_can_write_host_visible_catalog_path(tmp_path: Path):
+    host_visible_path = tmp_path / "host" / "codex-model-catalog.json"
+    gateway, _auth_path, codex_toml, gateway_dir = load_gateway(tmp_path)
+    gateway.MODEL_CATALOG_CLIENT_PATH = str(host_visible_path)
+
+    gateway.apply_codex()
+
+    doc = tomlkit.parse(codex_toml.read_text(encoding="utf-8"))
+    assert str(doc["model_catalog_json"]) == str(host_visible_path)
+    assert (gateway_dir / "codex-model-catalog.json").exists()
 
 
 def test_restore_preserves_user_model_changed_during_gateway_session(tmp_path: Path):

@@ -360,6 +360,7 @@ PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 | `APP_COOKIE_SECURE` | HTTPS 反向代理下设为 `true` |
 | `CODEX_GATEWAY_PORT` | Codex Gateway 宿主机端口 |
 | `CODEX_GATEWAY_PUBLIC_HOST` | 写入 Codex 配置的 Gateway 主机名，默认 `127.0.0.1` |
+| `CODEX_MODEL_CATALOG_CLIENT_PATH` | 写入 Codex 配置、供宿主机 Codex / VS Code 插件读取的模型目录路径；Docker 部署会自动设为宿主机 `CONFIGBOX_DATA_DIR/codex-gateway/codex-model-catalog.json` |
 
 推荐认证配置：
 
