@@ -1,11 +1,11 @@
 import type {
-  ActiveConfig,
-  BackupDoc,
-  BackupItem,
   ConfigFile,
   GatewayConfig,
   GatewayProvider,
   GatewayStatus,
+  OAuthStatus,
+  HistoryDoc,
+  HistoryItem,
   ProfileDoc,
   ProfileItem,
   Tool
@@ -63,23 +63,12 @@ export async function getTools() {
   return request<Tool[]>("/api/tools");
 }
 
-export async function getActiveConfig(tool: string) {
-  return request<ActiveConfig>(`/api/configs/${tool}/active`);
-}
-
 function filePayload(files: ConfigFile[]) {
   return files.map((file) => ({
     id: file.id,
     content: file.content,
     lastKnownMtime: file.mtime ?? null
   }));
-}
-
-export async function saveActiveConfig(tool: string, files: ConfigFile[], mtime?: number | null) {
-  return request<ActiveConfig>(`/api/configs/${tool}/active`, {
-    method: "PUT",
-    body: JSON.stringify({ files: filePayload(files), lastKnownMtime: mtime ?? null })
-  });
 }
 
 export async function listProfiles(tool: string) {
@@ -109,27 +98,27 @@ export async function deleteProfile(tool: string, name: string) {
 }
 
 export async function activateProfile(tool: string, name: string) {
-  return request<ActiveConfig>(`/api/profiles/${tool}/${name}/activate`, { method: "POST" });
+  return request<ProfileDoc>(`/api/profiles/${tool}/${name}/activate`, { method: "POST" });
 }
 
-export async function listBackups(tool: string) {
-  return request<BackupItem[]>(`/api/backups/${tool}`);
+export async function listHistory(tool: string) {
+  return request<HistoryItem[]>(`/api/history/${tool}`);
 }
 
-export async function getBackup(tool: string, backupName: string) {
-  return request<BackupDoc>(`/api/backups/${tool}/${backupName}`);
+export async function getHistory(tool: string, profileName: string, entryName: string) {
+  return request<HistoryDoc>(`/api/history/${tool}/${profileName}/${entryName}`);
 }
 
-export async function deleteBackup(tool: string, backupName: string) {
-  return request<{ ok: boolean }>(`/api/backups/${tool}/${backupName}`, { method: "DELETE" });
+export async function deleteHistory(tool: string, profileName: string, entryName: string) {
+  return request<{ ok: boolean }>(`/api/history/${tool}/${profileName}/${entryName}`, { method: "DELETE" });
 }
 
-export async function clearBackups(tool: string) {
-  return request<{ ok: boolean }>(`/api/backups/${tool}`, { method: "DELETE" });
+export async function clearHistory(tool: string) {
+  return request<{ ok: boolean }>(`/api/history/${tool}`, { method: "DELETE" });
 }
 
-export async function restoreBackup(tool: string, backupName: string) {
-  return request<ActiveConfig>(`/api/backups/${tool}/${backupName}/restore`, { method: "POST" });
+export async function restoreHistory(tool: string, profileName: string, entryName: string) {
+  return request<ProfileDoc>(`/api/history/${tool}/${profileName}/${entryName}/restore`, { method: "POST" });
 }
 
 export async function getGatewayConfig() {
@@ -153,21 +142,21 @@ export async function restartGateway() {
 }
 
 export async function getGatewayLogs() {
-  return request<{ lines: string[]; logDir: string; maxBytes: number; currentBytes: number }>("/api/gateway/logs");
+  return request<{ lines: string[]; logDir: string; currentBytes: number; maxBytes: number }>("/api/gateway/logs");
 }
 
 export async function clearGatewayLogs() {
-  return request<{ success: boolean; removed: number; logDir: string }>("/api/gateway/logs/clear", { method: "POST" });
+  return request<{ ok: boolean; removed: number }>("/api/gateway/logs/clear", { method: "POST" });
 }
 
-export async function addGatewayProvider(provider: Record<string, unknown>) {
+export async function addGatewayProvider(provider: Partial<GatewayProvider>) {
   return request<GatewayProvider>("/api/gateway/providers", {
     method: "POST",
     body: JSON.stringify(provider)
   });
 }
 
-export async function updateGatewayProvider(providerId: string, provider: Record<string, unknown>) {
+export async function updateGatewayProvider(providerId: string, provider: Partial<GatewayProvider>) {
   return request<GatewayProvider>(`/api/gateway/providers/${providerId}`, {
     method: "PUT",
     body: JSON.stringify(provider)
@@ -182,10 +171,14 @@ export async function activateGatewayProvider(providerId: string) {
   return request<GatewayProvider>(`/api/gateway/providers/${providerId}/activate`, { method: "POST" });
 }
 
-export async function applyGatewayToCodex() {
-  return request<{ success: boolean; baseUrl: string }>("/api/gateway/apply", { method: "POST" });
+export async function getGatewayOAuthStatus(kind: "gemini" | "antigravity") {
+  return request<OAuthStatus>(`/api/gateway/oauth/${kind}/status`);
 }
 
-export async function restoreGatewayCodex() {
-  return request<{ success: boolean }>("/api/gateway/restore", { method: "POST" });
+export async function loginGatewayOAuth(kind: "gemini" | "antigravity") {
+  return request<OAuthStatus>(`/api/gateway/oauth/${kind}/login`, { method: "POST" });
+}
+
+export async function logoutGatewayOAuth(kind: "gemini" | "antigravity") {
+  return request<OAuthStatus>(`/api/gateway/oauth/${kind}/logout`, { method: "DELETE" });
 }

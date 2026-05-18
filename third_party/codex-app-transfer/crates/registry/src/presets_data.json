@@ -11,10 +11,12 @@
     },
     "modelCapabilities": {
       "deepseek-v4-pro": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       },
       "deepseek-v4-flash": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       }
     },
     "notices": [
@@ -114,19 +116,23 @@
     },
     "modelCapabilities": {
       "mimo-v2-pro": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       },
       "mimo-v2-flash": {
-        "context_window": 262144
+        "context_window": 262144,
+        "supports_vision": false
       },
       "mimo-v2-omni": {
         "context_window": 262144
       },
       "mimo-v2.5": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       },
       "mimo-v2.5-pro": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       }
     },
     "isBuiltin": true
@@ -164,10 +170,12 @@
         "context_window": 262144
       },
       "mimo-v2.5": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       },
       "mimo-v2.5-pro": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       }
     },
     "isBuiltin": true
@@ -208,7 +216,41 @@
         "text": "Qwen 3.6 Plus / Flash 默认提供 1M 上下文，本应用直接透传，无需额外开关。"
       }
     ],
-    "modelCapabilities": {},
+    "modelCapabilities": {
+      "qwen3.6-plus": {
+        "context_window": 1000000
+      },
+      "qwen3.6-flash": {
+        "context_window": 1000000
+      }
+    },
+    "requestOptions": {},
+    "isBuiltin": true
+  },
+  {
+    "id": "bailian-token-plan",
+    "name": "阿里云百炼 (Token Plan)",
+    "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+    "docsUrl": "https://help.aliyun.com/zh/model-studio/token-plan-quickstart",
+    "authScheme": "bearer",
+    "apiFormat": "openai_chat",
+    "models": {
+      "default": "qwen3.6-plus"
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "Token Plan 团队版 API Key 与按量计费/Coding Plan 不互通，请确保 Base URL 与 API Key 来自同一套餐。"
+      }
+    ],
+    "modelCapabilities": {
+      "qwen3.6-plus": {
+        "context_window": 1000000
+      },
+      "qwen3.6-flash": {
+        "context_window": 1000000
+      }
+    },
     "requestOptions": {},
     "isBuiltin": true
   },
@@ -222,7 +264,11 @@
     "models": {
       "default": "MiniMax-M2.7"
     },
-    "modelCapabilities": {},
+    "modelCapabilities": {
+      "MiniMax-M2.7": {
+        "context_window": 204800
+      }
+    },
     "notices": [
       {
         "type": "info",
@@ -274,7 +320,11 @@
     "models": {
       "default": "gemini-3.1-flash-lite"
     },
-    "modelCapabilities": {},
+    "modelCapabilities": {
+      "gemini-3.1-flash-lite": {
+        "context_window": 1000000
+      }
+    },
     "notices": [
       {
         "type": "info",
@@ -306,7 +356,11 @@
     "models": {
       "default": "gemini-2.5-flash"
     },
-    "modelCapabilities": {},
+    "modelCapabilities": {
+      "gemini-2.5-flash": {
+        "context_window": 1000000
+      }
+    },
     "notices": [
       {
         "type": "info",
@@ -341,7 +395,11 @@
     "models": {
       "default": "gemini-3-flash"
     },
-    "modelCapabilities": {},
+    "modelCapabilities": {
+      "gemini-3-flash": {
+        "context_window": 1000000
+      }
+    },
     "notices": [
       {
         "type": "info",

@@ -18,22 +18,19 @@ from .schemas import (
     LoginRequest,
     ProfileCreateRequest,
     ProfileSaveRequest,
-    SaveActiveRequest,
 )
 from .storage import (
     activate_profile,
-    clear_backups,
+    clear_history,
     create_profile,
-    delete_backup,
+    delete_history,
     delete_profile,
     ensure_all,
-    list_backups,
+    list_history,
     list_profiles,
-    read_active,
-    read_backup,
+    read_history,
     read_profile,
-    restore_backup,
-    save_active,
+    restore_history,
     save_profile,
 )
 from . import gateway
@@ -106,17 +103,6 @@ def tools(user: AuthUser = Depends(require_user)) -> list[dict]:
     return public_tools()
 
 
-@app.get("/api/configs/{tool}/active")
-def get_active(tool: str, user: AuthUser = Depends(require_user)) -> dict:
-    return read_active(get_tool(tool))
-
-
-@app.put("/api/configs/{tool}/active")
-def put_active(tool: str, payload: SaveActiveRequest, user: AuthUser = Depends(require_user)) -> dict:
-    files = [file.model_dump(by_alias=True) for file in payload.files] if payload.files else None
-    return save_active(get_tool(tool), payload.content, payload.last_known_mtime, files)
-
-
 @app.get("/api/profiles/{tool}")
 def get_profiles(tool: str, user: AuthUser = Depends(require_user)) -> list[dict]:
     return list_profiles(get_tool(tool))
@@ -153,31 +139,31 @@ def activate(tool: str, name: str, user: AuthUser = Depends(require_user)) -> di
     return activate_profile(get_tool(tool), name)
 
 
-@app.get("/api/backups/{tool}")
-def get_backups(tool: str, user: AuthUser = Depends(require_user)) -> list[dict]:
-    return list_backups(get_tool(tool))
+@app.get("/api/history/{tool}")
+def get_history(tool: str, user: AuthUser = Depends(require_user)) -> list[dict]:
+    return list_history(get_tool(tool))
 
 
-@app.delete("/api/backups/{tool}", response_model=OkResponse)
-def remove_backups(tool: str, user: AuthUser = Depends(require_user)) -> OkResponse:
-    clear_backups(get_tool(tool))
+@app.delete("/api/history/{tool}", response_model=OkResponse)
+def remove_history(tool: str, user: AuthUser = Depends(require_user)) -> OkResponse:
+    clear_history(get_tool(tool))
     return OkResponse()
 
 
-@app.get("/api/backups/{tool}/{backup_name}")
-def get_backup(tool: str, backup_name: str, user: AuthUser = Depends(require_user)) -> dict:
-    return read_backup(get_tool(tool), backup_name)
+@app.get("/api/history/{tool}/{profile_name}/{entry_name}")
+def get_history_entry(tool: str, profile_name: str, entry_name: str, user: AuthUser = Depends(require_user)) -> dict:
+    return read_history(get_tool(tool), profile_name, entry_name)
 
 
-@app.delete("/api/backups/{tool}/{backup_name}", response_model=OkResponse)
-def remove_backup(tool: str, backup_name: str, user: AuthUser = Depends(require_user)) -> OkResponse:
-    delete_backup(get_tool(tool), backup_name)
+@app.delete("/api/history/{tool}/{profile_name}/{entry_name}", response_model=OkResponse)
+def remove_history_entry(tool: str, profile_name: str, entry_name: str, user: AuthUser = Depends(require_user)) -> OkResponse:
+    delete_history(get_tool(tool), profile_name, entry_name)
     return OkResponse()
 
 
-@app.post("/api/backups/{tool}/{backup_name}/restore")
-def restore(tool: str, backup_name: str, user: AuthUser = Depends(require_user)) -> dict:
-    return restore_backup(get_tool(tool), backup_name)
+@app.post("/api/history/{tool}/{profile_name}/{entry_name}/restore")
+def restore(tool: str, profile_name: str, entry_name: str, user: AuthUser = Depends(require_user)) -> dict:
+    return restore_history(get_tool(tool), profile_name, entry_name)
 
 
 @app.get("/api/gateway/config")
@@ -255,6 +241,21 @@ def gateway_apply(user: AuthUser = Depends(require_user)) -> dict:
 @app.post("/api/gateway/restore")
 def gateway_restore(user: AuthUser = Depends(require_user)) -> dict:
     return gateway.restore_codex()
+
+
+@app.get("/api/gateway/oauth/{kind}/status")
+def gateway_oauth_status(kind: str, user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.oauth_status(kind)
+
+
+@app.post("/api/gateway/oauth/{kind}/login")
+def gateway_oauth_login(kind: str, user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.oauth_login(kind)
+
+
+@app.delete("/api/gateway/oauth/{kind}/logout")
+def gateway_oauth_logout(kind: str, user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.oauth_logout(kind)
 
 
 static_dir = Path(__file__).parent / "static"

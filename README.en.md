@@ -339,7 +339,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
 | `CLAUDE_DIR` | Host Claude config directory, mounted to `/config/claude` |
 | `CODEX_DIR` | Host Codex config directory, mounted to `/config/codex` |
 | `OPENCODE_DIR` | Host OpenCode config directory, mounted to `/config/opencode` |
-| `CONFIGBOX_DATA_DIR` | ConfigBox profiles, backups, gateway config and logs directory |
+| `CONFIGBOX_DATA_DIR` | ConfigBox profiles, history, gateway config and logs directory |
 | `CONFIGBOX_UID` / `CONFIGBOX_GID` | Linux only, container runtime user, required, recommended to set to `id -u` / `id -g` |
 | `APP_USERNAME` | Web login username |
 | `APP_PASSWORD_HASH` | Web login password hash, recommended |
@@ -385,11 +385,11 @@ APP_COOKIE_SECURE=false
 
 ## Usage :floppy_disk:
 
-### Active Config
+### Profiles and History
 
 <img src="yanshi.png" alt="ConfigBox screenshot" width="800">
 
-Choose `Claude`, `Codex`, or `OpenCode` on the left, then open `Current Config`. These are the real active config files:
+ConfigBox now treats `Profile` as the single source of truth. Choose `Claude`, `Codex`, or `OpenCode` on the left and edit the Profile directly; clicking `Activate` projects that Profile into the real runtime config files:
 
 ```text
 Claude -> .claude/settings.json
@@ -397,22 +397,20 @@ Codex  -> .codex/auth.json + .codex/config.toml
 OpenCode -> .config/opencode/config.json
 ```
 
-When you save, ConfigBox validates JSON/TOML, backs up the old version, then writes atomically. If a file changed outside the web UI after the page was opened, ConfigBox reports a conflict instead of overwriting it.
-
-### Profiles
-
-A Profile is a saved configuration set that can be edited and activated later. Profiles are stored under `CONFIGBOX_DATA_DIR`:
+Profiles and their history are stored under `CONFIGBOX_DATA_DIR`:
 
 ```text
 profiles/claude/
 profiles/codex/
+history/claude/
+history/codex/
 ```
 
-Click a `Profile` to edit it. Click `Activate` to overwrite the real config files with that Profile, completing the config switch. A Codex Profile stores and activates both `auth.json` and `config.toml` together.
+When you save a Profile, ConfigBox first stores the previous version in `History`, then validates JSON/TOML and writes atomically. If that Profile is active, the real runtime files are updated too. Each Profile can have multiple history entries; the left-side `History` timeline shows them globally while labeling which Profile each entry belongs to. A Codex Profile stores and activates both `auth.json` and `config.toml` together.
 
 ### OpenCode Provider / Model Editing
 
-Choose `OpenCode` on the left to edit the full `config.json` directly. When the active config or a Profile is editable, the editor shows an OpenCode helper above the file editor for adding Providers or Models. These actions first update the editor content; click `Save` to write the real file.
+Choose `OpenCode` on the left to edit the full `config.json` inside a Profile. When a Profile is editable, the editor shows an OpenCode helper above the file editor for adding Providers or Models. These actions first update the editor content; click `Save` to write the Profile, and the runtime file is updated too when that Profile is active.
 
 ### Codex Gateway for Third-Party Models
 
@@ -459,7 +457,7 @@ The API still supports Basic Auth for command-line checks:
 
 ```bash
 curl -u admin:your_password http://127.0.0.1:8787/api/tools
-curl -u admin:your_password http://127.0.0.1:8787/api/configs/codex/active
+curl -u admin:your_password http://127.0.0.1:8787/api/profiles/codex
 ```
 
 The browser UI uses `/api/login` and HttpOnly Cookies.

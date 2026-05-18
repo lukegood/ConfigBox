@@ -22,15 +22,6 @@ export type Tool = {
   files: ToolFile[];
 };
 
-export type ActiveConfig = {
-  tool: string;
-  content: string;
-  format: ConfigFormat;
-  mtime: number | null;
-  pathLabel: string;
-  files?: ConfigFile[];
-};
-
 export type ProfileItem = {
   name: string;
   mtime: number | null;
@@ -46,14 +37,17 @@ export type ProfileDoc = {
   files?: ConfigFile[];
 };
 
-export type BackupItem = {
+export type HistoryItem = {
+  profileName: string;
   name: string;
   mtime: number | null;
   size: number;
+  reason: string;
 };
 
-export type BackupDoc = {
+export type HistoryDoc = {
   tool: string;
+  profileName: string;
   name: string;
   content: string;
   format: ConfigFormat;
@@ -63,7 +57,7 @@ export type BackupDoc = {
 
 export type ToolId = "claude" | "codex" | "opencode";
 
-export type ViewMode = "active" | "profile" | "backup" | "gateway";
+export type ViewMode = "profile" | "history" | "gateway";
 
 export type GatewayProvider = {
   id: string;
@@ -72,8 +66,12 @@ export type GatewayProvider = {
   apiFormat: string;
   authScheme: string;
   models: Record<string, string>;
+  extraHeaders?: Record<string, string>;
+  modelCapabilities?: Record<string, unknown>;
+  requestOptions?: Record<string, unknown>;
   apiKey?: string;
   hasApiKey?: boolean;
+  hasGrokWeb?: boolean;
 };
 
 export type GatewayConfig = {
@@ -102,4 +100,13 @@ export type GatewayStatus = {
   providerCount: number;
   codexRestored?: boolean;
   codexApplied?: boolean;
+};
+
+export type OAuthStatus = {
+  loggedIn: boolean;
+  email?: string | null;
+  projectId?: string | null;
+  expiresAt?: number | null;
+  shouldRefresh?: boolean;
+  cancelled?: boolean;
 };

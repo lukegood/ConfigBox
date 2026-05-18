@@ -27,7 +27,7 @@ def load_modules(tmp_path: Path):
     os.environ["CODEX_CONFIG_PATH"] = str(codex_path)
     os.environ["CODEX_CONFIG_TOML_PATH"] = str(codex_toml_path)
     os.environ["OPENCODE_CONFIG_PATH"] = str(opencode_path)
-    os.environ["BACKUP_RETENTION"] = "50"
+    os.environ["HISTORY_RETENTION"] = "50"
 
     for name in list(sys.modules):
         if name == "app" or name.startswith("app."):
@@ -46,6 +46,16 @@ def test_invalid_tool_rejected(tmp_path: Path):
         registry.get_tool("evil")
 
 
+def test_default_profile_is_created_and_active(tmp_path: Path):
+    registry, storage, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("claude")
+
+    profiles = storage.list_profiles(tool)
+
+    assert profiles == [{"name": "default", "mtime": profiles[0]["mtime"], "active": True}]
+    assert storage.read_profile(tool, "default")["content"] == '{"model": "sonnet"}\n'
+
+
 def test_invalid_profile_name_rejected(tmp_path: Path):
     registry, storage, errors, *_ = load_modules(tmp_path)
     with pytest.raises(errors.APIError) as exc:
@@ -53,53 +63,58 @@ def test_invalid_profile_name_rejected(tmp_path: Path):
     assert exc.value.code == "INVALID_PROFILE_NAME"
 
 
-def test_invalid_json_rejected(tmp_path: Path):
+def test_invalid_profile_json_rejected(tmp_path: Path):
     registry, storage, errors, *_ = load_modules(tmp_path)
     tool = registry.get_tool("claude")
-    mtime = storage.file_mtime(tool.active_path)
     with pytest.raises(errors.APIError) as exc:
-        storage.save_active(tool, "{bad", mtime)
+        storage.save_profile(tool, "default", "{bad")
     assert exc.value.code == "INVALID_JSON"
 
 
-def test_invalid_codex_json_rejected(tmp_path: Path):
-    registry, storage, errors, *_ = load_modules(tmp_path)
-    tool = registry.get_tool("codex")
-    mtime = storage.file_mtime(tool.active_path)
-    with pytest.raises(errors.APIError) as exc:
-        storage.save_active(tool, "{bad", mtime)
-    assert exc.value.code == "INVALID_JSON"
-
-
-def test_save_active_creates_backup(tmp_path: Path):
+def test_save_active_profile_creates_history_and_syncs_runtime(tmp_path: Path):
     registry, storage, _, claude_path, *_, data_dir = load_modules(tmp_path)
     tool = registry.get_tool("claude")
-    storage.save_active(tool, '{"model": "opus"}\n', storage.file_mtime(tool.active_path))
+
+    storage.save_profile(tool, "default", '{"model": "opus"}\n')
 
     assert claude_path.read_text(encoding="utf-8") == '{"model": "opus"}\n'
-    backups = list((data_dir / "backups" / "claude").glob("*.bak"))
-    assert len(backups) == 1
-    assert backups[0].read_text(encoding="utf-8") == '{"model": "sonnet"}\n'
+    history = storage.list_history(tool)
+    assert len(history) == 1
+    assert history[0]["profileName"] == "default"
+    restored_old = storage.read_history(tool, "default", history[0]["name"])
+    assert restored_old["content"] == '{"model": "sonnet"}\n'
+    assert (data_dir / "history" / "claude" / "default" / history[0]["name"]).is_dir()
 
 
-def test_activate_profile_overwrites_active(tmp_path: Path):
+def test_activate_profile_overwrites_runtime_without_history(tmp_path: Path):
     registry, storage, _, claude_path, *_ = load_modules(tmp_path)
     tool = registry.get_tool("claude")
     storage.create_profile(tool, "proxy", "empty")
     storage.save_profile(tool, "proxy", '{"env": {"HTTPS_PROXY": "http://127.0.0.1:7890"}}\n')
+
+    history_before_activate = len(storage.list_history(tool))
     storage.activate_profile(tool, "proxy")
 
     assert "HTTPS_PROXY" in claude_path.read_text(encoding="utf-8")
+    assert storage.active_profile_name(tool) == "proxy"
+    assert len(storage.list_history(tool)) == history_before_activate
 
 
-def test_external_mtime_conflict(tmp_path: Path):
-    registry, storage, errors, claude_path, *_ = load_modules(tmp_path)
+def test_profile_mtime_conflict(tmp_path: Path):
+    registry, storage, errors, *_ = load_modules(tmp_path)
     tool = registry.get_tool("claude")
-    old_mtime = storage.file_mtime(tool.active_path)
-    claude_path.write_text('{"external": true}\n', encoding="utf-8")
+    doc = storage.read_profile(tool, "default")
+    profile_file = storage.profile_file_path(tool, "default", tool.primary_file)
+    old_mtime = doc["files"][0]["mtime"]
+    profile_file.write_text('{"external": true}\n', encoding="utf-8")
 
     with pytest.raises(errors.APIError) as exc:
-        storage.save_active(tool, '{"model": "opus"}\n', old_mtime)
+        storage.save_profile(
+            tool,
+            "default",
+            None,
+            [{"id": "settings", "content": '{"model": "opus"}\n', "lastKnownMtime": old_mtime}],
+        )
     assert exc.value.code == "CONFLICT_MODIFIED_EXTERNALLY"
 
 
@@ -123,7 +138,7 @@ def test_codex_profile_pairs_auth_json_and_config_toml(tmp_path: Path):
     assert codex_toml_path.read_text(encoding="utf-8") == 'model = "deepseek-chat"\n'
     assert (data_dir / "profiles" / "codex" / "deepseek" / "auth.json").exists()
     assert (data_dir / "profiles" / "codex" / "deepseek" / "config.toml").exists()
-    assert any(path.is_dir() for path in (data_dir / "backups" / "codex").iterdir())
+    assert any(path.is_dir() for path in (data_dir / "history" / "codex" / "deepseek").iterdir())
 
 
 def test_invalid_codex_toml_rejected(tmp_path: Path):
@@ -134,56 +149,73 @@ def test_invalid_codex_toml_rejected(tmp_path: Path):
     assert exc.value.code == "INVALID_TOML"
 
 
-def test_delete_backup_removes_single_backup(tmp_path: Path):
+def test_profile_can_have_multiple_history_entries_and_restore_keeps_current_version(tmp_path: Path):
+    registry, storage, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("claude")
+    storage.save_profile(tool, "default", '{"model": "opus"}\n')
+    storage.save_profile(tool, "default", '{"model": "haiku"}\n')
+    history = storage.list_history(tool)
+
+    assert len(history) == 2
+
+    oldest = history[-1]
+    restored = storage.restore_history(tool, "default", oldest["name"])
+    next_history = storage.list_history(tool)
+
+    assert restored["content"] == '{"model": "sonnet"}\n'
+    assert len(next_history) == 3
+    assert storage.read_history(tool, "default", next_history[0]["name"])["content"] == '{"model": "haiku"}\n'
+
+
+def test_delete_history_removes_single_entry(tmp_path: Path):
     registry, storage, errors, *_ = load_modules(tmp_path)
     tool = registry.get_tool("claude")
-    storage.save_active(tool, '{"model": "opus"}\n', storage.file_mtime(tool.active_path))
-    backup_name = storage.list_backups(tool)[0]["name"]
+    storage.save_profile(tool, "default", '{"model": "opus"}\n')
+    entry = storage.list_history(tool)[0]
 
-    storage.delete_backup(tool, backup_name)
+    storage.delete_history(tool, "default", entry["name"])
 
-    assert storage.list_backups(tool) == []
+    assert storage.list_history(tool) == []
     with pytest.raises(errors.APIError) as exc:
-        storage.read_backup(tool, backup_name)
-    assert exc.value.code == "BACKUP_NOT_FOUND"
+        storage.read_history(tool, "default", entry["name"])
+    assert exc.value.code == "HISTORY_NOT_FOUND"
 
 
-def test_clear_backups_removes_file_and_directory_backups(tmp_path: Path):
+def test_clear_history_removes_all_profile_histories(tmp_path: Path):
     registry, storage, *_ = load_modules(tmp_path)
     claude = registry.get_tool("claude")
     codex = registry.get_tool("codex")
-    storage.save_active(claude, '{"model": "opus"}\n', storage.file_mtime(claude.active_path))
-    storage.save_active(
+    storage.save_profile(claude, "default", '{"model": "opus"}\n')
+    storage.save_profile(
         codex,
-        None,
+        "default",
         None,
         [
-            {"id": "auth", "content": '{"OPENAI_API_KEY": "next"}\n', "lastKnownMtime": storage.file_mtime(codex.files[0].active_path)},
-            {"id": "config", "content": 'model = "next"\n', "lastKnownMtime": storage.file_mtime(codex.files[1].active_path)},
+            {"id": "auth", "content": '{"OPENAI_API_KEY": "next"}\n'},
+            {"id": "config", "content": 'model = "next"\n'},
         ],
     )
 
-    assert storage.clear_backups(claude) == 1
-    assert storage.clear_backups(codex) == 1
-    assert storage.list_backups(claude) == []
-    assert storage.list_backups(codex) == []
+    assert storage.clear_history(claude) == 1
+    assert storage.clear_history(codex) == 1
+    assert storage.list_history(claude) == []
+    assert storage.list_history(codex) == []
 
 
-def test_opencode_config_is_json_tool(tmp_path: Path):
+def test_opencode_profile_is_json_tool(tmp_path: Path):
     registry, storage, _errors, *_ = load_modules(tmp_path)
     opencode_path = tmp_path / "config" / "opencode" / "config.json"
     tool = registry.get_tool("opencode")
 
-    storage.save_active(
+    storage.save_profile(
         tool,
+        "default",
         '{"$schema": "https://opencode.ai/config.json", "provider": {"zhipu": {"models": {}}}}\n',
-        storage.file_mtime(tool.active_path),
     )
 
     assert tool.name == "OpenCode"
     assert tool.path_label == "~/.config/opencode/config.json"
     assert '"zhipu"' in opencode_path.read_text(encoding="utf-8")
-
 
 def test_password_hash_verification(tmp_path: Path):
     load_modules(tmp_path)

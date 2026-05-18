@@ -24,25 +24,26 @@ import {
   addGatewayProvider,
   clearGatewayLogs,
   clearAuth,
-  clearBackups,
+  clearHistory,
   createProfile,
-  deleteBackup,
+  deleteHistory,
   deleteGatewayProvider,
   deleteProfile,
   getGatewayConfig,
   getGatewayLogs,
+  getGatewayOAuthStatus,
   getGatewayStatus,
-  getActiveConfig,
-  getBackup,
+  getHistory,
   getProfile,
   getTools,
   hasAuth,
-  listBackups,
+  listHistory,
   listProfiles,
+  loginGatewayOAuth,
+  logoutGatewayOAuth,
   me,
-  restoreBackup,
+  restoreHistory,
   restartGateway,
-  saveActiveConfig,
   saveProfile,
   setAuth,
   startGateway,
@@ -50,16 +51,16 @@ import {
   updateGatewayProvider
 } from "./api";
 import type {
-  ActiveConfig,
-  BackupDoc,
-  BackupItem,
   ConfigFile,
   GatewayConfig,
   GatewayStatus,
+  HistoryDoc,
+  HistoryItem,
   ProfileDoc,
   ProfileItem,
   Tool,
   ToolId,
+  OAuthStatus,
   ViewMode
 } from "./types";
 
@@ -73,8 +74,23 @@ type GatewayProviderForm = {
   apiKey: string;
   authScheme: string;
   apiFormat: string;
-  defaultModel: string;
-  gpt53Model: string;
+  models: Record<string, string>;
+  customMappings: GatewayCustomMapping[];
+  extraHeadersJson: string;
+  modelCapabilitiesJson: string;
+  requestOptionsJson: string;
+  grokSso: string;
+  grokSsoRw: string;
+  grokCookieString: string;
+  grokCfClearance: string;
+  grokStatsigId: string;
+  grokUserAgent: string;
+};
+
+type GatewayCustomMapping = {
+  id: string;
+  key: string;
+  value: string;
 };
 
 type OpenCodeProviderForm = {
@@ -100,6 +116,37 @@ type OpenCodeSummary = {
   providerIds: string[];
 };
 
+const gatewayModelSlots = [
+  { key: "default", label: "Default" },
+  { key: "gpt_5_5", label: "gpt-5.5" },
+  { key: "gpt_5_4", label: "gpt-5.4" },
+  { key: "gpt_5_4_mini", label: "gpt-5.4-mini" },
+  { key: "gpt_5_3_codex", label: "gpt-5.3-codex" },
+  { key: "gpt_5_2", label: "gpt-5.2" }
+] as const;
+
+const gatewayApiFormats = [
+  { value: "openai_chat", label: "OpenAI Chat" },
+  { value: "responses", label: "Responses" },
+  { value: "anthropic_messages", label: "Anthropic Messages" },
+  { value: "gemini_native", label: "Gemini Native" },
+  { value: "gemini_cli_oauth", label: "Gemini CLI (OAuth)" },
+  { value: "antigravity_oauth", label: "Antigravity (OAuth)" },
+  { value: "grok_web", label: "Grok Web" }
+] as const;
+
+const gatewayPredefinedModelKeys = new Set<string>(gatewayModelSlots.map((slot) => slot.key));
+let gatewayCustomMappingCounter = 0;
+
+function emptyGatewayModels(): Record<string, string> {
+  return Object.fromEntries(gatewayModelSlots.map((slot) => [slot.key, ""]));
+}
+
+function nextGatewayCustomMappingId() {
+  gatewayCustomMappingCounter += 1;
+  return `gateway-custom-${gatewayCustomMappingCounter}`;
+}
+
 const emptyGatewayProviderForm: GatewayProviderForm = {
   id: "",
   name: "",
@@ -107,8 +154,17 @@ const emptyGatewayProviderForm: GatewayProviderForm = {
   apiKey: "",
   authScheme: "bearer",
   apiFormat: "openai_chat",
-  defaultModel: "",
-  gpt53Model: ""
+  models: emptyGatewayModels(),
+  customMappings: [],
+  extraHeadersJson: "{}",
+  modelCapabilitiesJson: "{}",
+  requestOptionsJson: "{}",
+  grokSso: "",
+  grokSsoRw: "",
+  grokCookieString: "",
+  grokCfClearance: "",
+  grokStatsigId: "",
+  grokUserAgent: ""
 };
 
 const emptyOpenCodeProviderForm: OpenCodeProviderForm = {
@@ -130,15 +186,15 @@ function App() {
   const [tools, setTools] = useState<Tool[]>([]);
   const [toolId, setToolId] = useState<ToolId>("claude");
   const [profiles, setProfiles] = useState<ProfileItem[]>([]);
-  const [backups, setBackups] = useState<BackupItem[]>([]);
-  const [mode, setMode] = useState<ViewMode>("active");
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [mode, setMode] = useState<ViewMode>("profile");
   const [selectedProfile, setSelectedProfile] = useState("");
-  const [selectedBackup, setSelectedBackup] = useState("");
+  const [selectedHistory, setSelectedHistory] = useState<{ profileName: string; name: string } | null>(null);
   const [files, setFiles] = useState<ConfigFile[]>([]);
   const [savedFiles, setSavedFiles] = useState<ConfigFile[]>([]);
   const [activeFileId, setActiveFileId] = useState("");
   const [mtime, setMtime] = useState<number | null>(null);
-  const [title, setTitle] = useState("当前配置");
+  const [title, setTitle] = useState("Profile");
   const [status, setStatus] = useState("准备就绪");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -151,6 +207,11 @@ function App() {
   const [gatewayLogBytes, setGatewayLogBytes] = useState({ current: 0, max: 0 });
   const [gatewayProviderForm, setGatewayProviderForm] = useState<GatewayProviderForm | null>(null);
   const [gatewayRestartRequired, setGatewayRestartRequired] = useState(false);
+  const [gatewayOAuthStatus, setGatewayOAuthStatus] = useState<Record<"gemini" | "antigravity", OAuthStatus | null>>({
+    gemini: null,
+    antigravity: null
+  });
+  const [gatewayOAuthBusy, setGatewayOAuthBusy] = useState<"gemini" | "antigravity" | null>(null);
   const [openCodeProviderForm, setOpenCodeProviderForm] = useState<OpenCodeProviderForm | null>(null);
   const [openCodeModelForm, setOpenCodeModelForm] = useState<OpenCodeModelForm | null>(null);
   const [showGatewayProviderApiKey, setShowGatewayProviderApiKey] = useState(false);
@@ -161,14 +222,13 @@ function App() {
   const activeContent = activeFile?.content ?? "";
   const openCodeStats = useMemo(() => summarizeOpenCodeConfig(activeContent), [activeContent]);
   const dirty = filesChanged(files, savedFiles);
-  const readonly = mode === "backup" || mode === "gateway";
-  const showOpenCodeAssistant =
-    toolId === "opencode" && mode !== "backup" && mode !== "gateway" && activeFile?.format === "json";
+  const readonly = mode === "history" || mode === "gateway";
+  const showOpenCodeAssistant = toolId === "opencode" && mode === "profile" && activeFile?.format === "json";
   const sensitive = files.some((file) => /api[_-]?key|token|secret|password/i.test(file.content));
   const contentLength = files.reduce((sum, file) => sum + file.content.length, 0);
 
   function applyDocument(
-    doc: ActiveConfig | ProfileDoc | BackupDoc,
+    doc: ProfileDoc | HistoryDoc,
     nextTitle: string,
     nextStatus: string,
     preferredFileId = activeFileId
@@ -203,9 +263,10 @@ function App() {
   }
 
   async function loadLists(nextTool = toolId) {
-    const [profileItems, backupItems] = await Promise.all([listProfiles(nextTool), listBackups(nextTool)]);
+    const [profileItems, historyItems] = await Promise.all([listProfiles(nextTool), listHistory(nextTool)]);
     setProfiles(profileItems);
-    setBackups(backupItems);
+    setHistory(historyItems);
+    return profileItems;
   }
 
   async function loadTool(nextTool: ToolId) {
@@ -213,12 +274,16 @@ function App() {
     setError("");
     try {
       setToolId(nextTool);
-      await loadLists(nextTool);
-      const active = await getActiveConfig(nextTool);
-      setMode("active");
-      setSelectedProfile("");
-      setSelectedBackup("");
-      applyDocument(active, "当前配置", "已加载当前配置", "");
+      const profileItems = await loadLists(nextTool);
+      const activeProfile = profileItems.find((item) => item.active) ?? profileItems[0];
+      if (!activeProfile) {
+        throw new Error("未找到可用 Profile");
+      }
+      const doc = await getProfile(nextTool, activeProfile.name);
+      setMode("profile");
+      setSelectedProfile(activeProfile.name);
+      setSelectedHistory(null);
+      applyDocument(doc, `Profile: ${activeProfile.name}`, "已加载已启用 Profile", "");
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
     } finally {
@@ -226,12 +291,15 @@ function App() {
     }
   }
 
-  async function loadActive() {
-    const active = await getActiveConfig(toolId);
-    setMode("active");
-    setSelectedProfile("");
-    setSelectedBackup("");
-    applyDocument(active, "当前配置", "已重新加载");
+  async function reloadSelectedProfile() {
+    const fallback = profiles.find((item) => item.active) ?? profiles[0];
+    const name = selectedProfile || fallback?.name;
+    if (!name) return;
+    const doc = await getProfile(toolId, name);
+    setMode("profile");
+    setSelectedProfile(name);
+    setSelectedHistory(null);
+    applyDocument(doc, `Profile: ${name}`, "已重新加载");
   }
 
   async function loadGateway() {
@@ -248,7 +316,7 @@ function App() {
       setGatewayLogBytes({ current: logs.currentBytes, max: logs.maxBytes });
       setMode("gateway");
       setSelectedProfile("");
-      setSelectedBackup("");
+      setSelectedHistory(null);
       setTitle("Gateway");
       setStatus(statusData.running ? "Gateway 运行中" : "Gateway 未启动");
     } catch (err) {
@@ -265,7 +333,7 @@ function App() {
       const doc = await getProfile(toolId, name);
       setMode("profile");
       setSelectedProfile(name);
-      setSelectedBackup("");
+      setSelectedHistory(null);
       applyDocument(doc, `Profile: ${name}`, "已加载 Profile");
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载 Profile 失败");
@@ -274,17 +342,17 @@ function App() {
     }
   }
 
-  async function loadBackup(name: string) {
+  async function loadHistoryEntry(profileName: string, name: string) {
     setLoading(true);
     setError("");
     try {
-      const doc = await getBackup(toolId, name);
-      setMode("backup");
-      setSelectedBackup(name);
+      const doc = await getHistory(toolId, profileName, name);
+      setMode("history");
+      setSelectedHistory({ profileName, name });
       setSelectedProfile("");
-      applyDocument(doc, `Backup: ${name}`, "已加载备份");
+      applyDocument(doc, `History: ${profileName}`, "已加载历史版本");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "加载备份失败");
+      setError(err instanceof Error ? err.message : "加载历史版本失败");
     } finally {
       setLoading(false);
     }
@@ -310,17 +378,13 @@ function App() {
   }
 
   async function handleSave() {
+    if (mode !== "profile" || !selectedProfile) return;
     setLoading(true);
     setError("");
     try {
       const preferredFileId = activeFileId;
-      if (mode === "active") {
-        const saved = await saveActiveConfig(toolId, files, mtime);
-        applyDocument(saved, "当前配置", "已保存，旧版本已备份", preferredFileId);
-      } else if (mode === "profile" && selectedProfile) {
-        const saved = await saveProfile(toolId, selectedProfile, files);
-        applyDocument(saved, `Profile: ${selectedProfile}`, "Profile 已保存", preferredFileId);
-      }
+      const saved = await saveProfile(toolId, selectedProfile, files);
+      applyDocument(saved, `Profile: ${selectedProfile}`, "Profile 已保存，旧版本已写入 History", preferredFileId);
       await loadLists();
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存失败");
@@ -355,8 +419,11 @@ function App() {
     setError("");
     try {
       await deleteProfile(toolId, selectedProfile);
-      await loadLists();
-      await loadActive();
+      const profileItems = await loadLists();
+      const nextProfile = profileItems.find((item) => item.active) ?? profileItems[0];
+      if (nextProfile) {
+        await loadProfile(nextProfile.name);
+      }
       setStatus("Profile 已删除");
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除失败");
@@ -372,9 +439,9 @@ function App() {
     try {
       const active = await activateProfile(toolId, selectedProfile);
       await loadLists();
-      setMode("active");
-      setSelectedProfile("");
-      applyDocument(active, "当前配置", `已启用 Profile: ${selectedProfile}`);
+      setMode("profile");
+      setSelectedHistory(null);
+      applyDocument(active, `Profile: ${selectedProfile}`, `已启用 Profile: ${selectedProfile}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "启用失败");
     } finally {
@@ -382,16 +449,19 @@ function App() {
     }
   }
 
-  async function handleRestoreBackup() {
-    if (!selectedBackup || !window.confirm(`恢复备份 "${selectedBackup}"？`)) return;
+  async function handleRestoreHistory() {
+    if (!selectedHistory) return;
+    const { profileName, name } = selectedHistory;
+    if (!window.confirm(`恢复 ${profileName} 的历史版本 "${name}"？`)) return;
     setLoading(true);
     setError("");
     try {
-      const active = await restoreBackup(toolId, selectedBackup);
+      const restored = await restoreHistory(toolId, profileName, name);
       await loadLists();
-      setMode("active");
-      setSelectedBackup("");
-      applyDocument(active, "当前配置", "备份已恢复，恢复前版本也已备份");
+      setMode("profile");
+      setSelectedProfile(profileName);
+      setSelectedHistory(null);
+      applyDocument(restored, `Profile: ${profileName}`, "历史版本已恢复，恢复前版本也已写入 History");
     } catch (err) {
       setError(err instanceof Error ? err.message : "恢复失败");
     } finally {
@@ -399,37 +469,39 @@ function App() {
     }
   }
 
-  async function handleDeleteBackup() {
-    if (!selectedBackup || !window.confirm(`删除备份 "${selectedBackup}"？`)) return;
+  async function handleDeleteHistory() {
+    if (!selectedHistory) return;
+    const { profileName, name } = selectedHistory;
+    if (!window.confirm(`删除 ${profileName} 的历史版本 "${name}"？`)) return;
     setLoading(true);
     setError("");
     try {
-      await deleteBackup(toolId, selectedBackup);
+      await deleteHistory(toolId, profileName, name);
       await loadLists();
-      await loadActive();
-      setStatus("备份已删除");
+      await reloadSelectedProfile();
+      setStatus("历史版本已删除");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除备份失败");
+      setError(err instanceof Error ? err.message : "删除历史版本失败");
     } finally {
       setLoading(false);
     }
   }
 
-  async function handleClearBackups() {
-    if (!backups.length) return;
-    if (!window.confirm(`删除 ${tool?.name || toolId} 的全部 ${backups.length} 个备份？`)) return;
+  async function handleClearHistory() {
+    if (!history.length) return;
+    if (!window.confirm(`删除 ${tool?.name || toolId} 的全部 ${history.length} 条历史版本？`)) return;
     setLoading(true);
     setError("");
     try {
-      await clearBackups(toolId);
+      await clearHistory(toolId);
       await loadLists();
-      if (mode === "backup") {
-        await loadActive();
+      if (mode === "history") {
+        await reloadSelectedProfile();
       }
-      setSelectedBackup("");
-      setStatus("全部备份已删除");
+      setSelectedHistory(null);
+      setStatus("全部历史版本已删除");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "清空备份失败");
+      setError(err instanceof Error ? err.message : "清空历史版本失败");
     } finally {
       setLoading(false);
     }
@@ -501,9 +573,24 @@ function App() {
   function openGatewayProviderForm(provider?: GatewayConfig["providers"][number]) {
     setShowGatewayProviderApiKey(false);
     if (!provider) {
-      setGatewayProviderForm(emptyGatewayProviderForm);
+      setGatewayProviderForm({
+        ...emptyGatewayProviderForm,
+        models: emptyGatewayModels(),
+        customMappings: []
+      });
       return;
     }
+    const models = { ...emptyGatewayModels() };
+    for (const slot of gatewayModelSlots) {
+      models[slot.key] = provider.models?.[slot.key] || "";
+    }
+    const customMappings = Object.entries(provider.models || {})
+      .filter(([key, value]) => !gatewayPredefinedModelKeys.has(key) && Boolean(value))
+      .map(([key, value]) => ({
+        id: nextGatewayCustomMappingId(),
+        key,
+        value
+      }));
     setGatewayProviderForm({
       id: provider.id,
       name: provider.name,
@@ -511,13 +598,89 @@ function App() {
       apiKey: provider.apiKey || "",
       authScheme: provider.authScheme || "bearer",
       apiFormat: provider.apiFormat || "openai_chat",
-      defaultModel: provider.models?.default || "",
-      gpt53Model: provider.models?.gpt_5_3_codex || provider.models?.default || ""
+      models,
+      customMappings,
+      extraHeadersJson: formatJson(providerExtraHeaders(provider)),
+      modelCapabilitiesJson: formatJson(provider.modelCapabilities || {}),
+      requestOptionsJson: formatJson(provider.requestOptions || {}),
+      grokSso: "",
+      grokSsoRw: "",
+      grokCookieString: "",
+      grokCfClearance: "",
+      grokStatsigId: "",
+      grokUserAgent: ""
     });
+    if (provider.apiFormat === "gemini_cli_oauth") {
+      void loadGatewayOAuth("gemini");
+    } else if (provider.apiFormat === "antigravity_oauth") {
+      void loadGatewayOAuth("antigravity");
+    }
   }
 
   function updateGatewayProviderForm(field: keyof GatewayProviderForm, value: string) {
-    setGatewayProviderForm((current) => (current ? { ...current, [field]: value } : current));
+    setGatewayProviderForm((current) => {
+      if (!current) return current;
+      if (field === "apiFormat") {
+        return {
+          ...current,
+          apiFormat: value,
+          authScheme: recommendedGatewayAuthScheme(value)
+        };
+      }
+      return { ...current, [field]: value };
+    });
+  }
+
+  function updateGatewayModel(slot: string, value: string) {
+    setGatewayProviderForm((current) =>
+      current
+        ? {
+            ...current,
+            models: {
+              ...current.models,
+              [slot]: value
+            }
+          }
+        : current
+    );
+  }
+
+  function addGatewayCustomMapping() {
+    setGatewayProviderForm((current) =>
+      current
+        ? {
+            ...current,
+            customMappings: [
+              ...current.customMappings,
+              { id: nextGatewayCustomMappingId(), key: "", value: "" }
+            ]
+          }
+        : current
+    );
+  }
+
+  function updateGatewayCustomMapping(id: string, field: "key" | "value", value: string) {
+    setGatewayProviderForm((current) =>
+      current
+        ? {
+            ...current,
+            customMappings: current.customMappings.map((mapping) =>
+              mapping.id === id ? { ...mapping, [field]: value } : mapping
+            )
+          }
+        : current
+    );
+  }
+
+  function removeGatewayCustomMapping(id: string) {
+    setGatewayProviderForm((current) =>
+      current
+        ? {
+            ...current,
+            customMappings: current.customMappings.filter((mapping) => mapping.id !== id)
+          }
+        : current
+    );
   }
 
   async function handleGatewayProviderSubmit(event: FormEvent) {
@@ -532,16 +695,34 @@ function App() {
     setError("");
     try {
       const wasRunning = Boolean(gatewayStatus?.running);
+      const extraHeaders = parseJsonObject(form.extraHeadersJson, "额外 Headers");
+      const modelCapabilities = parseJsonObject(form.modelCapabilitiesJson, "模型能力");
+      const requestOptions = parseJsonObject(form.requestOptionsJson, "请求选项");
+      const models = {
+        ...Object.fromEntries(
+          gatewayModelSlots.map((slot) => [slot.key, form.models[slot.key]?.trim() || ""])
+        )
+      };
+      for (const mapping of form.customMappings) {
+        const key = mapping.key.trim();
+        if (key) {
+          models[key] = mapping.value.trim();
+        }
+      }
       const payload: Record<string, unknown> = {
         name: form.name.trim(),
         baseUrl: form.baseUrl.trim(),
         apiFormat: form.apiFormat,
         authScheme: form.authScheme,
-        models: {
-          default: form.defaultModel.trim(),
-          gpt_5_3_codex: form.gpt53Model.trim() || form.defaultModel.trim()
-        }
+        models,
+        extraHeaders,
+        modelCapabilities,
+        requestOptions
       };
+      const grokWeb = collectGrokWebPayload(form);
+      if (grokWeb) {
+        payload.grokWeb = grokWeb;
+      }
       if (form.apiKey.trim()) {
         payload.apiKey = form.apiKey.trim();
       }
@@ -613,6 +794,49 @@ function App() {
       setError(err instanceof Error ? err.message : "清除日志失败");
     } finally {
       setLoading(false);
+    }
+  }
+
+  function selectedOAuthKind() {
+    if (gatewayProviderForm?.apiFormat === "gemini_cli_oauth") return "gemini";
+    if (gatewayProviderForm?.apiFormat === "antigravity_oauth") return "antigravity";
+    return null;
+  }
+
+  async function loadGatewayOAuth(kind: "gemini" | "antigravity") {
+    try {
+      const next = await getGatewayOAuthStatus(kind);
+      setGatewayOAuthStatus((current) => ({ ...current, [kind]: next }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载 OAuth 状态失败");
+    }
+  }
+
+  async function handleGatewayOAuthLogin(kind: "gemini" | "antigravity") {
+    setGatewayOAuthBusy(kind);
+    setError("");
+    try {
+      const next = await loginGatewayOAuth(kind);
+      setGatewayOAuthStatus((current) => ({ ...current, [kind]: next }));
+      setStatus(next.loggedIn ? `${oauthLabel(kind)} 已登录` : `${oauthLabel(kind)} 未登录`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "OAuth 登录失败");
+    } finally {
+      setGatewayOAuthBusy(null);
+    }
+  }
+
+  async function handleGatewayOAuthLogout(kind: "gemini" | "antigravity") {
+    setGatewayOAuthBusy(kind);
+    setError("");
+    try {
+      const next = await logoutGatewayOAuth(kind);
+      setGatewayOAuthStatus((current) => ({ ...current, [kind]: next }));
+      setStatus(`${oauthLabel(kind)} 已退出`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "OAuth 退出失败");
+    } finally {
+      setGatewayOAuthBusy(null);
     }
   }
 
@@ -813,23 +1037,20 @@ function App() {
           ))}
         </div>
 
-        <section className="nav-section">
-          <button className={mode === "active" ? "nav-item selected" : "nav-item"} onClick={loadActive}>
-            当前配置
-          </button>
-          {toolId === "codex" ? (
+        {toolId === "codex" ? (
+          <section className="nav-section">
             <button className={mode === "gateway" ? "nav-item selected" : "nav-item"} onClick={loadGateway}>
               <span>Gateway</span>
               <PlugZap size={15} />
             </button>
-          ) : null}
-        </section>
+          </section>
+        ) : null}
 
         <section className="nav-section">
           <div className="section-title">
             <span>Profiles</span>
             <div className="mini-actions">
-              <button title="从当前配置创建 Profile" onClick={() => handleCreateProfile("active")}>
+              <button title="从已启用 Profile 创建" onClick={() => handleCreateProfile("active")}>
                 <FolderPlus size={15} />
               </button>
               <button title="创建空 Profile" onClick={() => handleCreateProfile("empty")}>
@@ -851,32 +1072,39 @@ function App() {
           </div>
         </section>
 
-        <section className="nav-section backups">
+        <section className="nav-section history">
           <div className="section-title">
-            <span>Backups</span>
+            <span>History</span>
             <div className="mini-actions">
               <span className="section-icon">
                 <DatabaseBackup size={15} />
               </span>
               <button
                 className="danger"
-                title="删除全部备份"
-                onClick={handleClearBackups}
-                disabled={loading || backups.length === 0}
+                title="删除全部历史"
+                onClick={handleClearHistory}
+                disabled={loading || history.length === 0}
               >
                 <Trash2 size={15} />
               </button>
             </div>
           </div>
           <div className="scroll-list">
-            {backups.map((item) => (
+            {history.map((item) => (
               <button
-                key={item.name}
-                className={mode === "backup" && selectedBackup === item.name ? "nav-item selected" : "nav-item"}
-                onClick={() => loadBackup(item.name)}
-                title={formatTime(item.mtime)}
+                key={`${item.profileName}-${item.name}`}
+                className={
+                  mode === "history" &&
+                  selectedHistory?.profileName === item.profileName &&
+                  selectedHistory.name === item.name
+                    ? "nav-item selected"
+                    : "nav-item"
+                }
+                onClick={() => loadHistoryEntry(item.profileName, item.name)}
+                title={`${item.profileName} · ${formatTime(item.mtime)}`}
               >
-                {item.name}
+                <span>{item.profileName}</span>
+                <span>{formatTime(item.mtime)}</span>
               </button>
             ))}
           </div>
@@ -892,7 +1120,9 @@ function App() {
             <p>
               {mode === "gateway"
                 ? "管理 Providers 与运行日志"
-                : `${tool?.pathLabel} · ${files.map((file) => file.format.toUpperCase()).join(" + ")}`}
+                : mode === "history"
+                  ? `历史版本属于 Profile: ${selectedHistory?.profileName ?? "-"}`
+                  : `${tool?.pathLabel} · ${files.map((file) => file.format.toUpperCase()).join(" + ")}`}
             </p>
           </div>
           <div className="actions">
@@ -934,7 +1164,7 @@ function App() {
                   <Check size={16} />
                   格式化
                 </button>
-                <button onClick={loadActive} disabled={loading} title="重新加载">
+                <button onClick={reloadSelectedProfile} disabled={loading} title="重新加载">
                   <RefreshCcw size={16} />
                   重载
                 </button>
@@ -955,13 +1185,13 @@ function App() {
                 </button>
               </>
             ) : null}
-            {mode === "backup" ? (
+            {mode === "history" ? (
               <>
-                <button onClick={handleRestoreBackup} disabled={loading} title="恢复备份">
+                <button onClick={handleRestoreHistory} disabled={loading} title="恢复历史版本">
                   <Play size={16} />
                   恢复
                 </button>
-                <button className="danger" onClick={handleDeleteBackup} disabled={loading} title="删除备份">
+                <button className="danger" onClick={handleDeleteHistory} disabled={loading} title="删除历史版本">
                   <Trash2 size={16} />
                 </button>
               </>
@@ -984,7 +1214,7 @@ function App() {
           ) : (
             <>
               <span className={dirty ? "dirty-dot" : "clean-dot"} />
-              <span>{dirty ? "未保存" : "已同步"}</span>
+              <span>{mode === "history" ? "只读历史" : dirty ? "未保存" : "已同步"}</span>
               <span>{contentLength} 字符</span>
               <span>{status}</span>
               <span>{mtime ? formatTime(mtime) : "无 mtime"}</span>
@@ -1120,7 +1350,7 @@ function App() {
               ) : null}
               <div className="editor-wrap">
                 <Editor
-                  key={`${toolId}-${mode}-${selectedProfile}-${selectedBackup}-${activeFile?.id ?? "file"}`}
+                  key={`${toolId}-${mode}-${selectedProfile}-${selectedHistory?.profileName ?? ""}-${selectedHistory?.name ?? ""}-${activeFile?.id ?? "file"}`}
                   height="100%"
                   value={activeContent}
                   onChange={(value) => updateActiveContent(value ?? "")}
@@ -1147,7 +1377,7 @@ function App() {
             <div className="modal-head">
               <div>
                 <h3>{gatewayProviderForm.id ? "编辑 Provider" : "添加 Provider"}</h3>
-                <p>OpenAI Chat 兼容上游</p>
+                <p>配置转发协议与模型映射</p>
               </div>
               <button type="button" onClick={() => setGatewayProviderForm(null)}>
                 关闭
@@ -1191,22 +1421,6 @@ function App() {
                 </div>
               </label>
               <label>
-                默认模型
-                <input
-                  value={gatewayProviderForm.defaultModel}
-                  onChange={(event) => updateGatewayProviderForm("defaultModel", event.target.value)}
-                  placeholder="deepseek-chat"
-                />
-              </label>
-              <label>
-                将Codex请求的模型映射为
-                <input
-                  value={gatewayProviderForm.gpt53Model}
-                  onChange={(event) => updateGatewayProviderForm("gpt53Model", event.target.value)}
-                  placeholder="deepseek-chat"
-                />
-              </label>
-              <label>
                 鉴权方式
                 <select
                   value={gatewayProviderForm.authScheme}
@@ -1217,7 +1431,233 @@ function App() {
                   <option value="none">None</option>
                 </select>
               </label>
+              <label>
+                协议类型
+                <select
+                  value={gatewayProviderForm.apiFormat}
+                  onChange={(event) => updateGatewayProviderForm("apiFormat", event.target.value)}
+                >
+                  {gatewayApiFormats.map((format) => (
+                    <option key={format.value} value={format.value}>
+                      {format.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
             </div>
+            {selectedOAuthKind() ? (
+              <section className="gateway-credential-section">
+                <div className="gateway-mapping-head">
+                  <div>
+                    <h4>{oauthLabel(selectedOAuthKind()!)} 登录</h4>
+                    <p>OAuth token 会保存到本机 token 文件；Gateway 运行后可在这里完成登录。</p>
+                  </div>
+                  <div className="gateway-oauth-actions">
+                    <button
+                      type="button"
+                      onClick={() => loadGatewayOAuth(selectedOAuthKind()!)}
+                      disabled={loading || gatewayOAuthBusy !== null}
+                    >
+                      刷新状态
+                    </button>
+                    {gatewayOAuthStatus[selectedOAuthKind()!]?.loggedIn ? (
+                      <button
+                        type="button"
+                        onClick={() => handleGatewayOAuthLogout(selectedOAuthKind()!)}
+                        disabled={loading || gatewayOAuthBusy !== null}
+                      >
+                        退出
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => handleGatewayOAuthLogin(selectedOAuthKind()!)}
+                        disabled={loading || gatewayOAuthBusy !== null || !gatewayStatus?.running}
+                      >
+                        {gatewayOAuthBusy === selectedOAuthKind() ? "登录中..." : "登录"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="gateway-credential-meta">
+                  {gatewayOAuthStatus[selectedOAuthKind()!]?.loggedIn ? (
+                    <>
+                      <span>已登录</span>
+                      <span>{gatewayOAuthStatus[selectedOAuthKind()!]?.email || "未知账号"}</span>
+                      <span>{gatewayOAuthStatus[selectedOAuthKind()!]?.projectId || "无 project"}</span>
+                    </>
+                  ) : (
+                    <span>{gatewayStatus?.running ? "未登录" : "先启动 Gateway，再登录"}</span>
+                  )}
+                </div>
+                <p className="gateway-credential-hint">
+                  若浏览器没有自动打开，请到 Gateway 日志里复制 OAuth URL 手动访问。
+                </p>
+              </section>
+            ) : null}
+            {gatewayProviderForm.apiFormat === "grok_web" ? (
+              <section className="gateway-credential-section">
+                <div className="gateway-mapping-head">
+                  <div>
+                    <h4>Grok Web 凭证</h4>
+                    <p>
+                      需要浏览器 cookie 中的 <code>sso</code>；编辑已有 Provider 时留空会保留已保存凭证。
+                    </p>
+                  </div>
+                </div>
+                <div className="gateway-mapping-grid">
+                  <label>
+                    sso
+                    <input
+                      value={gatewayProviderForm.grokSso}
+                      onChange={(event) => updateGatewayProviderForm("grokSso", event.target.value)}
+                      placeholder={gatewayProviderForm.id ? "已保存则可留空" : "JWT"}
+                      type="password"
+                    />
+                  </label>
+                  <label>
+                    sso-rw
+                    <input
+                      value={gatewayProviderForm.grokSsoRw}
+                      onChange={(event) => updateGatewayProviderForm("grokSsoRw", event.target.value)}
+                      placeholder="可选，默认复用 sso"
+                      type="password"
+                    />
+                  </label>
+                  <label>
+                    cf_clearance
+                    <input
+                      value={gatewayProviderForm.grokCfClearance}
+                      onChange={(event) => updateGatewayProviderForm("grokCfClearance", event.target.value)}
+                      placeholder="可选"
+                      type="password"
+                    />
+                  </label>
+                  <label>
+                    x-statsig-id
+                    <input
+                      value={gatewayProviderForm.grokStatsigId}
+                      onChange={(event) => updateGatewayProviderForm("grokStatsigId", event.target.value)}
+                      placeholder="可选"
+                      type="password"
+                    />
+                  </label>
+                  <label className="span-two">
+                    完整 Cookie 字符串
+                    <textarea
+                      value={gatewayProviderForm.grokCookieString}
+                      onChange={(event) =>
+                        updateGatewayProviderForm("grokCookieString", event.target.value)
+                      }
+                      placeholder="__cf_bm=...; cf_clearance=...; ..."
+                    />
+                  </label>
+                  <label className="span-two">
+                    User-Agent override
+                    <input
+                      value={gatewayProviderForm.grokUserAgent}
+                      onChange={(event) => updateGatewayProviderForm("grokUserAgent", event.target.value)}
+                      placeholder="Mozilla/5.0 ..."
+                    />
+                  </label>
+                </div>
+              </section>
+            ) : null}
+            <section className="gateway-mapping-section">
+              <div className="gateway-mapping-head">
+                <div>
+                  <h4>模型映射</h4>
+                  <p>将 Codex 模型映射为指定模型。未设置则为 Default。</p>
+                </div>
+                <button type="button" onClick={addGatewayCustomMapping}>
+                  + 自定义映射
+                </button>
+              </div>
+              <div className="gateway-mapping-grid">
+                {gatewayModelSlots.map((slot) => (
+                  <label key={slot.key}>
+                    {slot.label}
+                    <input
+                      value={gatewayProviderForm.models[slot.key] || ""}
+                      onChange={(event) => updateGatewayModel(slot.key, event.target.value)}
+                      placeholder={slot.key === "default" ? "deepseek-chat" : "留空则为 Default"}
+                    />
+                  </label>
+                ))}
+              </div>
+              {gatewayProviderForm.customMappings.length ? (
+                <div className="gateway-custom-mappings">
+                  {gatewayProviderForm.customMappings.map((mapping) => (
+                    <div className="gateway-custom-mapping-row" key={mapping.id}>
+                      <label>
+                        Codex 模型名
+                        <input
+                          value={mapping.key}
+                          onChange={(event) =>
+                            updateGatewayCustomMapping(mapping.id, "key", event.target.value)
+                          }
+                          placeholder="gpt-4o"
+                        />
+                      </label>
+                      <label>
+                        映射到
+                        <input
+                          value={mapping.value}
+                          onChange={(event) =>
+                            updateGatewayCustomMapping(mapping.id, "value", event.target.value)
+                          }
+                          placeholder="claude-haiku-4"
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="danger"
+                        onClick={() => removeGatewayCustomMapping(mapping.id)}
+                        title="删除自定义映射"
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </section>
+            <section className="gateway-advanced-section">
+              <div className="gateway-mapping-head">
+                <div>
+                  <h4>高级 Provider 字段</h4>
+                </div>
+              </div>
+              <div className="gateway-json-grid">
+                <label>
+                  extraHeaders
+                  <textarea
+                    value={gatewayProviderForm.extraHeadersJson}
+                    onChange={(event) =>
+                      updateGatewayProviderForm("extraHeadersJson", event.target.value)
+                    }
+                  />
+                </label>
+                <label>
+                  modelCapabilities
+                  <textarea
+                    value={gatewayProviderForm.modelCapabilitiesJson}
+                    onChange={(event) =>
+                      updateGatewayProviderForm("modelCapabilitiesJson", event.target.value)
+                    }
+                  />
+                </label>
+                <label>
+                  requestOptions
+                  <textarea
+                    value={gatewayProviderForm.requestOptionsJson}
+                    onChange={(event) =>
+                      updateGatewayProviderForm("requestOptionsJson", event.target.value)
+                    }
+                  />
+                </label>
+              </div>
+            </section>
             <div className="modal-actions">
               <button type="button" onClick={() => setGatewayProviderForm(null)}>
                 取消
@@ -1384,7 +1824,7 @@ function App() {
   );
 }
 
-function normalizeDocFiles(doc: ActiveConfig | ProfileDoc | BackupDoc): ConfigFile[] {
+function normalizeDocFiles(doc: ProfileDoc | HistoryDoc): ConfigFile[] {
   if (doc.files?.length) {
     return doc.files;
   }
@@ -1396,7 +1836,7 @@ function normalizeDocFiles(doc: ActiveConfig | ProfileDoc | BackupDoc): ConfigFi
       content: doc.content,
       format: doc.format,
       mtime: doc.mtime,
-      pathLabel: "pathLabel" in doc ? doc.pathLabel : ""
+      pathLabel: ""
     }
   ];
 }
@@ -1478,6 +1918,47 @@ function trimOpenCodeProviderForm(form: OpenCodeProviderForm): OpenCodeProviderF
 
 function formatOpenCodeConfig(doc: Record<string, unknown>) {
   return JSON.stringify(doc, null, 2) + "\n";
+}
+
+function providerExtraHeaders(provider: GatewayConfig["providers"][number]) {
+  return provider.extraHeaders || {};
+}
+
+function formatJson(value: unknown) {
+  return JSON.stringify(value || {}, null, 2);
+}
+
+function parseJsonObject(value: string, label: string): Record<string, unknown> {
+  const parsed = JSON.parse(value || "{}");
+  if (!isPlainObject(parsed)) {
+    throw new Error(`${label} 必须是 JSON 对象`);
+  }
+  return parsed;
+}
+
+function collectGrokWebPayload(form: GatewayProviderForm) {
+  const cookies: Record<string, string> = {};
+  if (form.grokSso.trim()) cookies.sso = form.grokSso.trim();
+  if (form.grokSsoRw.trim()) cookies["sso-rw"] = form.grokSsoRw.trim();
+  if (form.grokCookieString.trim()) cookies.cookieString = form.grokCookieString.trim();
+  if (form.grokCfClearance.trim()) cookies.cf_clearance = form.grokCfClearance.trim();
+  const payload: Record<string, unknown> = {};
+  if (Object.keys(cookies).length) payload.cookies = cookies;
+  if (form.grokStatsigId.trim()) payload.statsigId = form.grokStatsigId.trim();
+  if (form.grokUserAgent.trim()) payload.userAgent = form.grokUserAgent.trim();
+  return Object.keys(payload).length ? payload : null;
+}
+
+function recommendedGatewayAuthScheme(apiFormat: string) {
+  if (apiFormat === "gemini_native") return "google_api_key";
+  if (apiFormat === "gemini_cli_oauth") return "google_oauth_cloud_code";
+  if (apiFormat === "antigravity_oauth") return "google_oauth_antigravity";
+  if (apiFormat === "grok_web") return "grok_cookie";
+  return "bearer";
+}
+
+function oauthLabel(kind: "gemini" | "antigravity") {
+  return kind === "gemini" ? "Gemini CLI OAuth" : "Antigravity OAuth";
 }
 
 export default App;
