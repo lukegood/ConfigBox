@@ -22,7 +22,7 @@
 
 - ConfigBox是一个Docker化的Web管理工具，用于在浏览器中可视化管理和切换 Claude Code、Codex 与OpenCode的配置文件。
 
-- 具备Codex转发功能，支持GLM、Deepseek、Kimi第三方模型接入Codex。已内置基于[Cmochance/codex-app-transfer](https://github.com/Cmochance/codex-app-transfer)的Codex转发能力并将持续追踪更新。
+- 具备Codex转发功能，内置基于[Cmochance/codex-app-transfer](https://github.com/Cmochance/codex-app-transfer)的Codex转发能力并将持续追踪更新。支持GLM、Deepseek、Kimi和minimax等第三方模型接入Codex。
 
 - 支持Linux、macOS 和 Windows平台。支持Claude Code, Codex和OpenCode。
 
@@ -37,7 +37,7 @@ v0.5.0: 5月10日更新，增加对OpenCode的支持。
 v0.5.2: 5月14日更新，同步上游codex转发网关的更改，修复gateway界面的前端。  
 v0.5.3: 5月18日更新，优化配置切换逻辑，同步上游codex网关更新。 
 v0.5.4: 5月18日更新，紧急修复codex网关失效的BUG。  
-
+v0.5.5: 5月23日更新，同步上游codex网关更新
 ## 项目截图 :camera:
 
 <img src="yanshi.png" alt="ConfigBox screenshot" width="800">

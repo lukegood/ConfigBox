@@ -1642,8 +1642,8 @@ function App() {
               </div>
               <label className="gateway-toggle-row">
                 <span>
-                  <strong>Web Search</strong>
-                  <small>写入 requestOptions.web_search_enabled</small>
+                  <strong>允许模型使用原生联网搜索</strong>
+                  <small>Kimi / Moonshot / MiMo 等支持时启用；不支持的 Provider 会自动忽略</small>
                 </span>
                 <input
                   type="checkbox"
