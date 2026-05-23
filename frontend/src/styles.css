@@ -771,6 +771,36 @@ textarea {
   font-size: 13px;
 }
 
+.gateway-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+}
+
+.gateway-toggle-row span {
+  display: grid;
+  gap: 3px;
+}
+
+.gateway-toggle-row strong {
+  font-size: 14px;
+}
+
+.gateway-toggle-row small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.gateway-toggle-row input {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+
 .gateway-json-grid {
   display: grid;
   gap: 14px;
