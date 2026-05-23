@@ -78,6 +78,7 @@ type GatewayProviderForm = {
   customMappings: GatewayCustomMapping[];
   extraHeadersJson: string;
   modelCapabilitiesJson: string;
+  webSearchEnabled: boolean;
   requestOptionsJson: string;
   grokSso: string;
   grokSsoRw: string;
@@ -158,6 +159,7 @@ const emptyGatewayProviderForm: GatewayProviderForm = {
   customMappings: [],
   extraHeadersJson: "{}",
   modelCapabilitiesJson: "{}",
+  webSearchEnabled: false,
   requestOptionsJson: "{}",
   grokSso: "",
   grokSsoRw: "",
@@ -591,6 +593,7 @@ function App() {
         key,
         value
       }));
+    const requestOptions = provider.requestOptions || {};
     setGatewayProviderForm({
       id: provider.id,
       name: provider.name,
@@ -602,7 +605,8 @@ function App() {
       customMappings,
       extraHeadersJson: formatJson(providerExtraHeaders(provider)),
       modelCapabilitiesJson: formatJson(provider.modelCapabilities || {}),
-      requestOptionsJson: formatJson(provider.requestOptions || {}),
+      webSearchEnabled: requestOptions.web_search_enabled === true,
+      requestOptionsJson: formatJson(requestOptionsForAdvancedJson(requestOptions)),
       grokSso: "",
       grokSsoRw: "",
       grokCookieString: "",
@@ -629,6 +633,10 @@ function App() {
       }
       return { ...current, [field]: value };
     });
+  }
+
+  function updateGatewayProviderFlag(field: "webSearchEnabled", value: boolean) {
+    setGatewayProviderForm((current) => (current ? { ...current, [field]: value } : current));
   }
 
   function updateGatewayModel(slot: string, value: string) {
@@ -698,6 +706,10 @@ function App() {
       const extraHeaders = parseJsonObject(form.extraHeadersJson, "额外 Headers");
       const modelCapabilities = parseJsonObject(form.modelCapabilitiesJson, "模型能力");
       const requestOptions = parseJsonObject(form.requestOptionsJson, "请求选项");
+      delete requestOptions.web_search_enabled;
+      if (form.webSearchEnabled) {
+        requestOptions.web_search_enabled = true;
+      }
       const models = {
         ...Object.fromEntries(
           gatewayModelSlots.map((slot) => [slot.key, form.models[slot.key]?.trim() || ""])
@@ -1628,6 +1640,17 @@ function App() {
                   <h4>高级 Provider 字段</h4>
                 </div>
               </div>
+              <label className="gateway-toggle-row">
+                <span>
+                  <strong>允许模型使用原生联网搜索</strong>
+                  <small>Kimi / Moonshot / MiMo 等支持时启用；不支持的 Provider 会自动忽略</small>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={gatewayProviderForm.webSearchEnabled}
+                  onChange={(event) => updateGatewayProviderFlag("webSearchEnabled", event.target.checked)}
+                />
+              </label>
               <div className="gateway-json-grid">
                 <label>
                   extraHeaders
@@ -1922,6 +1945,11 @@ function formatOpenCodeConfig(doc: Record<string, unknown>) {
 
 function providerExtraHeaders(provider: GatewayConfig["providers"][number]) {
   return provider.extraHeaders || {};
+}
+
+function requestOptionsForAdvancedJson(requestOptions: Record<string, unknown>) {
+  const { web_search_enabled: _webSearchEnabled, ...rest } = requestOptions;
+  return rest;
 }
 
 function formatJson(value: unknown) {
