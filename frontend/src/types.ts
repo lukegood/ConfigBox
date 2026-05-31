@@ -35,6 +35,8 @@ export type ProfileDoc = {
   format: ConfigFormat;
   mtime: number | null;
   files?: ConfigFile[];
+  active?: boolean;
+  runtimeChanged?: boolean;
 };
 
 export type HistoryItem = {
@@ -72,6 +74,40 @@ export type GatewayProvider = {
   apiKey?: string;
   hasApiKey?: boolean;
   hasGrokWeb?: boolean;
+  isBuiltin?: boolean;
+};
+
+export type GatewayPresetMessage = {
+  level?: "info" | "warning" | string;
+  text: string;
+};
+
+export type GatewayPresetBaseUrl = {
+  url: string;
+  label?: string;
+};
+
+export type GatewayPreset = {
+  id: string;
+  name: string;
+  description?: string;
+  experimental?: boolean;
+  baseUrls?: GatewayPresetBaseUrl[];
+  messages?: GatewayPresetMessage[];
+  provider: Pick<GatewayProvider, "name" | "baseUrl" | "apiFormat" | "authScheme" | "models"> & {
+    extraHeaders?: Record<string, string>;
+    modelCapabilities?: Record<string, unknown>;
+    requestOptions?: Record<string, unknown>;
+  };
+};
+
+export type GatewayModelEntry = {
+  id?: string;
+  model?: string;
+  name?: string;
+  display_name?: string;
+  recommended?: boolean;
+  tag_title?: string;
 };
 
 export type GatewayConfig = {

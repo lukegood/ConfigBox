@@ -81,7 +81,184 @@ DOCUMENTED_CONTEXT_WINDOWS = {
     "gemini-3.1-flash-lite": ONE_M_CONTEXT_WINDOW,
     "gemini-2.5-flash": ONE_M_CONTEXT_WINDOW,
     "gemini-3-flash": ONE_M_CONTEXT_WINDOW,
+    "gemini-3-flash-agent": ONE_M_CONTEXT_WINDOW,
+    "gemini-3.5-flash-low": ONE_M_CONTEXT_WINDOW,
+    "gemini-3.5-flash-extra-low": ONE_M_CONTEXT_WINDOW,
+    "gemini-pro-agent": ONE_M_CONTEXT_WINDOW,
+    "gemini-3.1-pro-low": ONE_M_CONTEXT_WINDOW,
+    "gpt-oss-120b-medium": 131_072,
 }
+CONFIGBOX_GATEWAY_PRESETS: list[dict[str, Any]] = [
+    {
+        "id": "deepseek-v4",
+        "name": "DeepSeek V4",
+        "description": "DeepSeek 官方 OpenAI 兼容接口。",
+        "provider": {
+            "name": "DeepSeek",
+            "baseUrl": "https://api.deepseek.com",
+            "apiFormat": "openai_chat",
+            "authScheme": "bearer",
+            "models": {
+                "default": "deepseek-v4-pro",
+                "gpt_5_5": "deepseek-v4-pro",
+                "gpt_5_4": "deepseek-v4-pro",
+                "gpt_5_4_mini": "deepseek-v4-flash",
+                "gpt_5_3_codex": "deepseek-v4-pro",
+                "gpt_5_2": "deepseek-v4-flash",
+            },
+            "modelCapabilities": {
+                "deepseek-v4-pro": {"context_window": ONE_M_CONTEXT_WINDOW},
+                "deepseek-v4-flash": {"context_window": ONE_M_CONTEXT_WINDOW},
+            },
+        },
+    },
+    {
+        "id": "kimi",
+        "name": "Kimi",
+        "description": "月之暗面 OpenAI 兼容接口。",
+        "provider": {
+            "name": "Kimi",
+            "baseUrl": "https://api.moonshot.cn/v1",
+            "apiFormat": "openai_chat",
+            "authScheme": "bearer",
+            "models": {"default": "kimi-k2.6", "gpt_5_5": "kimi-k2.6", "gpt_5_4": "kimi-k2.6"},
+        },
+    },
+    {
+        "id": "kimi-code",
+        "name": "Kimi Code",
+        "description": "Kimi 编程接口，内置 Kimi CLI User-Agent。",
+        "provider": {
+            "name": "Kimi Code",
+            "baseUrl": "https://api.kimi.com/coding/v1",
+            "apiFormat": "openai_chat",
+            "authScheme": "bearer",
+            "models": {"default": "kimi-for-coding"},
+            "extraHeaders": {"User-Agent": "KimiCLI/1.40.0"},
+        },
+    },
+    {
+        "id": "zhipu-glm",
+        "name": "智谱 GLM",
+        "description": "智谱 GLM OpenAI 兼容接口。",
+        "provider": {
+            "name": "智谱 GLM",
+            "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+            "apiFormat": "openai_chat",
+            "authScheme": "bearer",
+            "models": {"default": "glm-5.1", "gpt_5_5": "glm-5.1", "gpt_5_4": "glm-4.7"},
+        },
+    },
+    {
+        "id": "bailian",
+        "name": "阿里云百炼",
+        "description": "DashScope OpenAI 兼容接口。",
+        "provider": {
+            "name": "阿里云百炼",
+            "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "apiFormat": "openai_chat",
+            "authScheme": "bearer",
+            "models": {"default": "qwen3.6-plus", "gpt_5_4_mini": "qwen3.6-flash"},
+        },
+    },
+    {
+        "id": "minimax",
+        "name": "MiniMax",
+        "description": "MiniMax OpenAI 兼容接口。",
+        "provider": {
+            "name": "MiniMax",
+            "baseUrl": "https://api.minimaxi.com/v1",
+            "apiFormat": "openai_chat",
+            "authScheme": "bearer",
+            "models": {"default": "MiniMax-M2.7"},
+        },
+    },
+    {
+        "id": "google-ai-studio",
+        "name": "Google AI Studio",
+        "description": "Google Gemini API Key 模式。",
+        "provider": {
+            "name": "Google AI Studio",
+            "baseUrl": "https://generativelanguage.googleapis.com",
+            "apiFormat": "gemini_native",
+            "authScheme": "google_api_key",
+            "models": {"default": "gemini-3.1-flash-lite"},
+            "modelCapabilities": {"gemini-3.1-flash-lite": {"context_window": ONE_M_CONTEXT_WINDOW}},
+        },
+    },
+    {
+        "id": "gemini-cli-oauth",
+        "name": "Gemini CLI OAuth",
+        "description": "使用浏览器登录 Google，不需要 API Key。",
+        "experimental": True,
+        "messages": [
+            {
+                "level": "warning",
+                "text": "使用 Google Cloud Code 内部端点，属于实验性能力；如果不可用，请改用 Google AI Studio。",
+            }
+        ],
+        "provider": {
+            "name": "Gemini CLI",
+            "baseUrl": "https://cloudcode-pa.googleapis.com",
+            "apiFormat": "gemini_cli_oauth",
+            "authScheme": "google_oauth_cloud_code",
+            "models": {"default": "gemini-2.5-flash"},
+        },
+    },
+    {
+        "id": "antigravity-oauth",
+        "name": "Antigravity OAuth",
+        "description": "使用 Antigravity OAuth 身份访问 Cloud Code Assist。",
+        "experimental": True,
+        "baseUrls": [
+            {"label": "daily", "url": "https://daily-cloudcode-pa.googleapis.com"},
+            {"label": "prod", "url": "https://cloudcode-pa.googleapis.com"},
+        ],
+        "messages": [
+            {
+                "level": "warning",
+                "text": "使用 Google 内部端点和 Antigravity 客户端身份，属于实验性能力；Google 可能随时调整协议。",
+            }
+        ],
+        "provider": {
+            "name": "Antigravity",
+            "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
+            "apiFormat": "antigravity_oauth",
+            "authScheme": "google_oauth_antigravity",
+            "models": {
+                "default": "gemini-3-flash-agent",
+                "gpt_5_5": "gemini-3.5-flash-low",
+                "gpt_5_4": "gemini-3.5-flash-extra-low",
+                "gpt_5_4_mini": "gemini-pro-agent",
+                "gpt_5_3_codex": "gemini-3.1-pro-low",
+                "gpt_5_2": "gemini-3-flash-agent",
+            },
+            "modelCapabilities": {
+                "gemini-3-flash-agent": {"context_window": ONE_M_CONTEXT_WINDOW},
+                "gemini-3.5-flash-low": {"context_window": ONE_M_CONTEXT_WINDOW},
+                "gemini-3.5-flash-extra-low": {"context_window": ONE_M_CONTEXT_WINDOW},
+                "gemini-pro-agent": {"context_window": ONE_M_CONTEXT_WINDOW},
+                "gemini-3.1-pro-low": {"context_window": ONE_M_CONTEXT_WINDOW},
+            },
+        },
+    },
+    {
+        "id": "grok-web",
+        "name": "Grok Web",
+        "description": "使用 grok.com Web Cookie。",
+        "experimental": True,
+        "messages": [
+            {"level": "warning", "text": "需要个人 Grok Web Cookie，仅建议本机个人使用。"}
+        ],
+        "provider": {
+            "name": "Grok Web",
+            "baseUrl": "https://grok.com",
+            "apiFormat": "grok_web",
+            "authScheme": "grok_cookie",
+            "models": {"default": "grok-420-computer-use-sa"},
+        },
+    },
+]
 
 _process: subprocess.Popen[str] | None = None
 
@@ -184,6 +361,10 @@ def public_provider(provider: dict[str, Any]) -> dict[str, Any]:
 
 def list_providers() -> list[dict[str, Any]]:
     return [public_provider(provider) for provider in read_config()["providers"]]
+
+
+def list_presets() -> dict[str, Any]:
+    return {"presets": CONFIGBOX_GATEWAY_PRESETS}
 
 
 def provider_index(config: dict[str, Any], provider_id: str) -> int | None:
@@ -574,6 +755,42 @@ def oauth_logout(kind: str) -> dict[str, Any]:
     return oauth_admin_request(oauth_path(kind, "logout"), "DELETE")
 
 
+def antigravity_models() -> dict[str, Any]:
+    try:
+        payload = oauth_admin_request("/__admin/antigravity-oauth/models")
+        if "models" not in payload and isinstance(payload.get("data"), list):
+            payload["models"] = payload["data"]
+        return payload
+    except APIError:
+        return antigravity_models_from_presets()
+
+
+def antigravity_models_from_presets() -> dict[str, Any]:
+    presets = list_presets()["presets"]
+    preset = next(
+        (item for item in presets if isinstance(item, dict) and item.get("id") == "antigravity-oauth"),
+        {},
+    )
+    provider = preset.get("provider") if isinstance(preset.get("provider"), dict) else {}
+    models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
+    ids = list(dict.fromkeys(str(value).strip() for value in models.values() if str(value or "").strip()))
+    entries = [
+        {
+            "id": model_id,
+            "display_name": model_id,
+            "recommended": index == 0,
+            "tag_title": "Default" if index == 0 else "",
+        }
+        for index, model_id in enumerate(ids)
+    ]
+    return {
+        "success": True,
+        "endpoint": "(preset seed: antigravity models)",
+        "models": entries,
+        "suggested": models,
+    }
+
+
 def oauth_path(kind: str, action: str) -> str:
     if kind not in {"gemini", "antigravity"}:
         raise APIError("INVALID_OAUTH_KIND", "Unsupported OAuth provider.", 404)
@@ -632,6 +849,10 @@ def ensure_snapshot() -> None:
     config_doc = read_toml_doc(codex_config_path())
     snapshot = {
         "createdAt": datetime.now(timezone.utc).isoformat(),
+        "runtimeContents": {
+            "auth": codex_auth_path().read_text(encoding="utf-8") if codex_auth_path().exists() else "{}\n",
+            "config": codex_config_path().read_text(encoding="utf-8") if codex_config_path().exists() else "",
+        },
         "auth": {
             key: {"exists": key in auth, "value": auth.get(key)}
             for key in MANAGED_AUTH_KEYS

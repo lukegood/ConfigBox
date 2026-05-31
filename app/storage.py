@@ -16,6 +16,8 @@ from .validators import validate_content, validate_history_entry_name, validate_
 
 
 STATE_PATH = DATA_DIR / "state.json"
+CODEX_GATEWAY_DIR = Path(os.getenv("CODEX_GATEWAY_DIR", str(DATA_DIR / "codex-gateway")))
+CODEX_GATEWAY_SNAPSHOT_PATH = CODEX_GATEWAY_DIR / "codex-snapshot.json"
 
 
 def history_retention() -> int:
@@ -155,6 +157,34 @@ def read_runtime_contents(tool: ToolConfig) -> dict[str, str]:
         file.id: read_text_or_default(file.active_path, default_file_content(file))
         for file in tool.files
     }
+
+
+def runtime_changed_for_profile(tool: ToolConfig, contents: dict[str, str]) -> bool:
+    if tool.id == "codex" and CODEX_GATEWAY_SNAPSHOT_PATH.exists():
+        snapshot_contents = codex_gateway_snapshot_contents(tool)
+        if snapshot_contents is None:
+            return False
+        return contents != snapshot_contents
+    return contents != read_runtime_contents(tool)
+
+
+def codex_gateway_snapshot_contents(tool: ToolConfig) -> dict[str, str] | None:
+    if not CODEX_GATEWAY_SNAPSHOT_PATH.exists():
+        return None
+    try:
+        snapshot = json.loads(CODEX_GATEWAY_SNAPSHOT_PATH.read_text(encoding="utf-8") or "{}")
+    except json.JSONDecodeError:
+        return None
+    raw_contents = snapshot.get("runtimeContents")
+    if not isinstance(raw_contents, dict):
+        return None
+    contents: dict[str, str] = {}
+    for file in tool.files:
+        value = raw_contents.get(file.id)
+        if not isinstance(value, str):
+            return None
+        contents[file.id] = value
+    return contents
 
 
 def sync_profile_to_runtime(tool: ToolConfig, contents: dict[str, str]) -> None:
@@ -317,6 +347,7 @@ def read_profile(tool: ToolConfig, name: str) -> dict:
         for file in tool.files
     ]
     primary = files[0]
+    active = active_profile_name(tool) == name
     return {
         "tool": tool.id,
         "name": name,
@@ -324,6 +355,8 @@ def read_profile(tool: ToolConfig, name: str) -> dict:
         "format": primary["format"],
         "mtime": mtime,
         "files": files,
+        "active": active,
+        "runtimeChanged": active and runtime_changed_for_profile(tool, contents),
     }
 
 
@@ -437,6 +470,25 @@ def activate_profile(tool: ToolConfig, name: str) -> dict:
                 "lastActivatedAt": datetime.now(timezone.utc).isoformat(),
             }
             write_state(state)
+    except Timeout as exc:
+        raise APIError("LOCK_TIMEOUT", "Timed out waiting for the file lock.", 423) from exc
+    return read_profile(tool, name)
+
+
+def import_runtime_to_profile(tool: ToolConfig, name: str) -> dict:
+    ensure_dirs(tool)
+    migrate_legacy_profiles(tool)
+    try:
+        with lock_for(tool):
+            if not profile_exists(tool, name):
+                raise APIError("PROFILE_NOT_FOUND", "Profile not found.", 404)
+            if active_profile_name(tool) != name:
+                raise APIError("PROFILE_NOT_ACTIVE", "Only the active profile can import current config.", 409)
+            runtime_contents = read_runtime_contents(tool)
+            validate_contents(tool, runtime_contents)
+            existing, _ = read_profile_contents(tool, name)
+            create_history_entry(tool, name, "import-runtime", existing)
+            write_profile_files(tool, name, runtime_contents)
     except Timeout as exc:
         raise APIError("LOCK_TIMEOUT", "Timed out waiting for the file lock.", 423) from exc
     return read_profile(tool, name)

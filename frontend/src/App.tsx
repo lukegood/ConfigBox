@@ -29,14 +29,17 @@ import {
   deleteHistory,
   deleteGatewayProvider,
   deleteProfile,
+  getGatewayAntigravityModels,
   getGatewayConfig,
   getGatewayLogs,
   getGatewayOAuthStatus,
+  getGatewayPresets,
   getGatewayStatus,
   getHistory,
   getProfile,
   getTools,
   hasAuth,
+  importRuntimeProfile,
   listHistory,
   listProfiles,
   loginGatewayOAuth,
@@ -53,6 +56,8 @@ import {
 import type {
   ConfigFile,
   GatewayConfig,
+  GatewayModelEntry,
+  GatewayPreset,
   GatewayStatus,
   HistoryDoc,
   HistoryItem,
@@ -69,6 +74,7 @@ const secretDots = "●●●●●●●●●●";
 
 type GatewayProviderForm = {
   id: string;
+  presetId: string;
   name: string;
   baseUrl: string;
   apiKey: string;
@@ -86,6 +92,7 @@ type GatewayProviderForm = {
   grokCfClearance: string;
   grokStatsigId: string;
   grokUserAgent: string;
+  isBuiltin: boolean;
 };
 
 type GatewayCustomMapping = {
@@ -150,6 +157,7 @@ function nextGatewayCustomMappingId() {
 
 const emptyGatewayProviderForm: GatewayProviderForm = {
   id: "",
+  presetId: "",
   name: "",
   baseUrl: "",
   apiKey: "",
@@ -166,7 +174,8 @@ const emptyGatewayProviderForm: GatewayProviderForm = {
   grokCookieString: "",
   grokCfClearance: "",
   grokStatsigId: "",
-  grokUserAgent: ""
+  grokUserAgent: "",
+  isBuiltin: false
 };
 
 const emptyOpenCodeProviderForm: OpenCodeProviderForm = {
@@ -196,6 +205,7 @@ function App() {
   const [savedFiles, setSavedFiles] = useState<ConfigFile[]>([]);
   const [activeFileId, setActiveFileId] = useState("");
   const [mtime, setMtime] = useState<number | null>(null);
+  const [runtimeChanged, setRuntimeChanged] = useState(false);
   const [title, setTitle] = useState("Profile");
   const [status, setStatus] = useState("准备就绪");
   const [error, setError] = useState("");
@@ -205,6 +215,11 @@ function App() {
   });
   const [gatewayConfig, setGatewayConfig] = useState<GatewayConfig | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus | null>(null);
+  const [gatewayPresets, setGatewayPresets] = useState<GatewayPreset[]>([]);
+  const [showGatewayExperimentalPresets, setShowGatewayExperimentalPresets] = useState(() => {
+    return localStorage.getItem("configbox.gateway.showExperimentalPresets") === "1";
+  });
+  const [gatewayModelEntries, setGatewayModelEntries] = useState<GatewayModelEntry[]>([]);
   const [gatewayLogs, setGatewayLogs] = useState<string[]>([]);
   const [gatewayLogBytes, setGatewayLogBytes] = useState({ current: 0, max: 0 });
   const [gatewayProviderForm, setGatewayProviderForm] = useState<GatewayProviderForm | null>(null);
@@ -223,8 +238,19 @@ function App() {
   const activeFile = useMemo(() => files.find((file) => file.id === activeFileId) ?? files[0], [files, activeFileId]);
   const activeContent = activeFile?.content ?? "";
   const openCodeStats = useMemo(() => summarizeOpenCodeConfig(activeContent), [activeContent]);
+  const visibleGatewayPresets = useMemo(
+    () => gatewayPresets.filter((preset) => showGatewayExperimentalPresets || preset.experimental !== true),
+    [gatewayPresets, showGatewayExperimentalPresets]
+  );
+  const selectedGatewayPreset = useMemo(
+    () => gatewayPresets.find((preset) => preset.id === gatewayProviderForm?.presetId) ?? null,
+    [gatewayPresets, gatewayProviderForm?.presetId]
+  );
+  const sortedGatewayModelEntries = useMemo(() => sortGatewayModelEntries(gatewayModelEntries), [gatewayModelEntries]);
   const dirty = filesChanged(files, savedFiles);
   const readonly = mode === "history" || mode === "gateway";
+  const selectedProfileActive = profiles.some((item) => item.name === selectedProfile && item.active);
+  const showRuntimeImport = mode === "profile" && selectedProfileActive && runtimeChanged;
   const showOpenCodeAssistant = toolId === "opencode" && mode === "profile" && activeFile?.format === "json";
   const sensitive = files.some((file) => /api[_-]?key|token|secret|password/i.test(file.content));
   const contentLength = files.reduce((sum, file) => sum + file.content.length, 0);
@@ -240,6 +266,7 @@ function App() {
     setSavedFiles(nextFiles);
     setActiveFileId(nextFiles.some((file) => file.id === preferredFileId) ? preferredFileId : nextFiles[0]?.id ?? "");
     setMtime(doc.mtime);
+    setRuntimeChanged("runtimeChanged" in doc ? Boolean(doc.runtimeChanged) : false);
     setTitle(nextTitle);
     setStatus(nextStatus);
   }
@@ -308,9 +335,15 @@ function App() {
     setLoading(true);
     setError("");
     try {
-      const [config, statusData, logs] = await Promise.all([getGatewayConfig(), getGatewayStatus(), getGatewayLogs()]);
+      const [config, statusData, logs, presets] = await Promise.all([
+        getGatewayConfig(),
+        getGatewayStatus(),
+        getGatewayLogs(),
+        getGatewayPresets()
+      ]);
       setGatewayConfig(config);
       setGatewayStatus(statusData);
+      setGatewayPresets(presets);
       if (!statusData.running) {
         setGatewayRestartRequired(false);
       }
@@ -319,6 +352,7 @@ function App() {
       setMode("gateway");
       setSelectedProfile("");
       setSelectedHistory(null);
+      setRuntimeChanged(false);
       setTitle("Gateway");
       setStatus(statusData.running ? "Gateway 运行中" : "Gateway 未启动");
     } catch (err) {
@@ -451,6 +485,23 @@ function App() {
     }
   }
 
+  async function handleImportRuntimeProfile() {
+    if (mode !== "profile" || !selectedProfile) return;
+    if (dirty && !window.confirm("当前编辑器有未保存修改。继续会用本机配置覆盖当前 Profile。")) return;
+    setLoading(true);
+    setError("");
+    try {
+      const preferredFileId = activeFileId;
+      const imported = await importRuntimeProfile(toolId, selectedProfile);
+      applyDocument(imported, `Profile: ${selectedProfile}`, "已用当前本机配置覆盖 Profile", preferredFileId);
+      await loadLists();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "覆盖 Profile 失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleRestoreHistory() {
     if (!selectedHistory) return;
     const { profileName, name } = selectedHistory;
@@ -574,6 +625,7 @@ function App() {
 
   function openGatewayProviderForm(provider?: GatewayConfig["providers"][number]) {
     setShowGatewayProviderApiKey(false);
+    setGatewayModelEntries([]);
     if (!provider) {
       setGatewayProviderForm({
         ...emptyGatewayProviderForm,
@@ -594,8 +646,10 @@ function App() {
         value
       }));
     const requestOptions = provider.requestOptions || {};
+    const matchedPreset = findGatewayPresetForProvider(gatewayPresets, provider);
     setGatewayProviderForm({
       id: provider.id,
+      presetId: matchedPreset?.id || "",
       name: provider.name,
       baseUrl: provider.baseUrl,
       apiKey: provider.apiKey || "",
@@ -612,12 +666,14 @@ function App() {
       grokCookieString: "",
       grokCfClearance: "",
       grokStatsigId: "",
-      grokUserAgent: ""
+      grokUserAgent: "",
+      isBuiltin: providerIsBuiltin(provider)
     });
     if (provider.apiFormat === "gemini_cli_oauth") {
       void loadGatewayOAuth("gemini");
     } else if (provider.apiFormat === "antigravity_oauth") {
       void loadGatewayOAuth("antigravity");
+      void loadGatewayAntigravityModels();
     }
   }
 
@@ -625,8 +681,14 @@ function App() {
     setGatewayProviderForm((current) => {
       if (!current) return current;
       if (field === "apiFormat") {
+        if (value === "antigravity_oauth") {
+          void loadGatewayAntigravityModels();
+        } else {
+          setGatewayModelEntries([]);
+        }
         return {
           ...current,
+          presetId: "",
           apiFormat: value,
           authScheme: recommendedGatewayAuthScheme(value)
         };
@@ -637,6 +699,53 @@ function App() {
 
   function updateGatewayProviderFlag(field: "webSearchEnabled", value: boolean) {
     setGatewayProviderForm((current) => (current ? { ...current, [field]: value } : current));
+  }
+
+  function toggleGatewayExperimentalPresets(value: boolean) {
+    setShowGatewayExperimentalPresets(value);
+    localStorage.setItem("configbox.gateway.showExperimentalPresets", value ? "1" : "0");
+  }
+
+  function applyGatewayPreset(preset: GatewayPreset) {
+    const provider = preset.provider;
+    const requestOptions = ensurePlainObject(provider.requestOptions);
+    setGatewayProviderForm((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        presetId: preset.id,
+        name: provider.name || current.name,
+        baseUrl: provider.baseUrl || current.baseUrl,
+        authScheme: provider.authScheme || recommendedGatewayAuthScheme(provider.apiFormat),
+        apiFormat: provider.apiFormat || "openai_chat",
+        models: { ...emptyGatewayModels(), ...(provider.models || {}) },
+        customMappings: customMappingsFromPreset(provider.models || {}),
+        extraHeadersJson: formatJson(provider.extraHeaders || {}),
+        modelCapabilitiesJson: formatJson(provider.modelCapabilities || {}),
+        webSearchEnabled: requestOptions.web_search_enabled === true,
+        requestOptionsJson: formatJson(requestOptionsForAdvancedJson(requestOptions)),
+        isBuiltin: true
+      };
+    });
+    setShowGatewayProviderApiKey(false);
+    if (provider.apiFormat === "gemini_cli_oauth") {
+      void loadGatewayOAuth("gemini");
+      setGatewayModelEntries([]);
+    } else if (provider.apiFormat === "antigravity_oauth") {
+      void loadGatewayOAuth("antigravity");
+      void loadGatewayAntigravityModels();
+    } else {
+      setGatewayModelEntries([]);
+    }
+  }
+
+  async function loadGatewayAntigravityModels() {
+    try {
+      const result = await getGatewayAntigravityModels();
+      setGatewayModelEntries(Array.isArray(result.models) ? result.models : []);
+    } catch {
+      setGatewayModelEntries([]);
+    }
   }
 
   function updateGatewayModel(slot: string, value: string) {
@@ -729,7 +838,8 @@ function App() {
         models,
         extraHeaders,
         modelCapabilities,
-        requestOptions
+        requestOptions,
+        isBuiltin: form.isBuiltin
       };
       const grokWeb = collectGrokWebPayload(form);
       if (grokWeb) {
@@ -988,6 +1098,43 @@ function App() {
       bootstrap();
     }
   }, []);
+
+  useEffect(() => {
+    if (!authenticated || mode !== "profile" || !selectedProfile || !selectedProfileActive) return;
+
+    let cancelled = false;
+
+    async function checkRuntimeChange() {
+      try {
+        const doc = await getProfile(toolId, selectedProfile);
+        if (!cancelled) {
+          setRuntimeChanged(Boolean(doc.runtimeChanged));
+        }
+      } catch {
+        // Keep the editor quiet; normal actions surface request errors.
+      }
+    }
+
+    const timer = window.setInterval(checkRuntimeChange, 15000);
+    const handleFocus = () => {
+      void checkRuntimeChange();
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void checkRuntimeChange();
+      }
+    };
+
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [authenticated, mode, selectedProfile, selectedProfileActive, toolId]);
 
   if (!authenticated) {
     return (
@@ -1314,6 +1461,16 @@ function App() {
                 默认密码仍在使用，请修改 APP_PASSWORD。
               </div>
             ) : null}
+            {showRuntimeImport ? (
+              <div className="banner caution runtime-import-banner">
+                <AlertTriangle size={16} />
+                <span>当前本机配置与已启用 Profile 不一致。</span>
+                <button onClick={handleImportRuntimeProfile} disabled={loading} title="用当前本机配置覆盖 Profile">
+                  <RefreshCcw size={15} />
+                  覆盖 Profile
+                </button>
+              </div>
+            ) : null}
             {sensitive ? (
               <div className="banner caution">
                 <AlertTriangle size={16} />
@@ -1395,6 +1552,51 @@ function App() {
                 关闭
               </button>
             </div>
+            <section className="gateway-preset-section">
+              <div className="gateway-mapping-head">
+                <div>
+                  <h4>快捷预设</h4>
+                  <p>ConfigBox 内置模板；选择后会自动填充协议、模型和高级字段。</p>
+                </div>
+                <label className="gateway-inline-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showGatewayExperimentalPresets}
+                    onChange={(event) => toggleGatewayExperimentalPresets(event.target.checked)}
+                  />
+                  显示实验性 provider
+                </label>
+              </div>
+              <div className="gateway-preset-grid">
+                {visibleGatewayPresets.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    className={gatewayProviderForm.presetId === preset.id ? "gateway-preset-card selected" : "gateway-preset-card"}
+                    onClick={() => applyGatewayPreset(preset)}
+                  >
+                    <span>
+                      <strong>{preset.name}</strong>
+                      <small>{preset.description || preset.provider.baseUrl}</small>
+                    </span>
+                    <span className="provider-meta">{apiFormatLabel(preset.provider.apiFormat)}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+            {selectedGatewayPreset?.messages?.length ? (
+              <section className="gateway-preset-messages">
+                {selectedGatewayPreset.messages.map((message, index) => (
+                  <div
+                    className={`gateway-preset-notice ${message.level === "warning" ? "warning" : ""}`}
+                    key={`${message.level || "info"}-${index}`}
+                  >
+                    <AlertTriangle size={15} />
+                    <span>{message.text}</span>
+                  </div>
+                ))}
+              </section>
+            ) : null}
             <div className="provider-form-grid">
               <label>
                 名称
@@ -1411,27 +1613,39 @@ function App() {
                   value={gatewayProviderForm.baseUrl}
                   onChange={(event) => updateGatewayProviderForm("baseUrl", event.target.value)}
                   placeholder="https://api.deepseek.com/v1"
+                  list={selectedGatewayPreset?.baseUrls?.length ? "gateway-baseurl-options" : undefined}
                 />
+                {selectedGatewayPreset?.baseUrls?.length ? (
+                  <datalist id="gateway-baseurl-options">
+                    {selectedGatewayPreset.baseUrls
+                      .filter((option) => option.url)
+                      .map((option) => (
+                        <option key={option.url} value={option.url} label={option.label} />
+                      ))}
+                  </datalist>
+                ) : null}
               </label>
-              <label>
-                API Key
-                <div className="secret-input-wrap">
-                  <input
-                    value={gatewayProviderForm.apiKey}
-                    onChange={(event) => updateGatewayProviderForm("apiKey", event.target.value)}
-                    placeholder={gatewayProviderForm.id ? "留空则保持原 API Key" : "sk-..."}
-                    type={showGatewayProviderApiKey ? "text" : "password"}
-                  />
-                  <button
-                    type="button"
-                    className="secret-toggle input"
-                    onClick={() => setShowGatewayProviderApiKey((current) => !current)}
-                    title={showGatewayProviderApiKey ? "隐藏 Key" : "显示 Key"}
-                  >
-                    {showGatewayProviderApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
-                  </button>
-                </div>
-              </label>
+              {gatewayUsesApiKey(gatewayProviderForm.apiFormat) ? (
+                <label>
+                  API Key
+                  <div className="secret-input-wrap">
+                    <input
+                      value={gatewayProviderForm.apiKey}
+                      onChange={(event) => updateGatewayProviderForm("apiKey", event.target.value)}
+                      placeholder={gatewayProviderForm.id ? "留空则保持原 API Key" : "sk-..."}
+                      type={showGatewayProviderApiKey ? "text" : "password"}
+                    />
+                    <button
+                      type="button"
+                      className="secret-toggle input"
+                      onClick={() => setShowGatewayProviderApiKey((current) => !current)}
+                      title={showGatewayProviderApiKey ? "隐藏 Key" : "显示 Key"}
+                    >
+                      {showGatewayProviderApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                    </button>
+                  </div>
+                </label>
+              ) : null}
               <label>
                 鉴权方式
                 <select
@@ -1440,6 +1654,10 @@ function App() {
                 >
                   <option value="bearer">Bearer</option>
                   <option value="x-api-key">X-Api-Key</option>
+                  <option value="google_api_key">Google API Key</option>
+                  <option value="google_oauth_cloud_code">Google OAuth Cloud Code</option>
+                  <option value="google_oauth_antigravity">Google OAuth Antigravity</option>
+                  <option value="grok_cookie">Grok Cookie</option>
                   <option value="none">None</option>
                 </select>
               </label>
@@ -1585,6 +1803,27 @@ function App() {
                   + 自定义映射
                 </button>
               </div>
+              {sortedGatewayModelEntries.length ? (
+                <div className="gateway-model-picks">
+                  {sortedGatewayModelEntries.slice(0, 8).map((entry) => {
+                    const modelId = gatewayModelEntryId(entry);
+                    return (
+                      <button key={modelId} type="button" onClick={() => updateGatewayModel("default", modelId)}>
+                        <span>{gatewayModelEntryLabel(entry)}</span>
+                        {entry.recommended ? <small>{entry.tag_title || "推荐"}</small> : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+              {sortedGatewayModelEntries.length ? (
+                <datalist id="gateway-model-options">
+                  {sortedGatewayModelEntries.map((entry) => {
+                    const modelId = gatewayModelEntryId(entry);
+                    return <option key={modelId} value={modelId} label={gatewayModelEntryLabel(entry)} />;
+                  })}
+                </datalist>
+              ) : null}
               <div className="gateway-mapping-grid">
                 {gatewayModelSlots.map((slot) => (
                   <label key={slot.key}>
@@ -1593,6 +1832,7 @@ function App() {
                       value={gatewayProviderForm.models[slot.key] || ""}
                       onChange={(event) => updateGatewayModel(slot.key, event.target.value)}
                       placeholder={slot.key === "default" ? "deepseek-chat" : "留空则为 Default"}
+                      list={sortedGatewayModelEntries.length ? "gateway-model-options" : undefined}
                     />
                   </label>
                 ))}
@@ -1975,6 +2215,66 @@ function collectGrokWebPayload(form: GatewayProviderForm) {
   if (form.grokStatsigId.trim()) payload.statsigId = form.grokStatsigId.trim();
   if (form.grokUserAgent.trim()) payload.userAgent = form.grokUserAgent.trim();
   return Object.keys(payload).length ? payload : null;
+}
+
+function gatewayUsesApiKey(apiFormat: string) {
+  return !["gemini_cli_oauth", "antigravity_oauth", "grok_web"].includes(apiFormat);
+}
+
+function customMappingsFromPreset(models: Record<string, string>) {
+  return Object.entries(models)
+    .filter(([key, value]) => !gatewayPredefinedModelKeys.has(key) && Boolean(value))
+    .map(([key, value]) => ({
+      id: nextGatewayCustomMappingId(),
+      key,
+      value
+    }));
+}
+
+function findGatewayPresetForProvider(
+  presets: GatewayPreset[],
+  provider: GatewayConfig["providers"][number]
+) {
+  const providerBaseUrl = normalizeCompareKey(provider.baseUrl);
+  const providerApiFormat = normalizeCompareKey(provider.apiFormat);
+  return presets.find((preset) => {
+    if (providerApiFormat && normalizeCompareKey(preset.provider.apiFormat) !== providerApiFormat) {
+      return false;
+    }
+    const urls = [
+      preset.provider.baseUrl,
+      ...(preset.baseUrls || []).map((option) => option.url)
+    ];
+    return preset.id === provider.id
+      || normalizeCompareKey(preset.provider.name) === normalizeCompareKey(provider.name)
+      || urls.some((url) => normalizeCompareKey(url) === providerBaseUrl);
+  });
+}
+
+function normalizeCompareKey(value: unknown) {
+  return String(value || "").trim().replace(/\/+$/, "").toLowerCase();
+}
+
+function providerIsBuiltin(provider: GatewayConfig["providers"][number]) {
+  return provider.isBuiltin === true;
+}
+
+function gatewayModelEntryId(entry: GatewayModelEntry) {
+  return String(entry.id || entry.model || "").trim();
+}
+
+function gatewayModelEntryLabel(entry: GatewayModelEntry) {
+  return String(entry.display_name || entry.name || entry.id || entry.model || "").trim();
+}
+
+function sortGatewayModelEntries(entries: GatewayModelEntry[]) {
+  return [...entries]
+    .filter((entry) => gatewayModelEntryId(entry))
+    .sort((a, b) => Number(b.recommended === true) - Number(a.recommended === true));
+}
+
+function apiFormatLabel(apiFormat: string) {
+  return gatewayApiFormats.find((format) => format.value === apiFormat)?.label || apiFormat || "OpenAI Chat";
 }
 
 function recommendedGatewayAuthScheme(apiFormat: string) {

@@ -379,13 +379,15 @@ textarea {
   background: var(--caution-bg);
 }
 
-.gateway-restart-banner span {
+.gateway-restart-banner span,
+.runtime-import-banner span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.gateway-restart-banner button {
+.gateway-restart-banner button,
+.runtime-import-banner button {
   flex: 0 0 auto;
   min-height: 30px;
   margin-left: auto;
@@ -685,6 +687,91 @@ textarea {
   margin: 18px 0;
 }
 
+.gateway-preset-section {
+  display: grid;
+  gap: 12px;
+  margin: 18px 0;
+}
+
+.gateway-preset-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  max-height: 220px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.gateway-preset-card {
+  min-height: 62px;
+  justify-content: space-between;
+  text-align: left;
+  padding: 10px 12px;
+}
+
+.gateway-preset-card.selected {
+  background: var(--selected);
+  border-color: var(--selected-border);
+}
+
+.gateway-preset-card span:first-child {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.gateway-preset-card strong,
+.gateway-preset-card small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-preset-card small,
+.provider-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.gateway-inline-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.gateway-inline-toggle input {
+  width: 18px;
+  height: 18px;
+  min-height: 18px;
+  padding: 0;
+}
+
+.gateway-preset-messages {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.gateway-preset-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  color: var(--muted);
+  background: var(--control);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.gateway-preset-notice.warning {
+  color: var(--text);
+  background: var(--warning-bg);
+  border-color: var(--warning-border);
+}
+
 .gateway-mapping-section {
   display: grid;
   gap: 14px;
@@ -741,6 +828,23 @@ textarea {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+}
+
+.gateway-model-picks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.gateway-model-picks button {
+  width: auto;
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.gateway-model-picks small {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .gateway-custom-mappings {
@@ -855,6 +959,7 @@ textarea {
 
   .provider-row,
   .provider-form-grid,
+  .gateway-preset-grid,
   .gateway-mapping-grid,
   .gateway-custom-mapping-row,
   .opencode-helper {

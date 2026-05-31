@@ -9,7 +9,9 @@
 //!   `seed` / `stop` / `parallel_tool_calls` / `frequency_penalty` /
 //!   `presence_penalty` / `user`
 //! - input items:`message`(role + content)/ `function_call` /
-//!   `function_call_output` / `input_image` / `input_file` / `input_audio` /
+//!   `function_call_output` / `tool_search_call`(→ assistant `tool_calls`
+//!   name="tool_search")/ `tool_search_output`(→ role:tool result + 注入
+//!   chat `tools[]`)/ `input_image` / `input_file` / `input_audio` /
 //!   `input_video`
 //! - tools:`type=function` 与 `type=custom`(custom 降级为接受单字符串
 //!   `input` 的 function)
@@ -163,10 +165,18 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
                 tools.iter().collect()
             };
 
-        let chat_tools: Vec<Value> = filtered_tools
+        let mut chat_tools: Vec<Value> = filtered_tools
             .iter()
             .flat_map(|t| convert_responses_tool_to_chat_tool(t, provider))
             .collect();
+        // 实验 exp/resources-to-tool-search:注入 tool_search 发现的工具。Codex
+        // 0.130+ 把 MCP 工具 defer 到 tool_search,发现的具体工具只在 input[] 的
+        // tool_search_output.tools 里,不在 body.tools[]。不注入则 LLM 看不到 →
+        // 无法调用 → 只能循环调 tool_search。展平复用 namespace 同一路径。
+        for discovered in discovered_tools_from_tool_search_output(input) {
+            chat_tools.extend(convert_responses_tool_to_chat_tool(&discovered, provider));
+        }
+        dedup_chat_tools_by_name(&mut chat_tools);
         if !chat_tools.is_empty() {
             // **Kimi `$web_search` 强制 thinking disabled**:Kimi 官方文档
             // (`platform.kimi.ai/docs/guide/use-web-search`)明确写
@@ -199,10 +209,14 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         }
     }
 
-    // reasoning → reasoning_effort
-    if let Some(reasoning_effort) = body.get("reasoning").and_then(build_reasoning_effort) {
-        result.insert("reasoning_effort".into(), reasoning_effort);
-    }
+    // reasoning → upstream effort/budget(按 provider 走 reasoning_effort_policy)
+    //
+    // 改前(v2.1.14 及更早):全 chat 上游共用 `normalize_chat_reasoning_effort`
+    // 把 xhigh/max 砍到 high — 对 DeepSeek 致命(issue #254:max 档不可达),
+    // 对 Kimi/GLM/MiMo/MiniMax/Qwen 也只是塞它们不认的字段。
+    // 改后:按 provider 查 [`codex_app_transfer_registry::reasoning_effort_wire`],
+    // DeepSeek 走 high/max 二档、其他 chat 上游 Drop、自定义 fallback 走 OpenAI enum。
+    apply_codex_reasoning_effort_for_provider(&mut result, body, provider);
 
     // max_output_tokens → max_tokens
     if let Some(v) = body.get("max_output_tokens") {
@@ -543,6 +557,96 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
                 "content": output_str,
             })]
         }
+        "tool_search_call" => {
+            // 实验 exp/resources-to-tool-search:input history 里 Codex 回放的
+            // `ResponseItem::ToolSearchCall { call_id, execution, arguments }`
+            // (codex `protocol/src/models.rs:792`)。这是 assistant 侧的工具调用
+            // (converter.rs 把 LLM 的 tool_search / redirect 来的 list_mcp_resources
+            // 改写成的 tool_search_call wire,Codex 执行后回放)。**必须**转成 chat
+            // `assistant.tool_calls`(name="tool_search"),与下面 tool_search_output
+            // 转的 `role:tool` message 配对 —— 否则 tool message 成孤儿,
+            // repair_tool_call_ids 补空 name tool_call → 上游 400
+            // (`messages[N].tool_calls[0] is missing a function name`)。
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_owned();
+            // arguments 在 Responses 是 JSON Value(object,如 {"query":"notion"});
+            // chat function.arguments 要 JSON **字符串**。
+            let arguments_str = match item.get("arguments") {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => serde_json::to_string(other).unwrap_or_else(|_| {
+                    // 加固(MOC-48 observability):serialize 失败 fallback 到空对象会
+                    // 静默丢掉 query,LLM 的 tool_search 调用变成无参 no-op。warn 让这种
+                    // 极少见的 schema drift 可观测(Value→string 正常不会失败)。
+                    tracing::warn!(
+                        target: "adapters::tool_search",
+                        "tool_search_call arguments failed to serialize; falling back to empty object — query lost (likely Codex schema drift)",
+                    );
+                    "{}".to_owned()
+                }),
+                None => "{}".to_owned(),
+            };
+            let arguments = sanitize_tool_arguments_json_string(&arguments_str);
+            vec![json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": if call_id.is_empty() { "call_unknown".to_owned() } else { call_id },
+                    "type": "function",
+                    "function": { "name": "tool_search", "arguments": arguments },
+                }],
+            })]
+        }
+        "tool_search_output" => {
+            // 实验 exp/resources-to-tool-search:Codex 0.130+ 把 LLM 调的
+            // tool_search 路由到本地 BM25,返 `ResponseItem::ToolSearchOutput
+            // { call_id, status, execution, tools }`(codex `protocol/src/models.rs:839`)
+            // 进下轮 input。**结构是 `tools` 字段,不是 `content`/`output`**,所以
+            // 之前落默认 arm(无 content)被静默丢弃 → repair_tool_call_ids 补
+            // "[Tool execution skipped... unknown_]" 误导占位 → LLM 以为工具失败
+            // 死循环调 tool_search。
+            //
+            // 发现的具体工具走 `discovered_tools_from_tool_search_output` 注入
+            // chat `tools[]`(LLM 才真正可调)。这里把 item 转成 role:tool message
+            // 给 call_id 一个**真实** result 消除 repair 占位,content 列出工具名
+            // 提示 LLM 可直接调用。
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("tool_call_id").and_then(|v| v.as_str()))
+                .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_owned();
+            // 加固(silent-failure review):call_id 缺失 → 下面 emit 的 role:tool
+            // message 成孤儿(repair_tool_call_ids 静默 drop)→ 静默重现本 PR 修的
+            // "工具静默消失" bug 类。tool_search_call / tool_search_output 本应按
+            // call_id 配对,缺失通常是 Codex schema drift,warn 让它可观测(发现的
+            // 工具映射仍经 tools[] 注入生效,只是这条 output 配不上 pair)。
+            if call_id.is_empty() {
+                tracing::warn!(
+                    target: "adapters::tool_search",
+                    "tool_search_output missing call_id; role:tool message will be orphaned and dropped by repair_tool_call_ids — likely Codex schema drift",
+                );
+            }
+            let names = extract_tool_search_output_tool_names(item);
+            let content = if names.is_empty() {
+                "tool_search returned no matching tools.".to_owned()
+            } else {
+                format!(
+                    "tool_search discovered {} tool(s), now available to call directly: {}",
+                    names.len(),
+                    names.join(", ")
+                )
+            };
+            vec![json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": content,
+            })]
+        }
         "custom_tool_call" => {
             // Codex CLI 把 freeform apply_patch 的回放 wire 包成
             // `ResponseItem::CustomToolCall { name, input, call_id, ... }`
@@ -705,6 +809,91 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
             }
         }
     }
+}
+
+/// 实验 exp/resources-to-tool-search:从 input[] 的 `tool_search_output` items
+/// 收集 Codex 发现的工具(namespace/function 结构)。Codex 0.130+ 把 MCP 工具
+/// defer 到 tool_search,发现的工具只出现在 tool_search_output.tools,**不在**
+/// body.tools[];不注入 chat tools[] 则 LLM 永远看不到 → 无法调用。
+fn discovered_tools_from_tool_search_output(input: &Value) -> Vec<Value> {
+    let Some(items) = input.get("input").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let outputs: Vec<&Value> = items
+        .iter()
+        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_search_output"))
+        .collect();
+    let discovered: Vec<Value> = outputs
+        .iter()
+        .filter_map(|item| item.get("tools").and_then(|t| t.as_array()))
+        .flatten()
+        .cloned()
+        .collect();
+    // 加固(MOC-48 observability):有 tool_search_output item 却收集到 0 个工具,
+    // 通常是 Codex schema drift(tools 字段改名/类型变)—— 不注入则 LLM 看不到工具
+    // 只能循环调 tool_search,无日志难定位。普通请求(无 tool_search_output)不打
+    // 日志避免噪音;count log 让 input malformed / 真无发现可区分。
+    if !outputs.is_empty() {
+        tracing::debug!(
+            target: "adapters::tool_search",
+            tool_search_output_items = outputs.len(),
+            discovered_tools = discovered.len(),
+            "collected discovered tools from tool_search_output for chat tools[] injection",
+        );
+    }
+    discovered
+}
+
+/// 按 `function.name` 去重 chat tools(保留首次出现 — body.tools[] builtin 在
+/// 发现工具之前 extend,故 builtin 优先)。空 name 不参与去重(全保留)。
+fn dedup_chat_tools_by_name(tools: &mut Vec<Value>) {
+    let mut seen = std::collections::HashSet::new();
+    tools.retain(|t| {
+        let name = t
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        if name.is_empty() {
+            return true;
+        }
+        seen.insert(name.to_owned())
+    });
+}
+
+/// 提取 tool_search_output.tools 里所有具体工具名(namespace 包展开内层
+/// function.name;顶级 function 直接取 name)。用于 role:tool message content。
+fn extract_tool_search_output_tool_names(item: &serde_json::Map<String, Value>) -> Vec<String> {
+    let Some(tools) = item.get("tools").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for tool in tools {
+        if tool.get("type").and_then(|t| t.as_str()) == Some("namespace") {
+            if let Some(inner) = tool.get("tools").and_then(|v| v.as_array()) {
+                for f in inner {
+                    if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                        names.push(n.to_owned());
+                    }
+                }
+            }
+        } else if let Some(n) = tool.get("name").and_then(|v| v.as_str()) {
+            names.push(n.to_owned());
+        }
+    }
+    // 加固(MOC-48 observability):无 inner tools 的 namespace 包 / 非 namespace entry
+    // 被静默跳过。tools 非空但 names 为空,通常是 Codex 0.131+ schema drift(包结构变 /
+    // name 字段改名)→ role:tool content 退化成 "no matching tools" 误导 LLM。
+    // debug log tools.len vs names.len 让 drift 可观测。
+    if !tools.is_empty() {
+        tracing::debug!(
+            target: "adapters::tool_search",
+            input_tools = tools.len(),
+            extracted_names = names.len(),
+            "extracted tool names from tool_search_output",
+        );
+    }
+    names
 }
 
 pub(crate) fn normalize_tool_output_for_context(
@@ -2190,34 +2379,69 @@ fn provider_supports_json_schema_response_format(provider: Option<&Provider>) ->
         .any(|needle| provider_looks_like(p, needle))
 }
 
-fn build_reasoning_effort(reasoning: &Value) -> Option<Value> {
-    match reasoning {
-        Value::String(s) => normalize_chat_reasoning_effort(s),
-        Value::Object(obj) => {
-            if let Some(effort) = obj.get("effort") {
-                if let Some(effort) = effort.as_str() {
-                    return normalize_chat_reasoning_effort(effort);
-                }
-                return Some(effort.clone());
-            }
-            if obj.contains_key("summary") {
-                return Some(reasoning.clone());
-            }
-            Some(reasoning.clone())
+/// 从 Codex `reasoning` 字段抽出 effort 字符串.
+///
+/// Codex 协议两种形态都接受:
+/// - `"reasoning": "high"`(legacy 字符串)
+/// - `"reasoning": {"effort": "high", "summary": "..."}`(标准对象)
+///
+/// 抽出后已做 trim + lowercase,empty 返回 None。其他字段(summary 等)在
+/// chat 协议里无对应,丢弃。
+///
+/// 非预期 JSON 形态(Array / Bool / Number 等)走 `warn` log 后 drop —
+/// 这通常是 Codex 协议变更或调用方协议错误,需告警以便 debug。
+fn extract_codex_effort(reasoning: Option<&Value>) -> Option<String> {
+    let reasoning = reasoning?;
+    let raw = match reasoning {
+        Value::String(s) => s.as_str(),
+        Value::Object(obj) => obj.get("effort").and_then(|v| v.as_str())?,
+        Value::Null => return None,
+        other => {
+            tracing::warn!(
+                target: "adapters::responses::request",
+                reasoning_kind = ?other,
+                "unexpected reasoning field shape in codex request; dropping effort (possible protocol change)"
+            );
+            return None;
         }
-        Value::Null => None,
-        other => Some(other.clone()),
-    }
+    };
+    let trimmed = raw.trim().to_ascii_lowercase();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
-fn normalize_chat_reasoning_effort(effort: &str) -> Option<Value> {
-    match effort.trim().to_ascii_lowercase().as_str() {
-        "minimal" | "low" | "medium" | "high" => {
-            Some(Value::String(effort.trim().to_ascii_lowercase()))
+/// 按 provider 把 Codex reasoning.effort 写进 chat body.
+///
+/// `provider == Some` 时走 [`codex_app_transfer_registry::apply_reasoning_effort`]
+/// 的 per-provider 注册表;`provider == None` 时走 OpenAI 标准 enum 保守 fallback,
+/// 并发出 `debug` log 标注路径(生产代码应始终有 provider 上下文,None 是
+/// 测试 / 早期协议解析旁路场景,意外走 None 会让 effort 被砍回 OpenAI 上限 high
+/// — 即 issue #254 同款症状,debug log 让 troubleshooting 有线索)。
+fn apply_codex_reasoning_effort_for_provider(
+    body: &mut Map<String, Value>,
+    src: &Map<String, Value>,
+    provider: Option<&Provider>,
+) {
+    let Some(effort) = extract_codex_effort(src.get("reasoning")) else {
+        return;
+    };
+    match provider {
+        Some(p) => {
+            codex_app_transfer_registry::apply_reasoning_effort(body, p, &effort);
         }
-        "xhigh" | "max" | "highest" => Some(Value::String("high".into())),
-        "none" | "off" | "auto" | "" => None,
-        _ => None,
+        None => {
+            tracing::debug!(
+                target: "adapters::responses::request",
+                codex_effort = %effort,
+                "no provider context; falling back to OpenAI enum reasoning_effort (test / bypass path)"
+            );
+            // 用空 id 复用同一个 wire enum 路径,保持行为跟"未知自定义 provider"完全一致 +
+            // 自带未知 effort 的 warn log,DRY 避免双份映射表
+            codex_app_transfer_registry::ReasoningEffortWire::OpenAIEnum.apply(
+                body,
+                &effort,
+                "<no-provider>",
+            );
+        }
     }
 }
 
@@ -2299,8 +2523,8 @@ use tools::{
     APPLY_PATCH_TOOL_NAME,
 };
 
-/// chat-path 实战指引,作为独立 `role:"system"` 注入,仅在该 turn 的 tools
-/// 数组里注册了 `apply_patch` 时启用。理由参见 issue #235 真机稳定性测试。
+/// chat-path 实战指引(英文版),作为独立 `role:"system"` 注入,仅在该 turn 的
+/// tools 数组里注册了 `apply_patch` 时启用。理由参见 issue #235 真机稳定性测试。
 ///
 /// **本版本(round 4 capture 实证根因修复)** :
 /// 旧版第 1 条"Use an EMPTY LINE as the `@@` anchor"是事实错误 — 上游
@@ -2313,7 +2537,13 @@ use tools::{
 ///   2. 显式说明 `@@` 单端语法 + 给出 `@@ class X` / `@@ def f():` 示例
 ///   3. 加 Add File 必须每行 `+` 前缀的强调
 ///   4. 加 "If Update repeatedly fails, fall back to Delete + Add File" 兜底
-const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE: &str = concat!(
+///
+/// **i18n**(#262):中文 user 输入 → 注入英文 system 易让模型中英混杂思考。
+/// 提供 [`APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH`] 中文翻译;V4A 关键字
+/// (`*** Begin Patch` / `@@ <header>` / `-line` / `+line` 等)+ 错误消息原文
+/// (`Failed to find context '...'` 等)+ shell 命令例子保英文,因 Codex CLI
+/// V4A parser / error matcher 接收的就是英文字面。
+const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
     "[apply_patch chat-path guidance — injected by codex-app-transfer adapter because the upstream lark grammar constraint is unavailable on chat function-call providers]\n",
     "\n",
     "**ALWAYS use the `apply_patch` tool to write file content** — new files, single-line edits, and full-file rewrites alike. **NEVER use shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / any `>` redirect to write actual file content** — doing so bypasses the Codex diff UI and audit trail. (The narrow exception in rule 5 below — `printf '\\n' > <path>` to seed an empty file before `*** Update File:` — is an apply_patch preparation step, not a content bypass.) For full-file rewrites or large changes where almost every line differs, use `*** Delete File: <path>` followed by `*** Add File: <path>` (every line of the new content prefixed with `+`) inside the same patch — this is more concise than a long `-`/`+` diff and is the correct apply_patch idiom for large rewrites.\n",
@@ -2351,10 +2581,74 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE: &str = concat!(
     "Following these rules avoids retry storms and improves the success rate on first attempt."
 );
 
+/// 中文版 apply_patch chat-path 指引(#262)。
+///
+/// **翻译原则**:
+/// - V4A 关键字保英文:`*** Begin Patch` / `*** Update File:` / `*** Add File:` /
+///   `*** Delete File:` / `*** Move to:` / `*** End of File` / `@@ <header>` /
+///   `-line` / `+line` / ` line`(context)— Codex CLI V4A parser 只认英文字面
+/// - 错误消息保英文:`Failed to find context '...'` / `is not a valid hunk header` /
+///   `invalid patch: The first line of the patch must be '*** Begin Patch'` /
+///   `Update file hunk for path '...' is empty` — Codex CLI 抛出的就是英文,
+///   翻成中文会让 user / 模型 grep 错错误信息
+/// - shell 命令例子保英文:`cat`, `sed`, `printf`, `echo` 等命令名,文件路径
+///   例子(`src/config.py` / `<path>`)
+/// - 程序员日常英文术语保英文:`apply_patch` / `tool` / `shell` / `hunk` /
+///   `context` / `patch` / `function` 等(混入中文反而不自然)
+/// - 强调词译:**ALWAYS** → **务必**;**NEVER** → **绝不**;**MUST** → **必须**;
+///   PREFERRED → 推荐;SINGLE-SIDED → 单端;DEEPLY NESTED → 深层嵌套
+/// - 跟英文版**逐条对应**(9 条规则 + 引言段),不简化不漏 emphasis
+const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH: &str = concat!(
+    "[apply_patch chat-path 指引 — 由 codex-app-transfer adapter 注入,因为上游 lark 语法约束在 chat function-call provider 上不可用]\n",
+    "\n",
+    "**务必使用 `apply_patch` tool 写文件内容** —— 新建文件、单行编辑、整文件重写都一样。**绝不使用 shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / 任何 `>` 重定向来写实际文件内容** —— 这样做会绕过 Codex diff UI 和审计 trail。(下面规则 5 提到的窄例外 — `printf '\\n' > <path>` 在 `*** Update File:` 之前播种空文件 — 是 apply_patch 的预处理步骤,不是内容旁路。)对于整文件重写或几乎每行都不同的大改动,在同一 patch 内用 `*** Delete File: <path>` 加上 `*** Add File: <path>`(新内容每行前缀 `+`)—— 这比长 `-`/`+` diff 更精简,是大重写的正确 apply_patch 用法。\n",
+    "\n",
+    "调用 `apply_patch` tool 时,遵循以下基于非 OpenAI chat provider 实战观察总结的规则:\n",
+    "\n",
+    "1. 推荐的 Update File 形式是**最简形态**:仅 `-line`(要删的行,byte-exact)和 `+line`(新行)直接跟在 `*** Update File: <path>` 之后 —— 无 `@@`、无 context 行。",
+    "凡是 `-` 行在文件里**唯一**时(简单单行编辑、配置改动、function 签名等绝大多数场景皆是)就用这个形态。例:\n",
+    "  *** Update File: src/config.py\n",
+    "  -DEBUG = False\n",
+    "  +DEBUG = True\n",
+    "若 `-` 行单独**有歧义**(同一行文本在文件多处出现),在上方/下方加空格前缀的 context 行(` line`)钉住它。",
+    "若 context 行也不足以消歧,再在独立行上加**单端** `@@ <header>` 标记(`@@ class Foo`、`@@ def bar():`、`@@ fn main() {`)。",
+    "**绝不加尾随 `@@`**(`@@ <header> @@` 是错的)—— Codex Desktop 的 V4A applier 会把尾随 `@@` 当字面文本,报 `Failed to find context '... @@'`。",
+    "深层嵌套消歧时用**多个** `@@` 行各占一行(例如 `@@ class Outer\\n@@ def inner():`),每条都是单端。\n",
+    "\n",
+    "2. Add File **不用** `@@` 标记、**不用** hunk。`*** Add File: <path>` 之后,新文件**每一行**(包括空行,写成单个 `+` 占一行)都前缀 `+`。没 `+` 前缀的原始源码(例如直接写 `def main():`)会触发 `'def main():' is not a valid hunk header` 错误。\n",
+    "\n",
+    "3. 每个 `-` 行和空格前缀的 context 行**必须**跟文件 byte-for-byte 一致(同样的前导 whitespace,不能 trim 尾随空格,字符完全相同)。不确定时先用 shell 跑 `cat <path>` 或 `sed -n '1,80p' <path>` 查一下,再用真实字节组 patch。靠猜会触发 `Failed to find context '<your guess>'` 错误。\n",
+    "\n",
+    "3a. 行前缀是**单字符**,前缀和内容之间**没有空格**:写 `-DEBUG = False`(不是 `- DEBUG = False`)、`+DEBUG = True`(不是 `+ DEBUG = True`),context 行 ` keepme`(单个前导空格)。Codex Desktop V4A applier 可能容忍多余空格,但其它 apply_patch 实现严格 —— 前缀写紧凑。\n",
+    "\n",
+    "4. **不要**在同一 patch 内对同一路径同时用 `*** Add File: <path>` 和 `*** Update File: <path>`。Update 步骤会在 Add 步骤落盘前读文件,看到空文件后失败。要么 (a) 让 `*** Add File:` 一次性写最终内容,要么 (b) 拆成两个独立的 `apply_patch` 调用。\n",
+    "\n",
+    "5. `*** Update File:` **不能**作用于完全空的文件。目标为空时先用 shell(例如 `printf '\\n' > <path>`)写至少一行,再调 `apply_patch`。\n",
+    "\n",
+    "6. 多行文件里,**没有**对应 `-` 行的孤立 `+` 行会**追加**在上文 context 之下 —— **不会**替换任何已有行。要修改已有行,**必须**同时包含 `-` 行(删旧内容)和 `+` 行(加新内容)。\n",
+    "\n",
+    "7. 同一目标上多次 Update File 都报 `Failed to find context` 错误时,fallback 到同一 patch 内的 Delete File + Add File 组合(语义上等价于整文件重写,绕开 anchor 匹配的脆弱性)。\n",
+    "\n",
+    "8. `*** Begin Patch` **必须**是 `input` 字符串的字面第一行 —— 不能有前导空格,前面不能有其它内容,绝不能直接写 `*** Add File:` 或任何操作 header。漏了会触发 `invalid patch: The first line of the patch must be '*** Begin Patch'`。\n",
+    "\n",
+    "9. `*** Update File: <old>` + `*** Move to: <new>` **要求**至少一个 hunk(带 `-`/`+` 行或 `*** End of File` 标记)。空的 Update+Move 块会报 `Update file hunk for path '<old>' is empty`。**纯重命名不改内容**时,在同一 patch 内用 `*** Delete File: <old>` + `*** Add File: <new>`(把原内容每行前缀 `+` 复制过去)。**重命名同时改内容**时,保留 Update+Move 并写真实的 `-`/`+` hunk。\n",
+    "\n",
+    "遵循这些规则可以避免 retry 风暴,提升首次尝试的成功率。"
+);
+
+/// 按当前 user 语言偏好选 apply_patch chat-path 指引。
+fn apply_patch_chat_path_guidance_for_current_language() -> &'static str {
+    use crate::core::language::{current_language, Language};
+    match current_language() {
+        Language::Chinese => APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH,
+        Language::English => APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN,
+    }
+}
+
 /// 检测 Responses request body 的 tools 数组是否注册了 `apply_patch` 工具。
 /// `apply_patch` 在 Responses 协议里以 `type:"custom", name:"apply_patch"` 出现,
 /// 在被 [`convert_responses_tool_to_chat_tool`] 降级前。
-/// 用于决定本 turn 是否注入 [`APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE`]。
+/// 用于决定本 turn 是否注入 [`apply_patch_chat_path_guidance_for_current_language`] 的产物。
 fn tools_register_apply_patch(body: &Value) -> bool {
     let Some(tools) = body.get("tools").and_then(Value::as_array) else {
         return false;
@@ -2368,6 +2662,6 @@ fn tools_register_apply_patch(body: &Value) -> bool {
 fn apply_patch_chat_guidance_message() -> Value {
     json!({
         "role": "system",
-        "content": APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE,
+        "content": apply_patch_chat_path_guidance_for_current_language(),
     })
 }

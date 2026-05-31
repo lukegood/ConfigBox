@@ -1,6 +1,8 @@
 import type {
   ConfigFile,
   GatewayConfig,
+  GatewayModelEntry,
+  GatewayPreset,
   GatewayProvider,
   GatewayStatus,
   OAuthStatus,
@@ -101,6 +103,10 @@ export async function activateProfile(tool: string, name: string) {
   return request<ProfileDoc>(`/api/profiles/${tool}/${name}/activate`, { method: "POST" });
 }
 
+export async function importRuntimeProfile(tool: string, name: string) {
+  return request<ProfileDoc>(`/api/profiles/${tool}/${name}/import-runtime`, { method: "POST" });
+}
+
 export async function listHistory(tool: string) {
   return request<HistoryItem[]>(`/api/history/${tool}`);
 }
@@ -145,6 +151,11 @@ export async function getGatewayLogs() {
   return request<{ lines: string[]; logDir: string; currentBytes: number; maxBytes: number }>("/api/gateway/logs");
 }
 
+export async function getGatewayPresets() {
+  const data = await request<{ presets: GatewayPreset[] }>("/api/gateway/presets");
+  return data.presets || [];
+}
+
 export async function clearGatewayLogs() {
   return request<{ ok: boolean; removed: number }>("/api/gateway/logs/clear", { method: "POST" });
 }
@@ -181,4 +192,13 @@ export async function loginGatewayOAuth(kind: "gemini" | "antigravity") {
 
 export async function logoutGatewayOAuth(kind: "gemini" | "antigravity") {
   return request<OAuthStatus>(`/api/gateway/oauth/${kind}/logout`, { method: "DELETE" });
+}
+
+export async function getGatewayAntigravityModels() {
+  return request<{
+    success?: boolean;
+    endpoint?: string;
+    models?: GatewayModelEntry[];
+    suggested?: Record<string, string>;
+  }>("/api/gateway/oauth/antigravity/models");
 }

@@ -355,12 +355,19 @@ pub async fn forward_handler(
     telemetry
         .logs
         .add("INFO", format!("forwarding → {upstream_url}"));
-    if let Some(upstream_model) = body_model(&plan.body) {
-        let mapped = resolved_model.as_deref().unwrap_or(&upstream_model);
+    let upstream_model = body_model(&plan.body);
+    if let Some(upstream_model) = &upstream_model {
+        let mapped = resolved_model.as_deref().unwrap_or(upstream_model);
         telemetry
             .logs
             .add("INFO", format!("model: {mapped} → {upstream_model}"));
     }
+    // [#304] 本地记录 session → 真实上游模型,供 Usage 页显示真实模型而非 Codex
+    // 客户端占位名。只落本地 jsonl,**不进 Codex rollout / 不影响对话**;forward-only。
+    // 用 `resolved_model`(rewrite/strip 后、adapter 重定位前的 body model)而非
+    // `upstream_model`(adapter 后的 plan.body):gemini_native 等把 model 挪进 URL 的
+    // adapter,plan.body 已无 model 字段,只有 resolved_model 仍持有真实上游模型。
+    record_session_upstream_model(&parts.headers, resolved_model.as_deref());
 
     // 6/7. 构造 reqwest 请求 + 发送(抽到 `build_and_send_upstream`,
     // transparent retry 复用)。
@@ -658,7 +665,33 @@ fn build_upstream_url(upstream_base: &str, upstream_path: &str) -> String {
     } else {
         format!("/{}", upstream_path)
     };
-    format!("{}{}", upstream_base.trim_end_matches('/'), path)
+    let base = upstream_base.trim_end_matches('/');
+    // 容错:用户把完整 endpoint(如 `…/v1/chat/completions`、`…/v1/messages`、
+    // `…/responses`)整段填进 base_url 时,adapter 仍会按协议拼标准 endpoint,
+    // 拼成 `…/chat/completions/chat/completions` 等 → 上游 404
+    // (反馈 fb-3093a382:误把 opencode zen 完整地址填进 baseUrl,MOC-72)。
+    // 做法:取 path 在 `/` 段边界上、同时也是 base 末尾的最长前缀作为"重叠段"去掉再拼。
+    // 既覆盖 create 路径(base 末尾 `/responses` + path `/responses`),也覆盖子路径
+    // (base 末尾 `/responses` + path `/responses/{id}/cancel` → `…/responses/{id}/cancel`,
+    // 不翻倍);query 原样保留。非破坏性:base 不含 endpoint 时 overlap=0,按原样拼。
+    let (path_no_query, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path.as_str(), None),
+    };
+    let mut overlap = 0usize;
+    let mut acc = String::new();
+    for seg in path_no_query.split('/').skip(1) {
+        acc.push('/');
+        acc.push_str(seg);
+        if base.ends_with(&acc) {
+            overlap = acc.len();
+        }
+    }
+    let rest = &path_no_query[overlap..];
+    match query {
+        Some(q) => format!("{base}{rest}?{q}"),
+        None => format!("{base}{rest}"),
+    }
 }
 
 /// 构造 reqwest 上游请求 + 发送,返回 `(Response, 出站 headers 快照)`。
@@ -780,13 +813,14 @@ async fn build_and_send_upstream(
             );
         }
         crate::resolver::AuthScheme::GoogleOauthAntigravity => {
-            // chat path 用短 UA 形式(不带 google-api-nodejs-client 后缀)。
-            // **不发 X-Goog-Api-Client** —— 实证 CLIProxyAPI `antigravity_executor.go`
-            // `buildRequest` (line 1987-1997) chat 路径只 set Authorization +
-            // User-Agent + Content-Type;`X-Goog-Api-Client` 仅 loadCodeAssist
-            // (line 1817) 跟 onboardUser (auth.go:288) 发。chat 多发会让上游
-            // 识别成"非 canonical client" → stricter rate limit / 429
-            // (2026-05-11 实测 429 修)
+            // **2026-05-29 本机 mitmproxy 抓包实证(Antigravity IDE 2.0.10)**:
+            // 对 cloudcode-pa 的所有请求(chat `streamGenerateContent` + 控制面
+            // `loadCodeAssist`/`fetchAvailableModels`)统一用 UA
+            // `antigravity/hub/<ver> <plat>/<arch>`,且**都不发** `X-Goog-Api-Client`
+            // (只 Authorization + User-Agent + Content-Type + Accept-Encoding)。
+            // 这推翻了之前基于 CLIProxyAPI 的"控制面才发 x-goog / 控制面用 nodejs-client
+            // 长 UA"假设。chat 多发 x-goog 会被上游识别成"非 canonical client" →
+            // stricter rate limit / 429。见 memory `reference_antigravity_wire_fingerprint`。
             up = up.header(
                 "User-Agent",
                 codex_app_transfer_gemini_oauth::antigravity_user_agent_chat(),
@@ -877,6 +911,42 @@ fn is_web_search_upstream_reject(body_bytes: &[u8]) -> bool {
         || lower.contains("not activated")
         || lower.contains("disabled");
     mentions_web_search && mentions_not_available
+}
+
+/// [#304] 本地记录 `session_id → 真实上游模型` 到 `~/.codex-app-transfer/session-models.jsonl`。
+/// Codex 入站带 `x-session-id` / `session_id` 头(= rollout session uuid),配上 adapter
+/// 解析后的真实上游模型,Usage 页据此显示真实模型而非客户端占位名(gpt-5.x)。
+///
+/// **只本地落 jsonl,不写 Codex rollout、不改回包,故不进对话 / 不影响对话。**
+/// best-effort:缺 session 头 / 模型 / 写失败均静默跳过,绝不阻塞转发。forward-only(历史
+/// 对话无记录,Usage 页对其仍显示 rollout 里的客户端模型名)。每请求 append 一行,读侧取
+/// 每 session 最后一条;文件增长可后续 compact(followup)。
+fn record_session_upstream_model(headers: &HeaderMap, upstream_model: Option<&str>) {
+    use std::io::Write;
+    let Some(model) = upstream_model.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let session_id = headers
+        .get("x-session-id")
+        .or_else(|| headers.get("session_id"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(session_id) = session_id else {
+        return;
+    };
+    let Some(dir) = codex_app_transfer_registry::config_dir() else {
+        return;
+    };
+    let path = dir.join("session-models.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let line = serde_json::json!({ "id": session_id, "model": model }).to_string();
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 fn log_upstream_error_diag(
@@ -1645,5 +1715,73 @@ mod tests {
         // 上游返回非 UTF-8 时不 panic,认为不匹配
         let body: &[u8] = &[0xff, 0xfe, 0xfd, 0x00];
         assert!(!is_web_search_upstream_reject(body));
+    }
+
+    #[test]
+    fn build_upstream_url_dedups_endpoint_suffix_in_base() {
+        // 正常路径:base 不含 endpoint → 照常拼(回归保护)
+        assert_eq!(
+            build_upstream_url("https://api.moonshot.cn/v1", "/chat/completions"),
+            "https://api.moonshot.cn/v1/chat/completions"
+        );
+        // base 误填完整 chat endpoint(反馈 fb-3093a382:opencode zen)→ 去重不翻倍
+        assert_eq!(
+            build_upstream_url(
+                "https://opencode.ai/zen/go/v1/chat/completions",
+                "/chat/completions"
+            ),
+            "https://opencode.ai/zen/go/v1/chat/completions"
+        );
+        // 去重时保留 query
+        assert_eq!(
+            build_upstream_url(
+                "https://opencode.ai/zen/go/v1/chat/completions",
+                "/chat/completions?stream=true"
+            ),
+            "https://opencode.ai/zen/go/v1/chat/completions?stream=true"
+        );
+        // anthropic:base 误填 /v1/messages → 去重
+        assert_eq!(
+            build_upstream_url("https://relay.example.com/v1/messages", "/v1/messages"),
+            "https://relay.example.com/v1/messages"
+        );
+        // anthropic 正常:base 不含 endpoint → 照常补 /v1/messages
+        assert_eq!(
+            build_upstream_url("https://api.anthropic.com", "/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        // responses:base 误填 /responses → 去重
+        assert_eq!(
+            build_upstream_url("https://relay.example.com/responses", "/responses"),
+            "https://relay.example.com/responses"
+        );
+        // 不误伤:base=/v1 + /responses(OpenAI 官方 responses-direct)照常拼
+        assert_eq!(
+            build_upstream_url("https://api.openai.com/v1", "/responses"),
+            "https://api.openai.com/v1/responses"
+        );
+        // 不误伤:responses 子路径(cancel)且 base 不含 endpoint → 照常拼
+        assert_eq!(
+            build_upstream_url("https://api.openai.com/v1", "/responses/resp_abc/cancel"),
+            "https://api.openai.com/v1/responses/resp_abc/cancel"
+        );
+        // codex-connector P2:base 误填 /responses + 子路径(cancel/retrieve)→ 段边界去重,不翻倍
+        assert_eq!(
+            build_upstream_url(
+                "https://relay.example.com/responses",
+                "/responses/resp_abc/cancel"
+            ),
+            "https://relay.example.com/responses/resp_abc/cancel"
+        );
+        // 段边界:base 末尾 /v1 + path /v1/responses → 只去掉重叠的 /v1,不误删
+        assert_eq!(
+            build_upstream_url("https://relay.example.com/v1", "/v1/responses"),
+            "https://relay.example.com/v1/responses"
+        );
+        // base 末尾 / 归一后再判断
+        assert_eq!(
+            build_upstream_url("https://api.openai.com/v1/", "/responses"),
+            "https://api.openai.com/v1/responses"
+        );
     }
 }

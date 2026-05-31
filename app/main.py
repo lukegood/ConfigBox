@@ -26,6 +26,7 @@ from .storage import (
     delete_history,
     delete_profile,
     ensure_all,
+    import_runtime_to_profile,
     list_history,
     list_profiles,
     read_history,
@@ -139,6 +140,11 @@ def activate(tool: str, name: str, user: AuthUser = Depends(require_user)) -> di
     return activate_profile(get_tool(tool), name)
 
 
+@app.post("/api/profiles/{tool}/{name}/import-runtime")
+def import_runtime(tool: str, name: str, user: AuthUser = Depends(require_user)) -> dict:
+    return import_runtime_to_profile(get_tool(tool), name)
+
+
 @app.get("/api/history/{tool}")
 def get_history(tool: str, user: AuthUser = Depends(require_user)) -> list[dict]:
     return list_history(get_tool(tool))
@@ -212,6 +218,11 @@ def gateway_providers(user: AuthUser = Depends(require_user)) -> list[dict]:
     return gateway.list_providers()
 
 
+@app.get("/api/gateway/presets")
+def gateway_presets(user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.list_presets()
+
+
 @app.post("/api/gateway/providers")
 def gateway_add_provider(payload: dict, user: AuthUser = Depends(require_user)) -> dict:
     return gateway.add_provider(payload)
@@ -256,6 +267,11 @@ def gateway_oauth_login(kind: str, user: AuthUser = Depends(require_user)) -> di
 @app.delete("/api/gateway/oauth/{kind}/logout")
 def gateway_oauth_logout(kind: str, user: AuthUser = Depends(require_user)) -> dict:
     return gateway.oauth_logout(kind)
+
+
+@app.get("/api/gateway/oauth/antigravity/models")
+def gateway_antigravity_models(user: AuthUser = Depends(require_user)) -> dict:
+    return gateway.antigravity_models()
 
 
 static_dir = Path(__file__).parent / "static"
