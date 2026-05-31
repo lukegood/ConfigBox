@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -26,6 +27,7 @@ def load_modules(tmp_path: Path):
     os.environ["CLAUDE_CONFIG_PATH"] = str(claude_path)
     os.environ["CODEX_CONFIG_PATH"] = str(codex_path)
     os.environ["CODEX_CONFIG_TOML_PATH"] = str(codex_toml_path)
+    os.environ["CODEX_GATEWAY_DIR"] = str(data_dir / "codex-gateway")
     os.environ["OPENCODE_CONFIG_PATH"] = str(opencode_path)
     os.environ["HISTORY_RETENTION"] = "50"
 
@@ -98,6 +100,92 @@ def test_activate_profile_overwrites_runtime_without_history(tmp_path: Path):
     assert "HTTPS_PROXY" in claude_path.read_text(encoding="utf-8")
     assert storage.active_profile_name(tool) == "proxy"
     assert len(storage.list_history(tool)) == history_before_activate
+
+
+def test_active_profile_reports_runtime_change(tmp_path: Path):
+    registry, storage, _, claude_path, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("claude")
+    storage.create_profile(tool, "other", "active")
+
+    claude_path.write_text('{"model": "manual"}\n', encoding="utf-8")
+
+    active_doc = storage.read_profile(tool, "default")
+    other_doc = storage.read_profile(tool, "other")
+    assert active_doc["active"] is True
+    assert active_doc["runtimeChanged"] is True
+    assert other_doc["active"] is False
+    assert other_doc["runtimeChanged"] is False
+
+
+def test_codex_profile_ignores_gateway_managed_runtime_overlay(tmp_path: Path):
+    registry, storage, _, _claude_path, codex_auth, codex_toml, data_dir = load_modules(tmp_path)
+    tool = registry.get_tool("codex")
+    original = storage.read_profile(tool, "default")
+    snapshot_path = data_dir / "codex-gateway" / "codex-snapshot.json"
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "runtimeContents": {
+                    "auth": original["files"][0]["content"],
+                    "config": original["files"][1]["content"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    codex_auth.write_text('{"auth_mode": "apikey", "OPENAI_API_KEY": "gateway"}\n', encoding="utf-8")
+    codex_toml.write_text(
+        'model_provider = "configbox_gateway"\nmodel = "gpt-5.3-codex"\n',
+        encoding="utf-8",
+    )
+
+    doc = storage.read_profile(tool, "default")
+
+    assert doc["runtimeChanged"] is False
+
+
+def test_codex_profile_ignores_legacy_gateway_snapshot_without_raw_contents(tmp_path: Path):
+    registry, storage, _, _claude_path, codex_auth, codex_toml, data_dir = load_modules(tmp_path)
+    tool = registry.get_tool("codex")
+    snapshot_path = data_dir / "codex-gateway" / "codex-snapshot.json"
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text('{"applied": {"model": "gpt-5.3-codex"}}\n', encoding="utf-8")
+    codex_auth.write_text('{"auth_mode": "apikey", "OPENAI_API_KEY": "gateway"}\n', encoding="utf-8")
+    codex_toml.write_text(
+        'model_provider = "configbox_gateway"\nmodel = "gpt-5.3-codex"\n',
+        encoding="utf-8",
+    )
+
+    doc = storage.read_profile(tool, "default")
+
+    assert doc["runtimeChanged"] is False
+
+
+def test_import_runtime_to_active_profile_creates_history(tmp_path: Path):
+    registry, storage, _, claude_path, *_, data_dir = load_modules(tmp_path)
+    tool = registry.get_tool("claude")
+    claude_path.write_text('{"model": "manual"}\n', encoding="utf-8")
+
+    imported = storage.import_runtime_to_profile(tool, "default")
+
+    assert imported["content"] == '{"model": "manual"}\n'
+    assert imported["runtimeChanged"] is False
+    history = storage.list_history(tool)
+    assert len(history) == 1
+    assert history[0]["reason"] == "import-runtime"
+    assert storage.read_history(tool, "default", history[0]["name"])["content"] == '{"model": "sonnet"}\n'
+    assert (data_dir / "profiles" / "claude" / "default.json").read_text(encoding="utf-8") == '{"model": "manual"}\n'
+
+
+def test_import_runtime_rejects_inactive_profile(tmp_path: Path):
+    registry, storage, errors, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("claude")
+    storage.create_profile(tool, "other", "active")
+
+    with pytest.raises(errors.APIError) as exc:
+        storage.import_runtime_to_profile(tool, "other")
+    assert exc.value.code == "PROFILE_NOT_ACTIVE"
 
 
 def test_profile_mtime_conflict(tmp_path: Path):

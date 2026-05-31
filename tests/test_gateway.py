@@ -71,6 +71,8 @@ def test_apply_codex_writes_catalog_and_context_window(tmp_path: Path):
     assert gpt55["display_name"] == "DeepSeek / deepseek-v4-pro"
     assert gpt55["context_window"] == 1_000_000
     assert gpt55["auto_compact_token_limit"] == 800_000
+    snapshot = json.loads((gateway_dir / "codex-snapshot.json").read_text(encoding="utf-8"))
+    assert snapshot["runtimeContents"]["config"] == 'model = "gpt-5.5"\n'
 
 
 def test_apply_codex_can_write_host_visible_catalog_path(tmp_path: Path):
@@ -152,6 +154,29 @@ def test_gateway_normalization_keeps_antigravity_alias(tmp_path: Path):
     )
 
     assert provider["apiFormat"] == "antigravity_oauth"
+
+
+def test_gateway_presets_use_configbox_schema(tmp_path: Path):
+    gateway, *_ = load_gateway(tmp_path)
+
+    presets = gateway.list_presets()["presets"]
+    antigravity = next(item for item in presets if item["id"] == "antigravity-oauth")
+
+    assert antigravity["experimental"] is True
+    assert antigravity["provider"]["apiFormat"] == "antigravity_oauth"
+    assert antigravity["provider"]["models"]["default"] == "gemini-3-flash-agent"
+    assert antigravity["baseUrls"]
+    assert antigravity["messages"]
+
+
+def test_antigravity_models_fall_back_to_preset_seed_when_gateway_is_stopped(tmp_path: Path):
+    gateway, *_ = load_gateway(tmp_path)
+
+    payload = gateway.antigravity_models()
+
+    assert payload["success"] is True
+    assert payload["models"][0]["id"] == "gemini-3-flash-agent"
+    assert payload["models"][0]["recommended"] is True
 
 
 def test_gateway_normalization_unknown_format_falls_back_to_openai_chat(tmp_path: Path):

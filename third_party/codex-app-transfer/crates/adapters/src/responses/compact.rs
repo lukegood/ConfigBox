@@ -29,7 +29,7 @@
 //!   (`codex-rs/core/src/compact.rs:262`)。
 
 use bytes::Bytes;
-use codex_app_transfer_registry::Provider;
+use codex_app_transfer_registry::{compact_disable_thinking_wire, Provider};
 use futures_util::stream::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::{json, Value};
@@ -79,7 +79,7 @@ use super::request::responses_body_to_chat_body_for_provider;
 /// example 全部移除。模型可自由选择 markdown / 段落 / 列表组织答案,
 /// `extract_summary_section` 在无 `<summary>` tag 时直接 raw fallback
 /// (本来就是容错路径,现在成为常规路径)。
-const COMPACT_SUMMARIZATION_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
+const COMPACT_SUMMARIZATION_PROMPT_EN: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
 Include:
 - Current progress and key decisions made
@@ -90,6 +90,34 @@ Include:
 - **Next Step** — the immediate next action aligned with the user's most recent explicit request. Include a **verbatim direct quote** from the most recent user message showing exactly where you left off; this prevents task drift.
 
 Be concise, structured, and focused on helping the next LLM seamlessly continue the work.";
+
+/// COMPACT 总结提示词中文版(#262)。
+///
+/// **翻译原则**:
+/// - 跟英文版**逐条对应** — 不漏 emphasis(**verbatim** / **All user messages**)
+/// - 技术词保英文:`LLM` / `Next Step`(英文章节名,跟英文版结构对齐)
+/// - **不**翻译 [`COMPACT_SUMMARY_PREFIX`] — Codex CLI 用 `startswith` 识别该前缀,
+///   字面英文不能动。此处仅翻译要模型 **写** summary 的 prompt(输入侧)
+const COMPACT_SUMMARIZATION_PROMPT_ZH: &str = "你正在执行 CONTEXT CHECKPOINT COMPACTION(上下文检查点压缩)。为下一个接手任务的 LLM 写一份交接总结。
+
+包含:
+- 当前进度和已做出的关键决策
+- 重要 context、约束、或 user 偏好
+- 还有什么待办(清晰的下一步)
+- 继续任务所需的关键数据、示例、引用
+- **截至目前的所有 user message,按时间顺序逐字或近似逐字保留** —— 这能保留其它方式会丢失的 intent 演变
+- **Next Step** —— 跟 user 最近一次显式请求对齐的下一个动作。包含从 user 最近一条 message 中**逐字引用**的直接 quote,标明你停在了哪里;这能防止任务漂移。
+
+精简、结构化,聚焦于帮助下一个 LLM 无缝接续工作。";
+
+/// 按当前 user 语言偏好选 compact summarization prompt(#262)。
+fn compact_summarization_prompt_for_current_language() -> &'static str {
+    use crate::core::language::{current_language, Language};
+    match current_language() {
+        Language::Chinese => COMPACT_SUMMARIZATION_PROMPT_ZH,
+        Language::English => COMPACT_SUMMARIZATION_PROMPT_EN,
+    }
+}
 
 /// 抄自 `openai/codex` 仓库 `codex-rs/core/templates/compact/summary_prefix.md` (Apache-2).
 /// Codex CLI 反序列化 compact 响应后,通过 `is_summary_message`(`startswith(PREFIX)`)
@@ -180,7 +208,7 @@ pub(crate) fn build_compact_chat_request(
     input_array.push(json!({
         "type": "message",
         "role": "user",
-        "content": COMPACT_SUMMARIZATION_PROMPT,
+        "content": compact_summarization_prompt_for_current_language(),
     }));
     let input = Value::Array(input_array);
 
@@ -211,8 +239,28 @@ pub(crate) fn build_compact_chat_request(
     let chat_body =
         responses_body_to_chat_body_for_provider(&synthetic_responses_body, Some(provider))?;
     let chat_body = enforce_compact_chat_message_budget(chat_body);
+    let chat_body = inject_compact_disable_thinking_if_supported(chat_body);
     serde_json::to_vec(&chat_body)
         .map_err(|e| AdapterError::Internal(format!("re-serialize compact body: {e}")))
+}
+
+/// 按 chat body 的 `model` 字段查 `compact_thinking_policy` 注册表,命中即注入
+/// 对应 wire(派 A `thinking.type=disabled` / 派 B `enable_thinking=false`)。
+///
+/// 注册表覆盖范围、入表四证、不入表的故意决策见
+/// `codex_app_transfer_registry::compact_thinking_policy` 模块顶部文档。
+/// 本函数只做 "查表 + 注入" 两步,**不在此处** inline 任何 provider / model 判定 —
+/// 加新模型走"加 registry entry + 加 registry 单测"路径,无需改本文件。
+fn inject_compact_disable_thinking_if_supported(mut chat_body: Value) -> Value {
+    let model_id = chat_body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    if let Some(wire) = compact_disable_thinking_wire(&model_id) {
+        wire.inject(&mut chat_body);
+    }
+    chat_body
 }
 
 fn enforce_compact_chat_message_budget(mut chat_body: Value) -> Value {
@@ -568,14 +616,57 @@ async fn collect_and_wrap_compact_body(
             "compact upstream non-JSON response: {e}; first 500 chars: {preview}"
         ))
     })?;
-    let raw = parsed
+    let raw = extract_compact_summary_text(&parsed).ok_or_else(|| {
+        let preview: String = serde_json::to_string(&parsed)
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect();
+        AdapterError::Internal(format!(
+            "compact upstream missing summary text (tried chat choices[0].message.content + \
+             gemini candidates[0].content.parts[].text); first 300 chars: {preview}"
+        ))
+    })?;
+
+    compact_response_body_from_summary_text(&raw)
+}
+
+/// 从上游 compact 响应里抽 summary 文本 —— **wire 无关**,兼容三种上游形状:
+/// 1. OpenAI chat-completions:`choices[0].message.content`
+/// 2. Gemini `generateContent`(Google AI Studio):`candidates[0].content.parts[*].text` 拼接
+/// 3. Cloud Code / Antigravity:gemini 响应外裹 `{"response": {...}}`,先剥 `response` 再按 (2) 抽
+///
+/// MOC-92:此前只认 chat 形状,导致 Gemini 系(gemini_native / cloud_code)compact
+/// 全部解析失败(antigravity 还因 cloud_code 未实现 compact 路由而更早炸)。
+fn extract_compact_summary_text(parsed: &Value) -> Option<String> {
+    // chat-completions
+    if let Some(s) = parsed
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            AdapterError::Internal("compact upstream missing choices[0].message.content".to_owned())
-        })?;
-
-    compact_response_body_from_summary_text(raw)
+    {
+        return Some(s.to_owned());
+    }
+    // cloud_code/antigravity 把 gemini 响应裹在 `response` 里;gemini_native 则是直出。
+    let root = parsed.get("response").unwrap_or(parsed);
+    if let Some(parts) = root
+        .pointer("/candidates/0/content/parts")
+        .and_then(|v| v.as_array())
+    {
+        // **排除 thought 部分**:compact 请求带 reasoning_effort → 转 Gemini 时产
+        // `thinkingConfig.include_thoughts=true` → 响应可能含 `{"thought":true,"text":...}`
+        // 思维链。summary 只要结论不要过程,且全代码别处(gemini_native/response.rs 把
+        // part.thought 路由 reasoning 而非 content)一致把 thought 当非 content。不排除
+        // 会让思维链污染压缩后的上下文(code-reviewer IMPORTANT)。
+        let text: String = parts
+            .iter()
+            .filter(|p| p.get("thought").and_then(|t| t.as_bool()) != Some(true))
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    None
 }
 
 pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u8>, AdapterError> {
@@ -1245,9 +1336,46 @@ mod tests {
         let err = collect_and_wrap_compact_body(StatusCode::OK, one_chunk_stream(upstream_body))
             .await
             .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("missing choices[0].message.content"));
+        assert!(
+            err.to_string().contains("missing summary text"),
+            "实际错误:{err}"
+        );
+    }
+
+    #[test]
+    fn extract_compact_summary_text_handles_chat_gemini_and_cloudcode_shapes() {
+        // MOC-92:三种上游形状都要能抽出 summary 文本。
+        let long = "x".repeat(900); // 过质量校验无关,这里只验抽取
+                                    // 1. chat-completions
+        let chat = json!({"choices": [{"message": {"content": long}}]});
+        assert_eq!(
+            extract_compact_summary_text(&chat).as_deref(),
+            Some(long.as_str())
+        );
+        // 2. gemini generateContent(Google AI Studio,直出);thought 部分必须排除
+        let gemini = json!({"candidates": [{"content": {"parts": [
+            {"text": "chain of thought...", "thought": true},
+            {"text": "part-a "}, {"text": "part-b"}
+        ]}}]});
+        assert_eq!(
+            extract_compact_summary_text(&gemini).as_deref(),
+            Some("part-a part-b"),
+            "thought 部分应被排除,不污染 summary"
+        );
+        // 3. cloud_code / antigravity:gemini 外裹 {"response": {...}}
+        let cloud = json!({"response": {"candidates": [{"content": {"parts": [
+            {"text": "wrapped summary"}
+        ]}}]}});
+        assert_eq!(
+            extract_compact_summary_text(&cloud).as_deref(),
+            Some("wrapped summary")
+        );
+        // 4. 都不匹配 → None
+        assert_eq!(extract_compact_summary_text(&json!({"foo": "bar"})), None);
+        assert_eq!(
+            extract_compact_summary_text(&json!({"candidates": [{"content": {"parts": []}}]})),
+            None
+        );
     }
 
     // ── validate_compact_summary_quality (fix #219) ──────────────────
@@ -1326,5 +1454,191 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("quality check failed"));
+    }
+
+    // ── compact_thinking_policy 注册表接入(issue #248) ─────────────────
+    //
+    // 这些测试只断言 "build_compact_chat_request 末尾正确调用了 registry 注入"
+    // 这一**集成点**,不重复 registry 自己的 entry-by-entry 覆盖测试
+    // (那些在 `codex_app_transfer_registry::compact_thinking_policy::tests`)。
+    // 加新模型走 registry 单测;本处只验"接入路径活着"。
+
+    /// 构造一个除 model 字段外都跟 `make_provider()` 一致的 provider。
+    /// 用于断言"注入决策只看 chat body 的 model 字段,不看 provider"。
+    fn provider_with_model(model_id: &str) -> Provider {
+        let mut p = make_provider();
+        p.models.insert("default".into(), model_id.into());
+        p
+    }
+
+    fn simple_compact_body(model: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "model": model,
+            "input": [
+                {"type": "message", "role": "user", "content": "hello"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn compact_injects_thinking_type_disabled_for_glm_5_1() {
+        // issue #248 主修复:GLM-5.1 强制 thinking,本 PR 注入 thinking.disabled
+        // 把 max_tokens 全留给 summary content。
+        let p = provider_with_model("glm-5.1");
+        let chat = build_compact_chat_request(&simple_compact_body("glm-5.1"), &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert_eq!(
+            parsed["thinking"],
+            json!({"type": "disabled"}),
+            "glm-5.1 必须命中 compact_thinking_policy 派 A,chat body 含 thinking.type=disabled"
+        );
+    }
+
+    #[test]
+    fn compact_injects_enable_thinking_false_for_qwen3() {
+        // 派 B:Qwen 3.x 用 enable_thinking=false wire,确认接入对派 B 也活着
+        let p = provider_with_model("qwen3.6-plus");
+        let chat = build_compact_chat_request(&simple_compact_body("qwen3.6-plus"), &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert_eq!(
+            parsed["enable_thinking"],
+            json!(false),
+            "qwen3.6-plus 必须命中 compact_thinking_policy 派 B,chat body 含 enable_thinking=false"
+        );
+    }
+
+    #[test]
+    fn compact_does_not_inject_for_minimax_no_disable_wire() {
+        // MiniMax M2.x 故意不入表(上游不支持 disable),compact body 必须**不含**
+        // thinking / enable_thinking 字段,避免给不认识的 endpoint 发 unknown field
+        let p = provider_with_model("MiniMax-M2.7");
+        let chat = build_compact_chat_request(&simple_compact_body("MiniMax-M2.7"), &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert!(
+            parsed.get("thinking").is_none(),
+            "MiniMax 不在 compact_thinking_policy 白名单,chat body 不应有 thinking 字段"
+        );
+        assert!(
+            parsed.get("enable_thinking").is_none(),
+            "MiniMax 不在 compact_thinking_policy 白名单,chat body 不应有 enable_thinking 字段"
+        );
+    }
+
+    #[test]
+    fn compact_does_not_inject_for_moonshot_v1_no_thinking_mode() {
+        // moonshot-v1 老 base 模型没有 thinking 模式,故意不入表
+        let p = provider_with_model("moonshot-v1-32k");
+        let chat = build_compact_chat_request(&simple_compact_body("moonshot-v1-32k"), &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert!(
+            parsed.get("thinking").is_none(),
+            "moonshot-v1 老模型无 thinking 模式,chat body 不应有 thinking 字段"
+        );
+        assert!(
+            parsed.get("enable_thinking").is_none(),
+            "moonshot-v1 老模型无 thinking 模式,chat body 不应有 enable_thinking 字段"
+        );
+    }
+
+    #[test]
+    fn compact_does_not_inject_for_unknown_model() {
+        // 用户自定义 / 未收录的 model:保守不注入,保持 current behavior
+        let p = provider_with_model("some-custom-model");
+        let chat =
+            build_compact_chat_request(&simple_compact_body("some-custom-model"), &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert!(
+            parsed.get("thinking").is_none() && parsed.get("enable_thinking").is_none(),
+            "未知 model 不应触发 compact_thinking_policy 注入"
+        );
+    }
+
+    #[test]
+    fn compact_does_not_inject_when_model_field_missing_or_null() {
+        // 防御性:`inject_compact_disable_thinking_if_supported` 用
+        // `unwrap_or("")` 兜底缺失/null model,registry 对空 string 返 None,
+        // 整条链路应静默 no-op 而非 panic。
+        let p = provider_with_model("glm-5.1");
+        // 缺 model 字段
+        let body_missing = serde_json::to_vec(&json!({
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let chat = build_compact_chat_request(&body_missing, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert!(
+            parsed.get("thinking").is_none(),
+            "缺 model 字段时不应注入(model 字段在 chat body 也会缺,query 不到 wire)"
+        );
+
+        // model: null
+        let body_null = serde_json::to_vec(&json!({
+            "model": null,
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let chat = build_compact_chat_request(&body_null, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert!(parsed.get("thinking").is_none(), "model:null 时不应注入");
+    }
+
+    // ── #262: compact prompt i18n tests ──────────────────────────────
+
+    /// Devin BUG-003 fix:跟 [`crate::core::language::TEST_I18N_LOCK`] 共用同一把
+    /// 锁,跨模块 serialize 同一全局 `USER_LANGUAGE`。原版每模块独立 mutex 无法
+    /// serialize cargo test 跨模块的并发,会 race。
+    use crate::core::language::TEST_I18N_LOCK as LANG_TEST_LOCK;
+
+    fn with_user_language<F: FnOnce()>(lang: &str, f: F) {
+        let _guard = LANG_TEST_LOCK.lock().unwrap();
+        crate::core::language::set_user_language(lang);
+        f();
+        crate::core::language::set_user_language("en");
+    }
+
+    fn compact_prompt_text_for_lang(lang: &str) -> String {
+        let mut out = String::new();
+        with_user_language(lang, || {
+            out = compact_summarization_prompt_for_current_language().to_string();
+        });
+        out
+    }
+
+    #[test]
+    fn compact_summarization_prompt_english_by_default() {
+        let prompt = compact_prompt_text_for_lang("en");
+        assert!(prompt.contains("CONTEXT CHECKPOINT COMPACTION"));
+        assert!(prompt.contains("Be concise, structured"));
+        assert!(!prompt.contains("精简、结构化"));
+    }
+
+    #[test]
+    fn compact_summarization_prompt_chinese_when_language_zh() {
+        let prompt = compact_prompt_text_for_lang("zh-CN");
+        assert!(prompt.contains("CONTEXT CHECKPOINT COMPACTION(上下文检查点压缩)"));
+        assert!(prompt.contains("精简、结构化"));
+        // 关键技术词保英文 — LLM / Next Step / context 等
+        for keyword in &["LLM", "Next Step", "context"] {
+            assert!(
+                prompt.contains(keyword),
+                "ZH compact prompt must keep keyword `{keyword}` in English"
+            );
+        }
+        // emphasis 翻译完整
+        assert!(prompt.contains("**逐字引用**"));
+        assert!(prompt.contains("**截至目前的所有 user message"));
+    }
+
+    /// `COMPACT_SUMMARY_PREFIX` 必须保字面英文(Codex CLI startswith 识别) —
+    /// 这条 const 不该被任何 i18n 路径覆盖。防回归。
+    #[test]
+    fn compact_summary_prefix_stays_english_regardless_of_user_language() {
+        with_user_language("zh-CN", || {
+            assert!(COMPACT_SUMMARY_PREFIX.starts_with("Another language model"));
+        });
+        with_user_language("en", || {
+            assert!(COMPACT_SUMMARY_PREFIX.starts_with("Another language model"));
+        });
     }
 }
