@@ -30,7 +30,15 @@
 
 ## Version Updates :sunny:
 
-:loudspeaker: 2026.05.14 Released v0.5.2, synced upstream codex-app-transfer, fixed some Gateway frontend issues.
+v0.2.0: May 6, optimized Codex configuration method.  
+v0.3.3: May 7, added Codex forwarding support, enabling integration with Chinese models and models not yet implementing the response protocol. Improved user experience.  
+v0.4.0: May 9, added support for macOS and Windows platforms.  
+v0.5.0: May 10, added support for OpenCode.  
+v0.5.2: May 14, synced upstream Codex forwarding gateway changes, fixed Gateway frontend issues.  
+v0.5.3: May 18, optimized configuration switching logic, synced upstream Codex gateway updates.  
+v0.5.4: May 18, emergency fix for Codex gateway malfunction.  
+v0.5.5: May 23, synced upstream Codex gateway updates.  
+v0.5.6: May 31, synced upstream gateway updates, fixed config not syncing when manually changed, improved user experience.
 
 ## Screenshot :camera:
 
