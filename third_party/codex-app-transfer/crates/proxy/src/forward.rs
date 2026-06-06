@@ -31,7 +31,10 @@ use futures_core::Stream;
 use futures_util::TryStreamExt;
 use thiserror::Error;
 
-use crate::diagnostics::{write_upstream_error_bundle, UpstreamErrorBundleInput};
+use crate::diagnostics::{
+    forward_trace_enabled, write_chatgpt_backend_trace, write_forward_trace_jsonl,
+    write_upstream_error_bundle, ForwardTraceInput, UpstreamErrorBundleInput,
+};
 use crate::resolver::{AuthScheme, ResolveError, ResolvedProvider, SharedResolver};
 use crate::telemetry::proxy_telemetry;
 
@@ -63,6 +66,24 @@ impl ProxyState {
                 // 反爬可能 ban "reqwest" 字串。改用中性的 Codex-App-Transfer/<v>
                 // 兜底,既不命中 codex 反爬规则,也不在 reqwest 黑名单。
                 .user_agent(DEFAULT_OUTBOUND_USER_AGENT)
+                // SSRF(AP-001):对每一跳重定向目标复检 host,拒绝跳向私有/内部地址。
+                // reqwest 默认跟随最多 10 跳,只校验初始 URL 会被 `302 → 169.254.169.254`
+                // 之类绕过整个 SSRF 防护(MOC-68 review 复盘)。这里限制跳数 + 逐跳复检。
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().len() >= 5 {
+                        return attempt.error("too many redirects".to_string());
+                    }
+                    let host = attempt.url().host_str().unwrap_or("").to_string();
+                    match redirect_host_is_safe(&host) {
+                        Ok(()) => attempt.follow(),
+                        Err(reason) => {
+                            proxy_telemetry()
+                                .logs
+                                .add("WARN", format!("SSRF blocked redirect → {host}: {reason}"));
+                            attempt.error(reason)
+                        }
+                    }
+                }))
                 .build()
                 .expect("reqwest client"),
             resolver,
@@ -98,6 +119,8 @@ pub enum ForwardError {
     Resolve(#[from] ResolveError),
     #[error("adapter: {0}")]
     Adapter(#[from] AdapterError),
+    #[error("bad request: {0}")]
+    BadRequest(String),
     /// OAuth bearer 不可用(用户没登过 / refresh 失败 / token 文件 IO 错)。
     /// 跟 generic Header 错误区分,IntoResponse 走 401 + 结构化 code 提示用户
     /// 重新登录,**不**走 502 generic 错误体(2026-05-11 silent-failure 修)。
@@ -185,6 +208,7 @@ impl axum::response::IntoResponse for ForwardError {
         }
 
         let (status, body) = match &self {
+            ForwardError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ForwardError::Resolve(re) => (re.status(), format!("proxy resolve error: {re}")),
             ForwardError::Adapter(ae) => (
                 StatusCode::BAD_REQUEST,
@@ -306,6 +330,9 @@ pub async fn forward_handler(
 
     // 1. 收齐入站 body
     let mut body_bytes: Bytes = axum::body::to_bytes(body, usize::MAX).await?;
+    // [MOC-89 forward-trace] 默认关:仅 CAS_DIAG_TRACE=1 时才克隆一份 Codex 原始请求体
+    // (rewrite/strip 前),供全过程 trace。关时不 clone、零额外开销。
+    let trace_inbound_raw: Option<Bytes> = forward_trace_enabled().then(|| body_bytes.clone());
 
     // 2. 解析(鉴权 + 路由)
     let client_path = parts
@@ -316,6 +343,24 @@ pub async fn forward_handler(
     if parts.method == Method::OPTIONS && is_local_responses_route(&client_path) {
         return Ok(cors_preflight_response()?);
     }
+
+    // [MOC-104 relay 诊断] chatgpt backend 透传:relay 模式 `chatgpt_base_url` 指向本
+    // proxy,`/backend-api/*` 是 Codex 的账号/插件/wham 请求(getAccount→userId、
+    // plugins install/list 等)。透传真 chatgpt.com 同 path(不走第三方 resolve/
+    // adapter),全 path+status+body 摘要落 telemetry log,把这条 TLS 黑盒链路变可见。
+    // 复用 state.http(reqwest 默认读系统代理设置 /`scutil --proxy`,跟随系统、非写死端口;
+    // chatgpt.com 必须经代理才可达,故绝不能 no_proxy)。
+    if is_chatgpt_backend_path(&client_path) {
+        return passthrough_chatgpt_backend(
+            &state,
+            &parts.method,
+            &parts.headers,
+            &client_path,
+            body_bytes,
+        )
+        .await;
+    }
+
     let original_model = body_model(&body_bytes);
     let resolved = state.resolver.resolve(&parts, &body_bytes)?;
 
@@ -342,6 +387,7 @@ pub async fn forward_handler(
 
     // 5. 拼上游 URL —— base 末尾去 `/`,plan.upstream_path 必含 `/`
     let upstream_url = build_upstream_url(&resolved.upstream_base, &plan.upstream_path);
+    check_ssrf_safe(&upstream_url).await?;
     let telemetry = proxy_telemetry();
     telemetry
         .logs
@@ -470,6 +516,32 @@ pub async fn forward_handler(
     // 辅助定位真实 Codex CLI 流量里"几分钟"是单次 reasoning 慢、还是连续
     // 多轮工具循环放大。
     let t_send = Instant::now();
+    // [MOC-89 forward-trace] gate 开时构造 trace 请求侧 owned 快照(成功路径 ctx / 错误
+    // 路径就地 push 共用)。仅在 forward_trace_enabled() 为真的分支里调用 → 关时不构造、
+    // headers/body 不 clone。response_headers 传上游 raw(transform/filter 前)。
+    let make_trace_ctx =
+        |status: u16, response_headers: reqwest::header::HeaderMap| ForwardTraceCtx {
+            method: parts.method.as_str().to_string(),
+            client_path: client_path.clone(),
+            client_query: parts.uri.query().map(|s| s.to_string()),
+            inbound_headers: parts.headers.clone(),
+            inbound_body: trace_inbound_raw
+                .as_ref()
+                .map(|b| b.to_vec())
+                .unwrap_or_default(),
+            upstream_url: upstream_url.clone(),
+            outbound_headers: outbound_headers_snapshot.clone(),
+            outbound_body: plan.body.to_vec(),
+            status,
+            response_headers,
+            provider_id: resolved.provider.id.clone(),
+            provider_name: resolved.provider.name.clone(),
+            api_format: resolved.provider.api_format.clone(),
+            auth_scheme: format!("{:?}", resolved.auth_scheme),
+            original_model: original_model.clone(),
+            resolved_model: resolved_model.clone(),
+            upstream_model: body_model(&plan.body),
+        };
     let (status, upstream_headers, upstream_stream): (
         http::StatusCode,
         HeaderMap,
@@ -498,6 +570,10 @@ pub async fn forward_handler(
             &plan.body,
             &body,
         );
+        // [MOC-89 forward-trace] 错误路径 body 已完整 buffer,gate 开时就地 push 一行
+        if forward_trace_enabled() {
+            write_trace_from_ctx(&make_trace_ctx(st.as_u16(), hs.clone()), &body, body.len());
+        }
         let single = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body) });
         (
             st,
@@ -510,6 +586,10 @@ pub async fn forward_handler(
         let st = resp.status();
         let hs = filter_hop_headers(resp.headers());
         let stream: codex_app_transfer_adapters::ByteStream = if st.is_success() {
+            // [MOC-89 forward-trace] gate 开时先 clone 上游 raw headers 再把 resp 消费成流;
+            // 响应体由 TracedStream tee(不破流式),Drop 时连同 ctx 写一行 jsonl。
+            let trace_ctx = forward_trace_enabled()
+                .then(|| make_trace_ctx(st.as_u16(), resp.headers().clone()));
             let raw = Box::pin(
                 resp.bytes_stream()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
@@ -519,9 +599,12 @@ pub async fn forward_handler(
                 t_send,
                 st.as_u16(),
                 upstream_url.clone(),
+                trace_ctx,
             ))
         } else {
             // retry 后再次 4xx 或 5xx
+            // [MOC-89 forward-trace] gate 开时先 clone 上游 raw headers 再消费 resp body
+            let trace_resp_headers = forward_trace_enabled().then(|| resp.headers().clone());
             let body_bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
@@ -554,6 +637,14 @@ pub async fn forward_handler(
                 &plan.body,
                 &body_bytes,
             );
+            // [MOC-89 forward-trace] body 已完整 buffer,gate 开时(headers 已 clone)就地 push
+            if let Some(rh) = trace_resp_headers {
+                write_trace_from_ctx(
+                    &make_trace_ctx(st.as_u16(), rh),
+                    &body_bytes,
+                    body_bytes.len(),
+                );
+            }
             let single =
                 futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) });
             Box::pin(single)
@@ -584,9 +675,181 @@ pub async fn forward_handler(
     Ok(builder.body(Body::from_stream(response_plan.stream))?)
 }
 
+/// [MOC-104 relay] relay 模式 `chatgpt_base_url=<proxy>/backend-api` 后,Codex 的
+/// 账号/插件/wham 请求都以 `/backend-api/` 开头(默认 chatgpt_base_url =
+/// `https://chatgpt.com/backend-api`)。这些请求不该走第三方 provider 路由,需透传
+/// 真 chatgpt.com。
+fn is_chatgpt_backend_path(path: &str) -> bool {
+    let p = path.split('?').next().unwrap_or(path);
+    p == "/backend-api" || p.starts_with("/backend-api/")
+}
+
+/// [MOC-104 relay 诊断] 把 chatgpt backend 请求透传真 chatgpt.com 同 path,逐条 log
+/// path/status/body 摘要。复用 `state.http`(走系统代理 → chatgpt.com 可达);响应整体
+/// buffer 以便 log body(getAccount/plugins 都是小 JSON、非 SSE,buffer 无碍)。
+/// header name/value 用字符串 + from_bytes 复制,避开 reqwest 与 axum 的 http 类型
+/// 是否同源的耦合。
+async fn passthrough_chatgpt_backend(
+    state: &ProxyState,
+    method: &Method,
+    headers: &HeaderMap,
+    client_path: &str,
+    body: Bytes,
+) -> Result<Response, ForwardError> {
+    let upstream = format!("https://chatgpt.com{client_path}");
+    let telemetry = proxy_telemetry();
+    telemetry.logs.add(
+        "INFO",
+        format!("[chatgpt-relay] {method} {client_path} → {upstream}"),
+    );
+    // [MOC-125] gate 开时先 clone Codex 原始请求体(下面会 move 进 rb),供 passthrough 诊断 trace。
+    let trace_inbound = forward_trace_enabled().then(|| body.clone());
+
+    // [review M-2] method 解析失败**报错、不降级** —— 把 POST(plugins install 等写操作)
+    // 悄悄降级成 GET 是破坏性降级(违反"禁止破坏性降级"硬规则);axum Method 已合法,
+    // 失败仅扩展 method 边界,报 BadRequest 让上层显式处理而非吞掉请求意图。
+    let rmethod = reqwest::Method::from_bytes(method.as_str().as_bytes()).map_err(|e| {
+        ForwardError::BadRequest(format!("无法转换 chatgpt backend method {method}: {e}"))
+    })?;
+    let mut rb = state.http.request(rmethod, &upstream);
+    for (k, v) in headers.iter() {
+        let name = k.as_str();
+        // host 让 reqwest 按 upstream 重填;accept-encoding 去掉避免压缩 body 干扰 log
+        if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
+        rb = rb.header(name, v.as_bytes());
+    }
+    if !body.is_empty() {
+        rb = rb.body(body);
+    }
+
+    let resp = rb.send().await?;
+    let status = resp.status().as_u16();
+    let resp_headers = resp.headers().clone();
+    // [review H-1] body 读失败**冒泡、不吞** —— `unwrap_or_default()` 会把上游连接 reset /
+    // TLS 截断 / 读超时伪装成"成功读到空 200",抹掉根因 + 让诊断日志说假话(本模块存在的
+    // 意义就是把 TLS 黑盒变可见)。透传场景上游断连本就该回 502 让 Codex 重试。
+    let resp_body = resp.bytes().await.map_err(ForwardError::Upstream)?;
+
+    // [review N-3] 不再 log 响应 body preview —— getAccount/plugin 响应含 account id/email,
+    // 落 telemetry 是敏感信息泄漏。只记 status + bytes 足够诊断;Authorization 本就不记。
+    telemetry.logs.add(
+        if (200..300).contains(&status) {
+            "INFO"
+        } else {
+            "WARN"
+        },
+        format!(
+            "[chatgpt-relay] resp {status} {client_path} ({} bytes)",
+            resp_body.len()
+        ),
+    );
+
+    // [MOC-125] chatgpt-backend passthrough 诊断:gate 开时记一条(inbound Codex 请求 / outbound
+    // 转发 chatgpt.com / response 回包,header 用 cookie 友好脱敏)。定位远程控制 enroll/server
+    // 404 死循环的会话连续性(set-cookie Domain 是否不匹配 relay host → Codex 不回带 cookie)。
+    if let Some(ref tbody) = trace_inbound {
+        let input = ForwardTraceInput {
+            method: method.as_str(),
+            client_path,
+            client_query: None,
+            inbound_headers: headers,
+            inbound_body: tbody.as_ref(),
+            upstream_url: &upstream,
+            // [review comment #1] passthrough 不转换协议,trace 的 outbound 段直接复用 inbound
+            // headers/body 作镜像 —— 真实发 chatgpt.com 的请求会再 strip host/accept-encoding、
+            // reqwest 重填 host/content-length(trace 未反映这层)。诊断重点在 inbound cookie +
+            // response set-cookie 的会话连续性,outbound 仅作对照。
+            outbound_headers: headers,
+            outbound_body: tbody.as_ref(),
+            status,
+            response_headers: &resp_headers,
+            response_body: resp_body.as_ref(),
+            response_full_len: resp_body.len(),
+            provider_id: "chatgpt-backend",
+            provider_name: "ChatGPT Backend (passthrough)",
+            api_format: "chatgpt_passthrough",
+            auth_scheme: "-",
+            original_model: None,
+            resolved_model: None,
+            upstream_model: None,
+        };
+        // [review HIGH] 写盘失败补一次去重 WARN —— 对齐 forward-trace(write_trace_from_ctx),
+        // 否则开了诊断却因权限/满盘写不出时,这条 passthrough trace 一行不落且零提示。
+        if write_chatgpt_backend_trace(&input).is_none()
+            && !TRACE_WRITE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            telemetry.logs.add(
+                "WARN",
+                "forward-trace 已开启(CAS_DIAG_TRACE)但写盘失败(后续不再提示);\
+                 检查 ~/.codex-app-transfer/forward-trace/ 目录权限与磁盘空间"
+                    .to_string(),
+            );
+        }
+    }
+
+    let mut builder = Response::builder().status(status);
+    if let Some(h) = builder.headers_mut() {
+        for (k, v) in resp_headers.iter() {
+            let name = k.as_str();
+            // content-length/transfer-encoding/content-encoding 由 axum 重算
+            if name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("transfer-encoding")
+                || name.eq_ignore_ascii_case("content-encoding")
+            {
+                continue;
+            }
+            // [review M-1] header 解析失败记日志、不静默丢 —— chatgpt backend 响应可能带
+            // 语义 header(chatgpt-account-id / set-cookie),无声丢弃是"幽灵丢 header"、最难
+            // 排查。降级(跳过该 header)可接受,但必须可见。
+            match (
+                HeaderName::from_bytes(name.as_bytes()),
+                axum::http::HeaderValue::from_bytes(v.as_bytes()),
+            ) {
+                (Ok(hn), Ok(hv)) => {
+                    h.append(hn, hv);
+                }
+                _ => telemetry.logs.add(
+                    "DEBUG",
+                    format!("[chatgpt-relay] 跳过无法解析的响应 header: {name}"),
+                ),
+            }
+        }
+    }
+    Ok(builder.body(Body::from(resp_body))?)
+}
+
 /// 在上游 SSE / chunked 流上叠加耗时埋点。流被 Drop(adapter 链路 / 客户端
 /// 中断)时,自动写一行 telemetry 日志,记录 send → 首字节(TTFB)/ 总耗时
 /// / 总字节数。**对延迟与吞吐零侵入**,只多了 Instant 比较与计数器累加。
+/// forward-trace(MOC-89)成功路径上限:tee 的响应体最多缓冲这么多字节(与 diagnostics
+/// 的 body cap 一致;`redact_body` 还会再 cap 一次)。仅 gate 开时分配。
+const MAX_TRACE_BODY_BYTES: usize = 256 * 1024;
+
+/// forward-trace 成功路径在 [`TracedStream`] 里随流携带的 owned 上下文。流走完(Drop)时
+/// 借这些字段 + tee 到的响应体构造 [`ForwardTraceInput`] 写一行 jsonl。仅 gate 开时为
+/// `Some`(关时整个 ctx 不构造、headers/body 不 clone)。
+struct ForwardTraceCtx {
+    method: String,
+    client_path: String,
+    client_query: Option<String>,
+    inbound_headers: reqwest::header::HeaderMap,
+    inbound_body: Vec<u8>,
+    upstream_url: String,
+    outbound_headers: reqwest::header::HeaderMap,
+    outbound_body: Vec<u8>,
+    status: u16,
+    response_headers: reqwest::header::HeaderMap,
+    provider_id: String,
+    provider_name: String,
+    api_format: String,
+    auth_scheme: String,
+    original_model: Option<String>,
+    resolved_model: Option<String>,
+    upstream_model: Option<String>,
+}
+
 struct TracedStream {
     inner: codex_app_transfer_adapters::ByteStream,
     started_at: Instant,
@@ -594,6 +857,10 @@ struct TracedStream {
     total_bytes: usize,
     status: u16,
     upstream_url: String,
+    /// forward-trace 上下文,仅 gate 开时 `Some`;`Drop` 时取出写 jsonl。
+    trace: Option<ForwardTraceCtx>,
+    /// tee 到的上游响应体(原样,不破流式),cap 到 [`MAX_TRACE_BODY_BYTES`]。
+    resp_buf: Vec<u8>,
 }
 
 impl TracedStream {
@@ -602,6 +869,7 @@ impl TracedStream {
         started_at: Instant,
         status: u16,
         upstream_url: String,
+        trace: Option<ForwardTraceCtx>,
     ) -> Self {
         Self {
             inner,
@@ -610,6 +878,8 @@ impl TracedStream {
             total_bytes: 0,
             status,
             upstream_url,
+            trace,
+            resp_buf: Vec::new(),
         }
     }
 }
@@ -624,6 +894,13 @@ impl Stream for TracedStream {
                     this.first_byte_at = Some(Instant::now());
                 }
                 this.total_bytes += chunk.len();
+                // [MOC-89 forward-trace] gate 开时 tee 一份响应体(cap),chunk 原样返回、
+                // 无 await、无重排 → 不破流式。关时 trace 为 None,这段跳过。
+                if this.trace.is_some() && this.resp_buf.len() < MAX_TRACE_BODY_BYTES {
+                    let room = MAX_TRACE_BODY_BYTES - this.resp_buf.len();
+                    let take = room.min(chunk.len());
+                    this.resp_buf.extend_from_slice(&chunk[..take]);
+                }
                 Poll::Ready(Some(Ok(chunk)))
             }
             other => other,
@@ -650,6 +927,61 @@ impl Drop for TracedStream {
                 total.as_secs_f64(),
                 self.total_bytes,
             ),
+        );
+        // [MOC-89 forward-trace] 流走完(成功路径)→ 借 owned ctx + tee 到的响应体写一行
+        // jsonl。仅 gate 开时 trace 为 Some。同步 append(一行),与上面 telemetry 日志
+        // 同属 Drop 内轻量 IO,不阻塞客户端(流已交付完毕)。
+        if let Some(ctx) = self.trace.take() {
+            // [MOC-169] Drop 时**重查 gate**:请求开始时 gate 开才有 ctx,但若流中途用户关了
+            // 诊断,这条 in-flight trace 不再落盘(与 MCP recorder「关即停」一致 —— 关诊断后采集
+            // 立即停,不留 in-flight 残尾)。env CAS_DIAG_TRACE 开的恒真、照写。
+            if forward_trace_enabled() {
+                // resp_buf 可能被 cap 截断;total_bytes 是 tee 累计真实全长 → 传它修正 truncated_bytes
+                write_trace_from_ctx(&ctx, &self.resp_buf, self.total_bytes);
+            }
+        }
+    }
+}
+
+/// forward-trace 写盘失败只在**首次**记一条 WARN(去重防每请求刷屏)。用户显式开了
+/// CAS_DIAG_TRACE 却因权限/满盘一行没写时,至少有一句提示而非完全静默。
+static TRACE_WRITE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 把 owned [`ForwardTraceCtx`] + 响应体借成 [`ForwardTraceInput`] 写一行 jsonl。成功
+/// 路径(`TracedStream::Drop`,body 来自 tee、可能被 cap 截断 → 传 `response_full_len`
+/// 为真实全长)与错误/retry 路径(handler 内,body 已完整 buffer → full_len = body.len())
+/// 共用,避免重复构造。
+fn write_trace_from_ctx(ctx: &ForwardTraceCtx, response_body: &[u8], response_full_len: usize) {
+    let input = ForwardTraceInput {
+        method: &ctx.method,
+        client_path: &ctx.client_path,
+        client_query: ctx.client_query.as_deref(),
+        inbound_headers: &ctx.inbound_headers,
+        inbound_body: &ctx.inbound_body,
+        upstream_url: &ctx.upstream_url,
+        outbound_headers: &ctx.outbound_headers,
+        outbound_body: &ctx.outbound_body,
+        status: ctx.status,
+        response_headers: &ctx.response_headers,
+        response_body,
+        response_full_len,
+        provider_id: &ctx.provider_id,
+        provider_name: &ctx.provider_name,
+        api_format: &ctx.api_format,
+        auth_scheme: &ctx.auth_scheme,
+        original_model: ctx.original_model.as_deref(),
+        resolved_model: ctx.resolved_model.as_deref(),
+        upstream_model: ctx.upstream_model.as_deref(),
+    };
+    if write_forward_trace_jsonl(&input).is_none()
+        && !TRACE_WRITE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        proxy_telemetry().logs.add(
+            "WARN",
+            "forward-trace 已开启(CAS_DIAG_TRACE)但写盘失败(后续不再提示);\
+             检查 ~/.codex-app-transfer/forward-trace/ 目录权限与磁盘空间"
+                .to_string(),
         );
     }
 }
@@ -692,6 +1024,148 @@ fn build_upstream_url(upstream_base: &str, upstream_path: &str) -> String {
         Some(q) => format!("{base}{rest}?{q}"),
         None => format!("{base}{rest}"),
     }
+}
+
+/// SSRF 防护:转发前**只拦"云 metadata"端点**,放行 loopback / 私网 LAN。
+///
+/// **为什么不拦 loopback/私网**:本 app 是桌面多 provider 代理,用户合法会把
+/// provider.baseUrl 配成本地 LLM(Ollama `127.0.0.1:11434` / LM Studio)或本地桥
+/// (实测真机就有 `http://127.0.0.1:29090`)。一刀切拦 loopback/私网会直接打断这些
+/// 核心用例(MOC-68 review:strict 版会破坏用户现有配置 + 失败 9 个集成测试)。
+/// 因此只阻断 SSRF 真正的高价值目标 —— 云 metadata(窃取实例凭据),其余放行。
+///
+/// **阻断对象(见 `is_cloud_metadata_ip`)**:169.254.0.0/16 链路本地(含
+/// 169.254.169.254 AWS/GCP/Azure/Oracle metadata)、100.100.100.200(Alibaba)、
+/// fd00:ec2::254(AWS IPv6 IMDS)、`metadata.google.internal`,及其 IPv4-mapped 形式。
+///
+/// **覆盖路径**:① 字面 IP 直接判;② hostname 异步解析后看是否落 metadata(解析失败
+/// 则放行 —— 只防 metadata,不可解析的 host 反正连不上);③ 重定向跟随由 client 的
+/// 自定义 redirect policy 对每跳复检(见 `ProxyState::new`),拦 `302 → 169.254.169.254`。
+/// **残留 TOCTOU**:检查时解析的 IP 与 reqwest 建连时再次解析的 IP 不保证一致
+/// (DNS rebinding 窗口),根治需把 IP pin 给 reqwest —— 留 followup,故不宣称完全防住。
+async fn check_ssrf_safe(upstream_url: &str) -> Result<(), ForwardError> {
+    let uri: http::Uri = upstream_url
+        .parse()
+        .map_err(|e| ForwardError::BadRequest(format!("invalid upstream URL: {e}")))?;
+    let host = uri.host().unwrap_or("");
+    match host_static_ssrf_verdict(host)? {
+        SsrfHostVerdict::LiteralAllowed => Ok(()),
+        SsrfHostVerdict::NeedsDnsResolution => {
+            let port = uri.port_u16().unwrap_or(443);
+            // 异步解析:proxy runtime 仅 2 worker,热路径不能用同步 to_socket_addrs 阻塞。
+            // 只为捕捉"自定义域名 A 记录指向云 metadata"。解析失败 → 放行(只防 metadata)。
+            match tokio::net::lookup_host((host, port)).await {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        if is_cloud_metadata_ip(addr.ip()) {
+                            proxy_telemetry().logs.add(
+                                "WARN",
+                                format!("SSRF blocked: {host} → cloud metadata {}", addr.ip()),
+                            );
+                            return Err(ForwardError::BadRequest(format!(
+                                "upstream URL {host} resolves to cloud metadata IP: {}",
+                                addr.ip()
+                            )));
+                        }
+                    }
+                    Ok(())
+                }
+                Err(_) => Ok(()),
+            }
+        }
+    }
+}
+
+enum SsrfHostVerdict {
+    /// 字面 IP 且非 metadata(含 loopback/私网/公网):无需 DNS,直接放行。
+    LiteralAllowed,
+    /// 普通 hostname:需调用方做(异步或同步)DNS 解析后看是否落 metadata。
+    NeedsDnsResolution,
+}
+
+/// SSRF 无 DNS 前置判定:空 host / 字面 metadata IP / metadata hostname → 拒;
+/// 其余字面 IP(loopback/私网/公网)→ `LiteralAllowed`;hostname → `NeedsDnsResolution`。
+/// 被转发前异步检查与 redirect policy 同步检查共用。
+fn host_static_ssrf_verdict(host: &str) -> Result<SsrfHostVerdict, ForwardError> {
+    if host.is_empty() {
+        return Err(ForwardError::BadRequest("upstream URL has no host".into()));
+    }
+    // http::Uri / Url 对 IPv6 字面量保留 `[...]`,先剥方括号再 parse,
+    // 否则 `[::ffff:169.254.169.254]`(IPv4-mapped metadata)parse 失败会绕过字面校验。
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if is_cloud_metadata_ip(ip) {
+            return Err(ForwardError::BadRequest(format!(
+                "upstream URL points to cloud metadata IP: {host}"
+            )));
+        }
+        return Ok(SsrfHostVerdict::LiteralAllowed);
+    }
+    let mut lower = host.to_ascii_lowercase();
+    if lower.ends_with('.') {
+        // 去尾点:`metadata.google.internal.` 等价无尾点
+        lower.pop();
+    }
+    // metadata hostname 直接拒(它本就解析到 169.254.169.254,但显式拒错误信息更清晰)。
+    // 注意:**不**拦 `localhost` —— loopback 已整体放行(本地 LLM/桥合法)。
+    if lower == "metadata.google.internal" || lower == "metadata" {
+        return Err(ForwardError::BadRequest(format!(
+            "upstream URL points to cloud metadata hostname: {host}"
+        )));
+    }
+    Ok(SsrfHostVerdict::NeedsDnsResolution)
+}
+
+/// redirect policy 用的同步 host 安全检查(重定向是少见路径,可接受同步阻塞解析)。
+/// 返回 `Err(reason)` 表示该跳目标指向云 metadata,应拒绝跟随。解析失败 → 放行。
+fn redirect_host_is_safe(host: &str) -> Result<(), String> {
+    match host_static_ssrf_verdict(host).map_err(|e| e.to_string())? {
+        SsrfHostVerdict::LiteralAllowed => Ok(()),
+        SsrfHostVerdict::NeedsDnsResolution => {
+            use std::net::ToSocketAddrs;
+            match (host, 443u16).to_socket_addrs() {
+                Ok(resolved) => {
+                    for addr in resolved {
+                        if is_cloud_metadata_ip(addr.ip()) {
+                            return Err(format!(
+                                "redirect host {host} resolves to cloud metadata IP {}",
+                                addr.ip()
+                            ));
+                        }
+                    }
+                    Ok(())
+                }
+                Err(_) => Ok(()),
+            }
+        }
+    }
+}
+
+/// 是否是"云 metadata"端点(SSRF 真正高价值目标)。**只拦 metadata,不拦 loopback/私网**。
+fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_metadata_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            // IPv4-mapped(::ffff:a.b.c.d):映射回 v4 判断,
+            // 否则 `[::ffff:169.254.169.254]` 会绕过。
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_metadata_v4(v4);
+            }
+            // AWS IPv6 IMDS 端点 fd00:ec2::254
+            v6 == std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x254)
+        }
+    }
+}
+
+fn is_metadata_v4(v4: std::net::Ipv4Addr) -> bool {
+    // 169.254.0.0/16 链路本地 —— 云 metadata 都落 169.254.169.254;link-local 不是
+    // 合法上游,整段拦掉既覆盖 metadata 又无误伤。
+    v4.is_link_local()
+        // Alibaba Cloud metadata(落在 CGNAT 100.64/10,故单独点名)
+        || v4.octets() == [100, 100, 100, 200]
 }
 
 /// 构造 reqwest 上游请求 + 发送,返回 `(Response, 出站 headers 快照)`。
@@ -1219,6 +1693,96 @@ fn filter_hop_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssrf_blocks_cloud_metadata_ips() {
+        use std::net::IpAddr;
+        for s in [
+            "169.254.169.254",        // AWS/GCP/Azure/Oracle metadata
+            "169.254.0.1",            // link-local(整段拦)
+            "100.100.100.200",        // Alibaba Cloud metadata
+            "::ffff:169.254.169.254", // IPv4-mapped metadata
+            "fd00:ec2::254",          // AWS IPv6 IMDS
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_cloud_metadata_ip(ip), "{s} 应判为云 metadata");
+        }
+    }
+
+    #[test]
+    fn ssrf_allows_loopback_private_and_public() {
+        use std::net::IpAddr;
+        // 桌面代理:loopback(本地 LLM/桥)+ 私网 LAN + 公网都应放行
+        for s in [
+            "127.0.0.1",            // loopback
+            "::1",                  // IPv6 loopback
+            "::ffff:127.0.0.1",     // IPv4-mapped loopback
+            "10.1.2.3",             // RFC1918
+            "192.168.1.1",          // RFC1918
+            "172.16.0.1",           // RFC1918
+            "fc00::1",              // ULA
+            "100.64.0.1",           // CGNAT(非 Alibaba metadata)
+            "8.8.8.8",              // 公网
+            "1.1.1.1",              // 公网
+            "2606:4700:4700::1111", // 公网 v6
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!is_cloud_metadata_ip(ip), "{s} 应放行");
+        }
+    }
+
+    #[test]
+    fn ssrf_static_verdict_blocks_metadata_allows_local() {
+        // metadata IP / hostname → 拒
+        for url_host in [
+            "169.254.169.254",
+            "[::ffff:169.254.169.254]",
+            "100.100.100.200",
+            "metadata.google.internal",
+        ] {
+            assert!(
+                host_static_ssrf_verdict(url_host).is_err(),
+                "{url_host} 应被静态判定拒绝"
+            );
+        }
+        // 字面 loopback/私网/公网 → 放行(无需 DNS)
+        for url_host in ["127.0.0.1", "[::1]", "10.0.0.1", "8.8.8.8"] {
+            assert!(
+                matches!(
+                    host_static_ssrf_verdict(url_host),
+                    Ok(SsrfHostVerdict::LiteralAllowed)
+                ),
+                "{url_host} 字面应放行"
+            );
+        }
+        // hostname(含 localhost)→ 交 DNS(localhost 解析到 loopback,非 metadata → 放行)
+        for url_host in ["api.openai.com", "localhost"] {
+            assert!(
+                matches!(
+                    host_static_ssrf_verdict(url_host),
+                    Ok(SsrfHostVerdict::NeedsDnsResolution)
+                ),
+                "{url_host} 应走 DNS"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ssrf_check_blocks_metadata_allows_loopback() {
+        // 放行:loopback 上游(本地 LLM / 本地桥,如真机 127.0.0.1:29090)
+        assert!(check_ssrf_safe("http://127.0.0.1:6379/").await.is_ok());
+        assert!(check_ssrf_safe("http://[::1]:8080/").await.is_ok());
+        assert!(check_ssrf_safe("http://127.0.0.1:29090/v1").await.is_ok());
+        // 拦:云 metadata
+        assert!(check_ssrf_safe("http://169.254.169.254/latest/meta-data/")
+            .await
+            .is_err());
+        assert!(check_ssrf_safe("http://[::ffff:169.254.169.254]/")
+            .await
+            .is_err());
+        // 非法 URL 仍拒
+        assert!(check_ssrf_safe("not a url").await.is_err());
+    }
 
     #[tokio::test]
     async fn previous_response_not_found_renders_openai_sdk_compatible_400() {

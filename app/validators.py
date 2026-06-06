@@ -8,15 +8,25 @@ import tomlkit
 from .errors import APIError
 
 
-PROFILE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+MAX_PROFILE_NAME_LENGTH = 64
 HISTORY_ENTRY_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,180}$")
 
 
 def validate_profile_name(name: str) -> None:
-    if not PROFILE_NAME_RE.fullmatch(name):
+    invalid = (
+        not name
+        or len(name) > MAX_PROFILE_NAME_LENGTH
+        or name.strip() != name
+        or name.startswith(".")
+        or ".." in name
+        or "/" in name
+        or "\\" in name
+        or any(ord(char) < 32 or ord(char) == 127 for char in name)
+    )
+    if invalid:
         raise APIError(
             "INVALID_PROFILE_NAME",
-            "Invalid profile name. Use only a-z, A-Z, 0-9, _ and -, max length 64.",
+            "Invalid profile name. Chinese, letters, numbers, spaces, _ and - are supported, max length 64.",
             400,
         )
 

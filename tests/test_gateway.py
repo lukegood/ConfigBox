@@ -169,6 +169,20 @@ def test_gateway_presets_use_configbox_schema(tmp_path: Path):
     assert antigravity["messages"]
 
 
+def test_minimax_preset_uses_m3_with_one_m_context(tmp_path: Path):
+    gateway, *_ = load_gateway(tmp_path)
+
+    presets = gateway.list_presets()["presets"]
+    minimax = next(item for item in presets if item["id"] == "minimax")
+    provider = gateway.normalize_provider(minimax["provider"])
+    catalog = gateway.build_catalog_models(provider)
+
+    assert provider["models"]["default"] == "MiniMax-M3"
+    assert provider["modelCapabilities"]["MiniMax-M3"]["context_window"] == 1_000_000
+    assert catalog[0]["display_name"] == "MiniMax / MiniMax-M3"
+    assert catalog[0]["context_window"] == 1_000_000
+
+
 def test_antigravity_models_fall_back_to_preset_seed_when_gateway_is_stopped(tmp_path: Path):
     gateway, *_ = load_gateway(tmp_path)
 
@@ -192,6 +206,20 @@ def test_gateway_normalization_unknown_format_falls_back_to_openai_chat(tmp_path
     )
 
     assert provider["apiFormat"] == "openai_chat"
+
+
+def test_gateway_provider_name_allows_chinese(tmp_path: Path):
+    gateway, *_ = load_gateway(tmp_path)
+
+    provider = gateway.normalize_provider(
+        {
+            "name": "中文供应商",
+            "baseUrl": "https://example.com/v1",
+            "models": {"default": "model"},
+        }
+    )
+
+    assert provider["name"] == "中文供应商"
 
 
 def test_grok_web_requires_credentials_and_masks_public_payload(tmp_path: Path):

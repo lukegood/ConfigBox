@@ -313,6 +313,156 @@ fn minimax_sanitizes_invalid_tool_call_arguments_in_messages() {
 }
 
 #[test]
+fn minimax_m3_keeps_tool_strict_but_m2_drops() {
+    // 真机实测(2026-06-03):M3 接受 OpenAI strict function-calling(strict:true →
+    // 200 + 正常 tool_call);M2.x 不接受、剥掉。strict 是严格 schema 输出保证。
+    let mk = |model: &str| {
+        json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "strict": true, "parameters": {"type": "object", "properties": {}}}}]
+        })
+        .as_object()
+        .expect("json object")
+        .clone()
+    };
+    let mut m3 = mk("MiniMax-M3");
+    sanitize_minimax_chat_body(&mut m3);
+    assert_eq!(
+        m3["tools"][0]["function"]
+            .get("strict")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "M3 应保留 tool function.strict(实测接受)"
+    );
+    let mut m2 = mk("MiniMax-M2.7");
+    sanitize_minimax_chat_body(&mut m2);
+    assert!(
+        m2["tools"][0]["function"].get("strict").is_none(),
+        "M2.x 应剥 tool function.strict"
+    );
+}
+
+#[test]
+fn minimax_m3_keeps_stream_options_but_m2_drops() {
+    // #356 用户实测病态对话根因:proxy 删 stream_options → MiniMax 不返 usage →
+    // Codex token 恒 0 → token-based auto-compact 失效 → 对话无限膨胀。M3 实测
+    // (2026-06-03)streaming + include_usage 稳定返真实 usage,必须保留;M2.x 仍删。
+    let mk = |model: &str| {
+        json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        })
+        .as_object()
+        .expect("json object")
+        .clone()
+    };
+    let mut m3 = mk("MiniMax-M3");
+    sanitize_minimax_chat_body(&mut m3);
+    assert_eq!(
+        m3.get("stream_options")
+            .and_then(|v| v.get("include_usage"))
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "M3 必须保留 stream_options.include_usage(否则 Codex token 恒 0、对话膨胀)"
+    );
+    let mut m2 = mk("MiniMax-M2.7");
+    sanitize_minimax_chat_body(&mut m2);
+    assert!(
+        !m2.contains_key("stream_options"),
+        "M2.x 仍删 stream_options(streaming 不稳定接受 include_usage)"
+    );
+}
+
+#[test]
+fn minimax_m3_keeps_system_and_standard_fields() {
+    // 真机实测(2026-06-03,api.minimaxi.com 直连 MiniMax-M3):M3 原生接受
+    // role=system / response_format / parallel_tool_calls(M2.x 同字段 400)。
+    // sanitize 不应对 M3 做 M2.x 的 system→user 改写 + 字段剥离。
+    let mut body = json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "hi"}
+        ],
+        "response_format": {"type": "json_object"},
+        "parallel_tool_calls": true,
+        "reasoning_effort": "high",
+        "tool_choice": "required"
+    })
+    .as_object()
+    .expect("json object")
+    .clone();
+    sanitize_minimax_chat_body(&mut body);
+    let roles: Vec<String> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["role"].as_str().map(ToOwned::to_owned))
+        .collect();
+    assert!(
+        roles.iter().any(|r| r == "system"),
+        "M3 应保留 role=system(不转 user),实际 roles={roles:?}"
+    );
+    assert!(
+        body.contains_key("response_format"),
+        "M3 应保留 response_format(实测接受)"
+    );
+    assert!(
+        body.contains_key("parallel_tool_calls"),
+        "M3 应保留 parallel_tool_calls(实测接受)"
+    );
+    assert!(
+        body.contains_key("reasoning_effort"),
+        "M3 应保留 reasoning_effort(实测接受,按规范透传上游而非剥除)"
+    );
+    assert_eq!(
+        body.get("tool_choice").and_then(|v| v.as_str()),
+        Some("required"),
+        "M3 应保留 tool_choice=required(实测支持,不降级到 auto)"
+    );
+}
+
+#[test]
+fn minimax_m2_still_converts_system_and_drops_unsupported_fields() {
+    // 回归保护:M2.x 必须保持 #139 的 system→user + 字段剥离(M3 的宽松路径
+    // 不能误伤 M2.x)。
+    let mut body = json!({
+        "model": "MiniMax-M2.7",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"}
+        ],
+        "response_format": {"type": "json_object"},
+        "parallel_tool_calls": true
+    })
+    .as_object()
+    .expect("json object")
+    .clone();
+    sanitize_minimax_chat_body(&mut body);
+    let roles: Vec<String> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["role"].as_str().map(ToOwned::to_owned))
+        .collect();
+    assert!(
+        !roles.iter().any(|r| r == "system"),
+        "M2.x 必须把 system 转成 user(#139),实际 roles={roles:?}"
+    );
+    assert!(
+        !body.contains_key("response_format"),
+        "M2.x(非 Text-01)必须剥 response_format"
+    );
+    assert!(
+        !body.contains_key("parallel_tool_calls"),
+        "M2.x 必须剥 parallel_tool_calls"
+    );
+}
+
+#[test]
 fn minimax_long_system_split_into_multiple_user_prefix_messages() {
     // issue #139 修:超 max_chars 切片,每片独立 role=user + 标记部分编号
     // `[System part i/N]\n` prefix(silent-failure F4:让模型看出是同一逻辑
@@ -2241,6 +2391,84 @@ fn apply_patch_chat_path_guidance_idempotent_across_turns() {
                 .count();
             assert_eq!(guidance_count, 1, "每次 convert 仅注入一次 guidance");
         }
+    });
+}
+
+#[test]
+fn web_tools_guidance_injected_when_web_fetch_registered() {
+    // 注册 web_fetch/web_search 时, first turn 注入"联网优先用工具"引导; 跨 turn 幂等(只 1 段)。
+    // **真实 wire 形态**:cat-webfetch MCP 工具是 namespace 包裹(forward-trace 实证),检测器必须
+    // 递归进内层才能匹配 —— 顶层 function fixture 测不出这个(原测试的漏洞)。
+    with_user_language("en", || {
+        let one_turn = json!({
+            "input": [{"type": "message", "role": "user", "content": "find chatgpt pricing"}],
+            "instructions": "You are helpful.",
+            "tools": [{"type": "namespace", "name": "mcp__cat_webfetch", "tools": [
+                {"type": "function", "name": "web_fetch", "description": "fetch a url"},
+                {"type": "function", "name": "web_search", "description": "search"}
+            ]}]
+        });
+        for _ in 0..3 {
+            let out = convert(one_turn.clone());
+            let count = out["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["content"].as_str().unwrap_or_default())
+                .filter(|c| c.contains("outbound network here is restricted"))
+                .count();
+            assert_eq!(count, 1, "注册 web 工具时每次 convert 仅注入一次引导");
+        }
+    });
+}
+
+#[test]
+fn no_web_tools_guidance_without_web_tools() {
+    // 没注册 web_fetch/web_search 时不注入(避免干扰纯本地任务)。
+    with_user_language("en", || {
+        let out = convert(json!({
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "instructions": "You are helpful.",
+            "tools": [{"type": "function", "name": "some_other_tool", "description": "x"}]
+        }));
+        let injected = out["messages"].as_array().unwrap().iter().any(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("outbound network here is restricted")
+        });
+        assert!(!injected, "无 web 工具时不应注入引导");
+    });
+}
+
+#[test]
+fn web_tools_guidance_skipped_when_previous_response_id_set() {
+    // 后续 turn(previous_response_id 非空)不再注入 —— history 经 session cache 已含上轮注入,
+    // 再注入会逐 turn 堆积(同 apply_patch turn-gating,共享 is_first_turn gate)。
+    with_user_language("en", || {
+        let out = convert(json!({
+            "input": [{"type": "message", "role": "user", "content": "another query"}],
+            "instructions": "You are helpful.",
+            "previous_response_id": "resp_prior_web",
+            "tools": [{"type": "namespace", "name": "mcp__cat_webfetch", "tools": [
+                {"type": "function", "name": "web_search", "description": "search"}
+            ]}]
+        }));
+        let count = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("outbound network here is restricted")
+            })
+            .count();
+        assert_eq!(
+            count, 0,
+            "后续 turn(previous_response_id 非空)不应再注入引导(history 已含)"
+        );
     });
 }
 

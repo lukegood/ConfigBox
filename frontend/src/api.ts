@@ -15,6 +15,10 @@ import type {
 
 const AUTH_KEY = "configbox.loggedIn";
 
+function pathSegment(value: string) {
+  return encodeURIComponent(value);
+}
+
 export async function setAuth(username: string, password: string) {
   const user = await request<{ username: string; defaultPassword: boolean }>("/api/login", {
     method: "POST",
@@ -85,26 +89,26 @@ export async function createProfile(tool: string, name: string, source: "active"
 }
 
 export async function getProfile(tool: string, name: string) {
-  return request<ProfileDoc>(`/api/profiles/${tool}/${name}`);
+  return request<ProfileDoc>(`/api/profiles/${tool}/${pathSegment(name)}`);
 }
 
 export async function saveProfile(tool: string, name: string, files: ConfigFile[]) {
-  return request<ProfileDoc>(`/api/profiles/${tool}/${name}`, {
+  return request<ProfileDoc>(`/api/profiles/${tool}/${pathSegment(name)}`, {
     method: "PUT",
     body: JSON.stringify({ files: filePayload(files) })
   });
 }
 
 export async function deleteProfile(tool: string, name: string) {
-  return request<{ ok: boolean }>(`/api/profiles/${tool}/${name}`, { method: "DELETE" });
+  return request<{ ok: boolean }>(`/api/profiles/${tool}/${pathSegment(name)}`, { method: "DELETE" });
 }
 
 export async function activateProfile(tool: string, name: string) {
-  return request<ProfileDoc>(`/api/profiles/${tool}/${name}/activate`, { method: "POST" });
+  return request<ProfileDoc>(`/api/profiles/${tool}/${pathSegment(name)}/activate`, { method: "POST" });
 }
 
 export async function importRuntimeProfile(tool: string, name: string) {
-  return request<ProfileDoc>(`/api/profiles/${tool}/${name}/import-runtime`, { method: "POST" });
+  return request<ProfileDoc>(`/api/profiles/${tool}/${pathSegment(name)}/import-runtime`, { method: "POST" });
 }
 
 export async function listHistory(tool: string) {
@@ -112,11 +116,11 @@ export async function listHistory(tool: string) {
 }
 
 export async function getHistory(tool: string, profileName: string, entryName: string) {
-  return request<HistoryDoc>(`/api/history/${tool}/${profileName}/${entryName}`);
+  return request<HistoryDoc>(`/api/history/${tool}/${pathSegment(profileName)}/${pathSegment(entryName)}`);
 }
 
 export async function deleteHistory(tool: string, profileName: string, entryName: string) {
-  return request<{ ok: boolean }>(`/api/history/${tool}/${profileName}/${entryName}`, { method: "DELETE" });
+  return request<{ ok: boolean }>(`/api/history/${tool}/${pathSegment(profileName)}/${pathSegment(entryName)}`, { method: "DELETE" });
 }
 
 export async function clearHistory(tool: string) {
@@ -124,7 +128,7 @@ export async function clearHistory(tool: string) {
 }
 
 export async function restoreHistory(tool: string, profileName: string, entryName: string) {
-  return request<ProfileDoc>(`/api/history/${tool}/${profileName}/${entryName}/restore`, { method: "POST" });
+  return request<ProfileDoc>(`/api/history/${tool}/${pathSegment(profileName)}/${pathSegment(entryName)}/restore`, { method: "POST" });
 }
 
 export async function getGatewayConfig() {

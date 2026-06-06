@@ -65,6 +65,19 @@ def test_invalid_profile_name_rejected(tmp_path: Path):
     assert exc.value.code == "INVALID_PROFILE_NAME"
 
 
+def test_profile_name_allows_chinese(tmp_path: Path):
+    registry, storage, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("claude")
+
+    created = storage.create_profile(tool, "中文供应商", "active")
+    storage.save_profile(tool, "中文供应商", '{"model": "opus"}\n')
+    profiles = storage.list_profiles(tool)
+
+    assert created["name"] == "中文供应商"
+    assert storage.read_profile(tool, "中文供应商")["content"] == '{"model": "opus"}\n'
+    assert "中文供应商" in {profile["name"] for profile in profiles}
+
+
 def test_invalid_profile_json_rejected(tmp_path: Path):
     registry, storage, errors, *_ = load_modules(tmp_path)
     tool = registry.get_tool("claude")
@@ -100,6 +113,20 @@ def test_activate_profile_overwrites_runtime_without_history(tmp_path: Path):
     assert "HTTPS_PROXY" in claude_path.read_text(encoding="utf-8")
     assert storage.active_profile_name(tool) == "proxy"
     assert len(storage.list_history(tool)) == history_before_activate
+
+
+def test_delete_active_profile_switches_to_fallback(tmp_path: Path):
+    registry, storage, _, claude_path, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("claude")
+    storage.create_profile(tool, "中文供应商", "empty")
+    storage.save_profile(tool, "中文供应商", '{"model": "opus"}\n')
+    storage.activate_profile(tool, "中文供应商")
+
+    storage.delete_profile(tool, "中文供应商")
+
+    assert storage.active_profile_name(tool) == "default"
+    assert claude_path.read_text(encoding="utf-8") == '{"model": "sonnet"}\n'
+    assert "中文供应商" not in {profile["name"] for profile in storage.list_profiles(tool)}
 
 
 def test_active_profile_reports_runtime_change(tmp_path: Path):
