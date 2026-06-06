@@ -498,6 +498,44 @@ textarea {
   min-height: 32px;
 }
 
+.assistant-provider-list {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 7px;
+  max-height: 168px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.assistant-provider-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) auto minmax(160px, 1.2fr) auto;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--control);
+  padding: 8px 10px;
+  min-width: 0;
+}
+
+.assistant-provider-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assistant-provider-row span:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.assistant-provider-row small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .editor-loading {
   height: 100%;
   display: grid;
@@ -958,6 +996,7 @@ textarea {
   }
 
   .provider-row,
+  .assistant-provider-row,
   .provider-form-grid,
   .gateway-preset-grid,
   .gateway-mapping-grid,

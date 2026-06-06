@@ -77,6 +77,7 @@ DOCUMENTED_CONTEXT_WINDOWS = {
     "glm-4.7": 200_000,
     "qwen3.6-plus": ONE_M_CONTEXT_WINDOW,
     "qwen3.6-flash": ONE_M_CONTEXT_WINDOW,
+    "minimax-m3": ONE_M_CONTEXT_WINDOW,
     "minimax-m2.7": 204_800,
     "gemini-3.1-flash-lite": ONE_M_CONTEXT_WINDOW,
     "gemini-2.5-flash": ONE_M_CONTEXT_WINDOW,
@@ -170,7 +171,11 @@ CONFIGBOX_GATEWAY_PRESETS: list[dict[str, Any]] = [
             "baseUrl": "https://api.minimaxi.com/v1",
             "apiFormat": "openai_chat",
             "authScheme": "bearer",
-            "models": {"default": "MiniMax-M2.7"},
+            "models": {"default": "MiniMax-M3"},
+            "modelCapabilities": {
+                "MiniMax-M3": {"context_window": ONE_M_CONTEXT_WINDOW},
+                "MiniMax-M2.7": {"context_window": 204_800},
+            },
         },
     },
     {

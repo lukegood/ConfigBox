@@ -69,7 +69,7 @@ import type {
   ViewMode
 } from "./types";
 
-const profileNamePattern = /^[a-zA-Z0-9_-]{1,64}$/;
+const maxProfileNameLength = 64;
 const secretDots = "●●●●●●●●●●";
 
 type GatewayProviderForm = {
@@ -101,14 +101,30 @@ type GatewayCustomMapping = {
   value: string;
 };
 
+type OpenCodePreset = {
+  id: string;
+  name: string;
+  description: string;
+  npm: string;
+  baseURL: string;
+  models: Array<{ id: string; name: string }>;
+};
+
+type OpenCodeModelRow = {
+  id: string;
+  modelId: string;
+  modelName: string;
+};
+
 type OpenCodeProviderForm = {
+  originalProviderId: string;
+  presetId: string;
   providerId: string;
   name: string;
   npm: string;
   baseURL: string;
   apiKey: string;
-  modelId: string;
-  modelName: string;
+  models: OpenCodeModelRow[];
 };
 
 type OpenCodeModelForm = {
@@ -122,6 +138,38 @@ type OpenCodeSummary = {
   providerCount: number;
   modelCount: number;
   providerIds: string[];
+};
+
+type OpenCodeProviderSummary = {
+  id: string;
+  name: string;
+  baseURL: string;
+  modelCount: number;
+};
+
+type ClaudePreset = {
+  id: string;
+  name: string;
+  description: string;
+  baseUrl: string;
+  model: string;
+  smallFastModel?: string;
+};
+
+type ClaudeProviderForm = {
+  presetId: string;
+  baseUrl: string;
+  authToken: string;
+  model: string;
+  smallFastModel: string;
+  timeoutMs: string;
+};
+
+type ClaudeSummary = {
+  valid: boolean;
+  provider: string;
+  model: string;
+  hasToken: boolean;
 };
 
 const gatewayModelSlots = [
@@ -145,6 +193,7 @@ const gatewayApiFormats = [
 
 const gatewayPredefinedModelKeys = new Set<string>(gatewayModelSlots.map((slot) => slot.key));
 let gatewayCustomMappingCounter = 0;
+let openCodeModelRowCounter = 0;
 
 function emptyGatewayModels(): Record<string, string> {
   return Object.fromEntries(gatewayModelSlots.map((slot) => [slot.key, ""]));
@@ -153,6 +202,11 @@ function emptyGatewayModels(): Record<string, string> {
 function nextGatewayCustomMappingId() {
   gatewayCustomMappingCounter += 1;
   return `gateway-custom-${gatewayCustomMappingCounter}`;
+}
+
+function nextOpenCodeModelRowId() {
+  openCodeModelRowCounter += 1;
+  return `opencode-model-${openCodeModelRowCounter}`;
 }
 
 const emptyGatewayProviderForm: GatewayProviderForm = {
@@ -178,15 +232,104 @@ const emptyGatewayProviderForm: GatewayProviderForm = {
   isBuiltin: false
 };
 
-const emptyOpenCodeProviderForm: OpenCodeProviderForm = {
-  providerId: "",
-  name: "",
-  npm: "@ai-sdk/openai-compatible",
-  baseURL: "",
-  apiKey: "",
-  modelId: "",
-  modelName: ""
-};
+const openCodePresets: OpenCodePreset[] = [
+  {
+    id: "openai-compatible",
+    name: "OpenAI Compatible",
+    description: "通用 OpenAI 兼容接口",
+    npm: "@ai-sdk/openai-compatible",
+    baseURL: "",
+    models: [{ id: "", name: "" }]
+  },
+  {
+    id: "openrouter",
+    name: "OpenRouter",
+    description: "OpenRouter Chat Completions",
+    npm: "@ai-sdk/openai-compatible",
+    baseURL: "https://openrouter.ai/api/v1",
+    models: [{ id: "anthropic/claude-sonnet-4", name: "Claude Sonnet 4" }]
+  },
+  {
+    id: "zhipu",
+    name: "智谱 GLM",
+    description: "GLM Coding / OpenAI 兼容接口",
+    npm: "@ai-sdk/openai-compatible",
+    baseURL: "https://open.bigmodel.cn/api/coding/paas/v4",
+    models: [{ id: "GLM-5.1", name: "GLM-5.1" }]
+  },
+  {
+    id: "moonshot",
+    name: "Moonshot Kimi",
+    description: "Moonshot OpenAI 兼容接口",
+    npm: "@ai-sdk/openai-compatible",
+    baseURL: "https://api.moonshot.cn/v1",
+    models: [{ id: "kimi-k2-0711-preview", name: "Kimi K2" }]
+  },
+  {
+    id: "deepseek",
+    name: "DeepSeek",
+    description: "DeepSeek OpenAI 兼容接口",
+    npm: "@ai-sdk/openai-compatible",
+    baseURL: "https://api.deepseek.com/v1",
+    models: [{ id: "deepseek-chat", name: "DeepSeek Chat" }]
+  }
+];
+
+const claudePresets: ClaudePreset[] = [
+  {
+    id: "anthropic",
+    name: "Anthropic",
+    description: "Claude 官方 API",
+    baseUrl: "https://api.anthropic.com",
+    model: "claude-sonnet-4-20250514",
+    smallFastModel: "claude-3-5-haiku-20241022"
+  },
+  {
+    id: "openrouter",
+    name: "OpenRouter",
+    description: "OpenRouter Anthropic 兼容入口",
+    baseUrl: "https://openrouter.ai/api/anthropic",
+    model: "anthropic/claude-sonnet-4",
+    smallFastModel: "anthropic/claude-3.5-haiku"
+  },
+  {
+    id: "zhipu",
+    name: "智谱 GLM",
+    description: "GLM Claude Code 兼容入口",
+    baseUrl: "https://open.bigmodel.cn/api/anthropic",
+    model: "glm-4.5",
+    smallFastModel: "glm-4.5-air"
+  },
+  {
+    id: "moonshot",
+    name: "Moonshot Kimi",
+    description: "Kimi Claude Code 兼容入口",
+    baseUrl: "https://api.moonshot.cn/anthropic",
+    model: "kimi-k2-0711-preview",
+    smallFastModel: "kimi-k2-0711-preview"
+  },
+  {
+    id: "deepseek",
+    name: "DeepSeek",
+    description: "DeepSeek Anthropic 兼容入口",
+    baseUrl: "https://api.deepseek.com/anthropic",
+    model: "deepseek-chat",
+    smallFastModel: "deepseek-chat"
+  }
+];
+
+function emptyOpenCodeProviderFormValue(): OpenCodeProviderForm {
+  return {
+    originalProviderId: "",
+    presetId: "",
+    providerId: "",
+    name: "",
+    npm: "@ai-sdk/openai-compatible",
+    baseURL: "",
+    apiKey: "",
+    models: [{ id: nextOpenCodeModelRowId(), modelId: "", modelName: "" }]
+  };
+}
 
 function App() {
   const [authenticated, setAuthenticated] = useState(hasAuth());
@@ -231,13 +374,17 @@ function App() {
   const [gatewayOAuthBusy, setGatewayOAuthBusy] = useState<"gemini" | "antigravity" | null>(null);
   const [openCodeProviderForm, setOpenCodeProviderForm] = useState<OpenCodeProviderForm | null>(null);
   const [openCodeModelForm, setOpenCodeModelForm] = useState<OpenCodeModelForm | null>(null);
+  const [claudeProviderForm, setClaudeProviderForm] = useState<ClaudeProviderForm | null>(null);
   const [showGatewayProviderApiKey, setShowGatewayProviderApiKey] = useState(false);
   const [showOpenCodeProviderApiKey, setShowOpenCodeProviderApiKey] = useState(false);
+  const [showClaudeProviderToken, setShowClaudeProviderToken] = useState(false);
 
   const tool = useMemo(() => tools.find((item) => item.id === toolId), [tools, toolId]);
   const activeFile = useMemo(() => files.find((file) => file.id === activeFileId) ?? files[0], [files, activeFileId]);
   const activeContent = activeFile?.content ?? "";
   const openCodeStats = useMemo(() => summarizeOpenCodeConfig(activeContent), [activeContent]);
+  const openCodeProviders = useMemo(() => summarizeOpenCodeProviders(activeContent), [activeContent]);
+  const claudeStats = useMemo(() => summarizeClaudeConfig(activeContent), [activeContent]);
   const visibleGatewayPresets = useMemo(
     () => gatewayPresets.filter((preset) => showGatewayExperimentalPresets || preset.experimental !== true),
     [gatewayPresets, showGatewayExperimentalPresets]
@@ -252,6 +399,8 @@ function App() {
   const selectedProfileActive = profiles.some((item) => item.name === selectedProfile && item.active);
   const showRuntimeImport = mode === "profile" && selectedProfileActive && runtimeChanged;
   const showOpenCodeAssistant = toolId === "opencode" && mode === "profile" && activeFile?.format === "json";
+  const showClaudeAssistant = toolId === "claude" && mode === "profile" && activeFile?.format === "json";
+  const showProfileAssistant = showOpenCodeAssistant || showClaudeAssistant;
   const sensitive = files.some((file) => /api[_-]?key|token|secret|password/i.test(file.content));
   const contentLength = files.reduce((sum, file) => sum + file.content.length, 0);
 
@@ -430,10 +579,10 @@ function App() {
   }
 
   async function handleCreateProfile(source: "active" | "empty") {
-    const name = window.prompt("Profile 名称");
+    const name = window.prompt("Profile 名称")?.trim();
     if (!name) return;
-    if (!profileNamePattern.test(name)) {
-      setError("Profile 名称只能使用字母、数字、下划线和短横线，最长 64 个字符");
+    if (!isValidProfileName(name)) {
+      setError("Profile 名称支持中文、英文、数字、空格、下划线和短横线，最长 64 个字符");
       return;
     }
     setLoading(true);
@@ -962,9 +1111,34 @@ function App() {
     }
   }
 
-  function openOpenCodeProviderForm() {
+  function openOpenCodeProviderForm(providerId?: string) {
     setShowOpenCodeProviderApiKey(false);
-    setOpenCodeProviderForm(emptyOpenCodeProviderForm);
+    if (!providerId) {
+      setOpenCodeProviderForm(emptyOpenCodeProviderFormValue());
+      return;
+    }
+    try {
+      const doc = parseOpenCodeObject(activeContent);
+      const provider = ensurePlainObject(ensurePlainObject(doc.provider)[providerId]);
+      const options = ensurePlainObject(provider.options);
+      const models = Object.entries(ensurePlainObject(provider.models)).map(([modelId, model]) => ({
+        id: nextOpenCodeModelRowId(),
+        modelId,
+        modelName: stringValue(ensurePlainObject(model).name) || modelId
+      }));
+      setOpenCodeProviderForm({
+        originalProviderId: providerId,
+        presetId: findOpenCodePresetId(provider),
+        providerId,
+        name: stringValue(provider.name) || providerId,
+        npm: stringValue(provider.npm) || "@ai-sdk/openai-compatible",
+        baseURL: stringValue(options.baseURL) || stringValue(options.baseUrl),
+        apiKey: "",
+        models: models.length ? models : [{ id: nextOpenCodeModelRowId(), modelId: "", modelName: "" }]
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取 OpenCode Provider 失败");
+    }
   }
 
   function openOpenCodeModelFormDialog() {
@@ -984,6 +1158,62 @@ function App() {
     setOpenCodeProviderForm((current) => (current ? { ...current, [field]: value } : current));
   }
 
+  function applyOpenCodePreset(preset: OpenCodePreset) {
+    setOpenCodeProviderForm((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        presetId: preset.id,
+        providerId: current.originalProviderId ? current.providerId : preset.id,
+        name: preset.name,
+        npm: preset.npm,
+        baseURL: preset.baseURL,
+        models: preset.models.map((model) => ({
+          id: nextOpenCodeModelRowId(),
+          modelId: model.id,
+          modelName: model.name
+        }))
+      };
+    });
+    setShowOpenCodeProviderApiKey(false);
+  }
+
+  function addOpenCodeFormModel() {
+    setOpenCodeProviderForm((current) =>
+      current
+        ? {
+            ...current,
+            models: [...current.models, { id: nextOpenCodeModelRowId(), modelId: "", modelName: "" }]
+          }
+        : current
+    );
+  }
+
+  function updateOpenCodeFormModel(id: string, field: "modelId" | "modelName", value: string) {
+    setOpenCodeProviderForm((current) =>
+      current
+        ? {
+            ...current,
+            models: current.models.map((model) => (model.id === id ? { ...model, [field]: value } : model))
+          }
+        : current
+    );
+  }
+
+  function removeOpenCodeFormModel(id: string) {
+    setOpenCodeProviderForm((current) =>
+      current
+        ? {
+            ...current,
+            models:
+              current.models.length > 1
+                ? current.models.filter((model) => model.id !== id)
+                : [{ id: nextOpenCodeModelRowId(), modelId: "", modelName: "" }]
+          }
+        : current
+    );
+  }
+
   function updateOpenCodeModelForm(field: keyof OpenCodeModelForm, value: string) {
     setOpenCodeModelForm((current) => (current ? { ...current, [field]: value } : current));
   }
@@ -992,38 +1222,77 @@ function App() {
     event.preventDefault();
     if (!openCodeProviderForm) return;
     const form = trimOpenCodeProviderForm(openCodeProviderForm);
-    if (!form.providerId || !form.name || !form.npm || !form.baseURL || !form.apiKey || !form.modelId) {
-      setError("Provider ID、名称、npm、Base URL、API Key 和初始模型必填");
+    const models = form.models.filter((model) => model.modelId);
+    if (!form.providerId || !form.name || !form.npm || !form.baseURL || !models.length) {
+      setError("Provider ID、名称、npm、Base URL 和至少一个模型必填");
+      return;
+    }
+    const duplicatedModel = findDuplicate(models.map((model) => model.modelId));
+    if (duplicatedModel) {
+      setError(`Model "${duplicatedModel}" 重复`);
       return;
     }
     try {
       const doc = parseOpenCodeObject(activeContent);
       const providers = ensurePlainObject(doc.provider);
-      if (providers[form.providerId] !== undefined) {
+      const isEditing = Boolean(form.originalProviderId);
+      if ((!isEditing || form.providerId !== form.originalProviderId) && providers[form.providerId] !== undefined) {
         setError(`Provider "${form.providerId}" 已存在`);
         return;
       }
+      const existingProvider = ensurePlainObject(providers[form.originalProviderId || form.providerId]);
+      const existingOptions = ensurePlainObject(existingProvider.options);
+      if (!form.apiKey && !stringValue(existingOptions.apiKey)) {
+        setError("API Key 必填；编辑已有 Provider 时留空才会保留原值");
+        return;
+      }
+      const existingModels = ensurePlainObject(existingProvider.models);
+      const nextModels: Record<string, unknown> = {};
+      for (const model of models) {
+        const existingModel = ensurePlainObject(existingModels[model.modelId]);
+        nextModels[model.modelId] = {
+          ...existingModel,
+          name: model.modelName || model.modelId
+        };
+      }
+      const nextOptions = {
+        ...existingOptions,
+        baseURL: form.baseURL,
+        apiKey: form.apiKey || stringValue(existingOptions.apiKey)
+      };
+      if (form.originalProviderId && form.originalProviderId !== form.providerId) {
+        delete providers[form.originalProviderId];
+      }
       doc.$schema = typeof doc.$schema === "string" ? doc.$schema : "https://opencode.ai/config.json";
       providers[form.providerId] = {
+        ...existingProvider,
         npm: form.npm,
         name: form.name,
-        options: {
-          baseURL: form.baseURL,
-          apiKey: form.apiKey
-        },
-        models: {
-          [form.modelId]: {
-            name: form.modelName || form.modelId
-          }
-        }
+        options: nextOptions,
+        models: nextModels
       };
       doc.provider = providers;
       updateActiveContent(formatOpenCodeConfig(doc));
       setOpenCodeProviderForm(null);
       setError("");
-      setStatus(`已添加 OpenCode Provider: ${form.providerId}`);
+      setStatus(`${isEditing ? "已更新" : "已添加"} OpenCode Provider: ${form.providerId}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "添加 Provider 失败");
+      setError(err instanceof Error ? err.message : "保存 Provider 失败");
+    }
+  }
+
+  function handleOpenCodeDeleteProvider(providerId: string) {
+    if (!window.confirm(`删除 OpenCode Provider "${providerId}"？`)) return;
+    try {
+      const doc = parseOpenCodeObject(activeContent);
+      const providers = ensurePlainObject(doc.provider);
+      delete providers[providerId];
+      doc.provider = providers;
+      updateActiveContent(formatOpenCodeConfig(doc));
+      setError("");
+      setStatus(`已删除 OpenCode Provider: ${providerId}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除 Provider 失败");
     }
   }
 
@@ -1060,6 +1329,80 @@ function App() {
       setStatus(`已添加 OpenCode Model: ${modelId}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "添加 Model 失败");
+    }
+  }
+
+  function openClaudeProviderForm() {
+    setShowClaudeProviderToken(false);
+    try {
+      const doc = parseClaudeSettingsObject(activeContent);
+      const env = ensurePlainObject(doc.env);
+      const baseUrl = stringValue(env.ANTHROPIC_BASE_URL);
+      const preset = findClaudePresetByBaseUrl(baseUrl);
+      setClaudeProviderForm({
+        presetId: preset?.id || "",
+        baseUrl,
+        authToken: "",
+        model: stringValue(env.ANTHROPIC_MODEL),
+        smallFastModel: stringValue(env.ANTHROPIC_SMALL_FAST_MODEL),
+        timeoutMs: stringValue(env.API_TIMEOUT_MS)
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取 Claude 设置失败");
+    }
+  }
+
+  function updateClaudeProviderForm(field: keyof ClaudeProviderForm, value: string) {
+    setClaudeProviderForm((current) => (current ? { ...current, [field]: value } : current));
+  }
+
+  function applyClaudePreset(preset: ClaudePreset) {
+    setClaudeProviderForm((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        presetId: preset.id,
+        baseUrl: preset.baseUrl,
+        model: preset.model,
+        smallFastModel: preset.smallFastModel || current.smallFastModel
+      };
+    });
+    setShowClaudeProviderToken(false);
+  }
+
+  function handleClaudeProviderSubmit(event: FormEvent) {
+    event.preventDefault();
+    if (!claudeProviderForm) return;
+    const form = trimClaudeProviderForm(claudeProviderForm);
+    if (!form.baseUrl || !form.model) {
+      setError("Base URL 和主模型必填");
+      return;
+    }
+    try {
+      const doc = parseClaudeSettingsObject(activeContent);
+      const env = ensurePlainObject(doc.env);
+      env.ANTHROPIC_BASE_URL = form.baseUrl;
+      env.ANTHROPIC_MODEL = form.model;
+      if (form.smallFastModel) {
+        env.ANTHROPIC_SMALL_FAST_MODEL = form.smallFastModel;
+      } else {
+        delete env.ANTHROPIC_SMALL_FAST_MODEL;
+      }
+      if (form.authToken) {
+        env.ANTHROPIC_AUTH_TOKEN = form.authToken;
+      }
+      if (form.timeoutMs) {
+        env.API_TIMEOUT_MS = form.timeoutMs;
+      } else {
+        delete env.API_TIMEOUT_MS;
+      }
+      doc.env = env;
+      updateActiveContent(formatOpenCodeConfig(doc));
+      setClaudeProviderForm(null);
+      setError("");
+      setStatus("已更新 Claude Provider 环境配置");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存 Claude Provider 失败");
     }
   }
 
@@ -1479,7 +1822,7 @@ function App() {
             ) : null}
             {error ? <div className="banner error">{error}</div> : null}
 
-            <div className={showOpenCodeAssistant ? "editor-panel with-helper" : "editor-panel"}>
+            <div className={showProfileAssistant ? "editor-panel with-helper" : "editor-panel"}>
               <div className="file-tabs" role="tablist">
                 {files.map((file) => (
                   <button
@@ -1506,13 +1849,60 @@ function App() {
                     <span>{openCodeStats.modelCount} models</span>
                   </div>
                   <div className="opencode-helper-actions">
-                    <button type="button" onClick={openOpenCodeProviderForm} disabled={loading}>
+                    <button type="button" onClick={() => openOpenCodeProviderForm()} disabled={loading}>
                       <FolderPlus size={15} />
                       Provider
                     </button>
                     <button type="button" onClick={openOpenCodeModelFormDialog} disabled={loading}>
                       +
                       Model
+                    </button>
+                  </div>
+                  {openCodeProviders.length ? (
+                    <div className="assistant-provider-list">
+                      {openCodeProviders.map((provider) => (
+                        <div className="assistant-provider-row" key={provider.id}>
+                          <span>
+                            <strong>{provider.name || provider.id}</strong>
+                            <small>{provider.id}</small>
+                          </span>
+                          <span>{provider.modelCount} models</span>
+                          <span>{provider.baseURL || "-"}</span>
+                          <span className="provider-actions">
+                            <button type="button" onClick={() => openOpenCodeProviderForm(provider.id)}>
+                              编辑
+                            </button>
+                            <button
+                              type="button"
+                              className="danger"
+                              onClick={() => handleOpenCodeDeleteProvider(provider.id)}
+                            >
+                              <Trash2 size={15} />
+                            </button>
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+              {showClaudeAssistant ? (
+                <div className="opencode-helper">
+                  <div className="opencode-helper-title">
+                    <span>Claude Provider 助手</span>
+                    <span className={claudeStats.valid ? "pill" : "pill muted-pill"}>
+                      {claudeStats.valid ? "JSON" : "JSON 错误"}
+                    </span>
+                  </div>
+                  <div className="opencode-helper-stats">
+                    <span>{claudeStats.provider}</span>
+                    <span>{claudeStats.model}</span>
+                    <span>{claudeStats.hasToken ? "token 已设置" : "token 未设置"}</span>
+                  </div>
+                  <div className="opencode-helper-actions">
+                    <button type="button" onClick={openClaudeProviderForm} disabled={loading}>
+                      <PlugZap size={15} />
+                      Provider
                     </button>
                   </div>
                 </div>
@@ -1938,13 +2328,37 @@ function App() {
           <form className="provider-modal" onSubmit={handleOpenCodeProviderSubmit}>
             <div className="modal-head">
               <div>
-                <h3>添加 OpenCode Provider</h3>
+                <h3>{openCodeProviderForm.originalProviderId ? "编辑 OpenCode Provider" : "添加 OpenCode Provider"}</h3>
                 <p>config.json</p>
               </div>
               <button type="button" onClick={() => setOpenCodeProviderForm(null)}>
                 关闭
               </button>
             </div>
+            <section className="gateway-preset-section">
+              <div className="gateway-mapping-head">
+                <div>
+                  <h4>快捷预设</h4>
+                  <p>按 OpenCode provider 写法填充 npm、Base URL 和常用模型。</p>
+                </div>
+              </div>
+              <div className="gateway-preset-grid">
+                {openCodePresets.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    className={openCodeProviderForm.presetId === preset.id ? "gateway-preset-card selected" : "gateway-preset-card"}
+                    onClick={() => applyOpenCodePreset(preset)}
+                  >
+                    <span>
+                      <strong>{preset.name}</strong>
+                      <small>{preset.description}</small>
+                    </span>
+                    <span className="provider-meta">{preset.npm.replace("@ai-sdk/", "")}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
             <div className="provider-form-grid">
               <label>
                 Provider ID
@@ -1985,7 +2399,7 @@ function App() {
                   <input
                     value={openCodeProviderForm.apiKey}
                     onChange={(event) => updateOpenCodeProviderForm("apiKey", event.target.value)}
-                    placeholder="sk-..."
+                    placeholder={openCodeProviderForm.originalProviderId ? "留空则保持原 API Key" : "sk-..."}
                     type={showOpenCodeProviderApiKey ? "text" : "password"}
                   />
                   <button
@@ -1998,30 +2412,157 @@ function App() {
                   </button>
                 </div>
               </label>
-              <label>
-                初始模型 ID
-                <input
-                  value={openCodeProviderForm.modelId}
-                  onChange={(event) => updateOpenCodeProviderForm("modelId", event.target.value)}
-                  placeholder="GLM-5.1"
-                />
-              </label>
-              <label>
-                初始模型名称
-                <input
-                  value={openCodeProviderForm.modelName}
-                  onChange={(event) => updateOpenCodeProviderForm("modelName", event.target.value)}
-                  placeholder="GLM-5.1"
-                />
-              </label>
             </div>
+            <section className="gateway-mapping-section">
+              <div className="gateway-mapping-head">
+                <div>
+                  <h4>模型</h4>
+                  <p>写入 provider.models；模型名称留空时使用模型 ID。</p>
+                </div>
+                <button type="button" onClick={addOpenCodeFormModel}>
+                  + 模型
+                </button>
+              </div>
+              <div className="gateway-custom-mappings">
+                {openCodeProviderForm.models.map((model) => (
+                  <div className="gateway-custom-mapping-row" key={model.id}>
+                    <label>
+                      模型 ID
+                      <input
+                        value={model.modelId}
+                        onChange={(event) => updateOpenCodeFormModel(model.id, "modelId", event.target.value)}
+                        placeholder="GLM-5.1"
+                      />
+                    </label>
+                    <label>
+                      模型名称
+                      <input
+                        value={model.modelName}
+                        onChange={(event) => updateOpenCodeFormModel(model.id, "modelName", event.target.value)}
+                        placeholder={model.modelId || "GLM-5.1"}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() => removeOpenCodeFormModel(model.id)}
+                      title="删除模型"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </section>
             <div className="modal-actions">
               <button type="button" onClick={() => setOpenCodeProviderForm(null)}>
                 取消
               </button>
               <button className="primary" type="submit">
                 <Save size={16} />
-                添加
+                保存
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+      {claudeProviderForm ? (
+        <div className="modal-backdrop" role="presentation">
+          <form className="provider-modal" onSubmit={handleClaudeProviderSubmit}>
+            <div className="modal-head">
+              <div>
+                <h3>配置 Claude Provider</h3>
+                <p>settings.json env</p>
+              </div>
+              <button type="button" onClick={() => setClaudeProviderForm(null)}>
+                关闭
+              </button>
+            </div>
+            <section className="gateway-preset-section">
+              <div className="gateway-mapping-head">
+                <div>
+                  <h4>快捷预设</h4>
+                  <p>写入 Claude Code 支持的环境变量。</p>
+                </div>
+              </div>
+              <div className="gateway-preset-grid">
+                {claudePresets.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    className={claudeProviderForm.presetId === preset.id ? "gateway-preset-card selected" : "gateway-preset-card"}
+                    onClick={() => applyClaudePreset(preset)}
+                  >
+                    <span>
+                      <strong>{preset.name}</strong>
+                      <small>{preset.description}</small>
+                    </span>
+                    <span className="provider-meta">{preset.model}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+            <div className="provider-form-grid">
+              <label>
+                Base URL
+                <input
+                  value={claudeProviderForm.baseUrl}
+                  onChange={(event) => updateClaudeProviderForm("baseUrl", event.target.value)}
+                  placeholder="https://api.anthropic.com"
+                  autoFocus
+                />
+              </label>
+              <label>
+                Auth Token
+                <div className="secret-input-wrap">
+                  <input
+                    value={claudeProviderForm.authToken}
+                    onChange={(event) => updateClaudeProviderForm("authToken", event.target.value)}
+                    placeholder="留空则保持原 token"
+                    type={showClaudeProviderToken ? "text" : "password"}
+                  />
+                  <button
+                    type="button"
+                    className="secret-toggle input"
+                    onClick={() => setShowClaudeProviderToken((current) => !current)}
+                    title={showClaudeProviderToken ? "隐藏 Token" : "显示 Token"}
+                  >
+                    {showClaudeProviderToken ? <EyeOff size={14} /> : <Eye size={14} />}
+                  </button>
+                </div>
+              </label>
+              <label>
+                主模型
+                <input
+                  value={claudeProviderForm.model}
+                  onChange={(event) => updateClaudeProviderForm("model", event.target.value)}
+                  placeholder="claude-sonnet-4-20250514"
+                />
+              </label>
+              <label>
+                快速小模型
+                <input
+                  value={claudeProviderForm.smallFastModel}
+                  onChange={(event) => updateClaudeProviderForm("smallFastModel", event.target.value)}
+                  placeholder="claude-3-5-haiku-20241022"
+                />
+              </label>
+              <label>
+                超时毫秒
+                <input
+                  value={claudeProviderForm.timeoutMs}
+                  onChange={(event) => updateClaudeProviderForm("timeoutMs", event.target.value)}
+                  placeholder="600000"
+                />
+              </label>
+            </div>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setClaudeProviderForm(null)}>
+                取消
+              </button>
+              <button className="primary" type="submit">
+                <Save size={16} />
+                保存
               </button>
             </div>
           </form>
@@ -2126,10 +2667,30 @@ function formatBytes(bytes: number) {
   return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
+function isValidProfileName(name: string) {
+  return (
+    name.length > 0 &&
+    name.length <= maxProfileNameLength &&
+    name.trim() === name &&
+    !name.startsWith(".") &&
+    !name.includes("..") &&
+    !/[\\/]/.test(name) &&
+    !/[\u0000-\u001f\u007f]/.test(name)
+  );
+}
+
 function parseOpenCodeObject(content: string): Record<string, unknown> {
   const parsed = JSON.parse(content || "{}");
   if (!isPlainObject(parsed)) {
     throw new Error("OpenCode 配置根节点必须是 JSON 对象");
+  }
+  return parsed;
+}
+
+function parseClaudeSettingsObject(content: string): Record<string, unknown> {
+  const parsed = JSON.parse(content || "{}");
+  if (!isPlainObject(parsed)) {
+    throw new Error("Claude 设置根节点必须是 JSON 对象");
   }
   return parsed;
 }
@@ -2140,6 +2701,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function ensurePlainObject(value: unknown): Record<string, unknown> {
   return isPlainObject(value) ? value : {};
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" ? value : "";
 }
 
 function summarizeOpenCodeConfig(content: string): OpenCodeSummary {
@@ -2167,20 +2732,99 @@ function summarizeOpenCodeConfig(content: string): OpenCodeSummary {
   }
 }
 
+function summarizeOpenCodeProviders(content: string): OpenCodeProviderSummary[] {
+  try {
+    const doc = parseOpenCodeObject(content);
+    const providers = ensurePlainObject(doc.provider);
+    return Object.entries(providers).map(([id, provider]) => {
+      const providerDoc = ensurePlainObject(provider);
+      const options = ensurePlainObject(providerDoc.options);
+      return {
+        id,
+        name: stringValue(providerDoc.name),
+        baseURL: stringValue(options.baseURL) || stringValue(options.baseUrl),
+        modelCount: Object.keys(ensurePlainObject(providerDoc.models)).length
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+function summarizeClaudeConfig(content: string): ClaudeSummary {
+  try {
+    const doc = parseClaudeSettingsObject(content);
+    const env = ensurePlainObject(doc.env);
+    const baseUrl = stringValue(env.ANTHROPIC_BASE_URL);
+    return {
+      valid: true,
+      provider: findClaudePresetByBaseUrl(baseUrl)?.name || baseUrl || "Anthropic 默认",
+      model: stringValue(env.ANTHROPIC_MODEL) || "默认模型",
+      hasToken: Boolean(stringValue(env.ANTHROPIC_AUTH_TOKEN) || stringValue(env.ANTHROPIC_API_KEY))
+    };
+  } catch {
+    return {
+      valid: false,
+      provider: "JSON 错误",
+      model: "-",
+      hasToken: false
+    };
+  }
+}
+
 function trimOpenCodeProviderForm(form: OpenCodeProviderForm): OpenCodeProviderForm {
   return {
+    originalProviderId: form.originalProviderId.trim(),
+    presetId: form.presetId.trim(),
     providerId: form.providerId.trim(),
     name: form.name.trim(),
     npm: form.npm.trim(),
     baseURL: form.baseURL.trim(),
     apiKey: form.apiKey.trim(),
-    modelId: form.modelId.trim(),
-    modelName: form.modelName.trim()
+    models: form.models.map((model) => ({
+      id: model.id,
+      modelId: model.modelId.trim(),
+      modelName: model.modelName.trim()
+    }))
+  };
+}
+
+function trimClaudeProviderForm(form: ClaudeProviderForm): ClaudeProviderForm {
+  return {
+    presetId: form.presetId.trim(),
+    baseUrl: form.baseUrl.trim(),
+    authToken: form.authToken.trim(),
+    model: form.model.trim(),
+    smallFastModel: form.smallFastModel.trim(),
+    timeoutMs: form.timeoutMs.trim()
   };
 }
 
 function formatOpenCodeConfig(doc: Record<string, unknown>) {
   return JSON.stringify(doc, null, 2) + "\n";
+}
+
+function findOpenCodePresetId(provider: Record<string, unknown>) {
+  const npm = normalizeCompareKey(stringValue(provider.npm));
+  const options = ensurePlainObject(provider.options);
+  const baseURL = normalizeCompareKey(stringValue(options.baseURL) || stringValue(options.baseUrl));
+  return openCodePresets.find((preset) => {
+    return normalizeCompareKey(preset.npm) === npm && (!preset.baseURL || normalizeCompareKey(preset.baseURL) === baseURL);
+  })?.id || "";
+}
+
+function findClaudePresetByBaseUrl(baseUrl: string) {
+  const normalized = normalizeCompareKey(baseUrl);
+  return claudePresets.find((preset) => normalizeCompareKey(preset.baseUrl) === normalized) ?? null;
+}
+
+function findDuplicate(values: string[]) {
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (seen.has(value)) return value;
+    seen.add(value);
+  }
+  return "";
 }
 
 function providerExtraHeaders(provider: GatewayConfig["providers"][number]) {

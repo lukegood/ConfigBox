@@ -247,6 +247,18 @@ def profile_exists(tool: ToolConfig, name: str) -> bool:
     return is_multi_file(tool) and legacy_profile_path(tool, name).exists()
 
 
+def profile_names(tool: ToolConfig) -> list[str]:
+    names: set[str] = set()
+    if is_multi_file(tool):
+        for path in tool.profile_dir.iterdir():
+            if path.is_dir():
+                names.add(path.name)
+    for path in tool.profile_dir.glob(f"*{tool.ext}"):
+        if path.is_file():
+            names.add(path.name[: -len(tool.ext)])
+    return sorted(names)
+
+
 def profile_file_path(tool: ToolConfig, name: str, file: ToolFile) -> Path:
     if is_multi_file(tool):
         return profile_path(tool, name) / file.filename
@@ -436,10 +448,22 @@ def save_profile(
 def delete_profile(tool: ToolConfig, name: str) -> None:
     ensure_dirs(tool)
     migrate_legacy_profiles(tool)
-    if active_profile_name(tool) == name:
-        raise APIError("PROFILE_ACTIVE", "Cannot delete the currently active profile.", 409)
+    validate_profile_name(name)
     try:
         with lock_for(tool):
+            names = profile_names(tool)
+            if name not in names:
+                raise APIError("PROFILE_NOT_FOUND", "Profile not found.", 404)
+            remaining = [profile_name for profile_name in names if profile_name != name]
+            was_active = active_profile_name(tool) == name
+            if was_active and not remaining:
+                raise APIError("PROFILE_LAST", "Cannot delete the last profile.", 409)
+            fallback_name = ""
+            fallback_contents: dict[str, str] | None = None
+            if was_active:
+                fallback_name = "default" if "default" in remaining else remaining[0]
+                fallback_contents, _ = read_profile_contents(tool, fallback_name)
+                validate_contents(tool, fallback_contents)
             path = profile_path(tool, name)
             legacy_path = legacy_profile_path(tool, name)
             if path.exists() and path.is_dir():
@@ -453,6 +477,14 @@ def delete_profile(tool: ToolConfig, name: str) -> None:
             profile_history = history_profile_path(tool, name)
             if profile_history.exists():
                 shutil.rmtree(profile_history)
+            if was_active and fallback_contents is not None:
+                sync_profile_to_runtime(tool, fallback_contents)
+                state = read_state()
+                state[tool.id] = {
+                    "activeProfile": fallback_name,
+                    "lastActivatedAt": datetime.now(timezone.utc).isoformat(),
+                }
+                write_state(state)
     except Timeout as exc:
         raise APIError("LOCK_TIMEOUT", "Timed out waiting for the file lock.", 423) from exc
 
