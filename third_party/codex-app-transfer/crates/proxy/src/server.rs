@@ -20,7 +20,34 @@ use crate::resolver::SharedResolver;
 /// 把所有方法 / 所有路径都路由到 `forward_handler`(裸代理 + B1 路由 + B2 鉴权改写)。
 /// Stage 3 起此 router 会再叠 adapter 中间件(provider 协议转换)。
 pub fn build_router(resolver: SharedResolver) -> Router {
-    let state = ProxyState::new(resolver);
+    build_router_with_state(ProxyState::new(resolver))
+}
+
+fn register_apply_patch_trace_sink() {
+    use codex_app_transfer_adapters::core::apply_patch_trace;
+    apply_patch_trace::install(
+        crate::diagnostics::forward_trace_enabled,
+        Box::new(|mut value| {
+            let seq = crate::trace_store::next_seq();
+            if let serde_json::Value::Object(map) = &mut value {
+                map.insert("seq".to_owned(), seq.into());
+                map.insert(
+                    "captured_at".to_owned(),
+                    chrono::Local::now().to_rfc3339().into(),
+                );
+                map.insert("proxy_version".to_owned(), env!("CARGO_PKG_VERSION").into());
+            }
+            crate::trace_store::trace_store().push(
+                crate::trace_store::TraceKind::ApplyPatch,
+                seq,
+                value,
+            );
+        }),
+    );
+}
+
+fn build_router_with_state(state: ProxyState) -> Router {
+    register_apply_patch_trace_sink();
     Router::new()
         .route(
             "/responses",

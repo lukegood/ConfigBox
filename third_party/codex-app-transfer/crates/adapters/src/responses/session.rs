@@ -2029,8 +2029,10 @@ mod tests {
     // 回归(真机 blob 删除根因):clear_all_persisted 在 db=None(db init 失败 fallback 纯
     // 内存 / 瞬时撞锁)时**不删 blob**、返回 Err —— 避免删光仍被磁盘 db 行有效引用的 blob
     // 留下悬挂引用(含图历史丢)。隐私清除在 db 不可达时失败而非部分成功,用户重试即可。
+    #[cfg(unix)] // 用 chmod 000 模拟 db init 失败,仅 Unix 适用(Windows 无 PermissionsExt)
     #[test]
     fn clear_with_db_none_errors_and_preserves_blobs() {
+        use std::os::unix::fs::PermissionsExt;
         let (_dir, path) = fresh_db_path();
         let big = format!("data:image/png;base64,{}", "A".repeat(20_000));
         // 进程A:正常 db,迁移含图 → blob + message_contents + response_sessions 持久磁盘。
@@ -2076,21 +2078,20 @@ mod tests {
         let rs_before = count_rows("SELECT COUNT(*) FROM response_sessions");
         assert!(mc_before > 0 && rs_before > 0);
 
-        // 进程B:用同级目录下的目录路径冒充 sessions.db → sqlite 打开必然失败
-        // (比 chmod 000 更稳定:容器 root 仍可能绕过权限位);blobs 层仍指真实目录。
-        let bad_db_path = path.parent().unwrap().join("sessions-db-dir");
-        std::fs::create_dir(&bad_db_path).unwrap();
+        // 进程B:chmod 000 让 sessions.db 打不开 → db init 失败 → db=None;blobs 层仍指真实目录。
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let (cache_b, warn_b) = ResponseSessionCache::with_db_path(
             8,
             Duration::from_secs(60),
             DEFAULT_PERSISTED_TTL,
-            &bad_db_path,
+            &path,
         );
         assert!(warn_b.is_some(), "db 应 init 失败 fallback 纯内存(db=None)");
         // 用户点「清除会话历史」→ POST /api/sessions/clear → clear_all_persisted。
         let result = cache_b.clear_all_persisted();
 
-        // 验证:修复后 blob 应保留、原 db 行不变、clear 返回 Err。
+        // 恢复权限后验证:修复后 blob 应保留、db 行不变、clear 返回 Err。
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let blobs_after = count_blobs(&blobdir);
         let mc_after = count_rows("SELECT COUNT(*) FROM message_contents");
         let rs_after = count_rows("SELECT COUNT(*) FROM response_sessions");

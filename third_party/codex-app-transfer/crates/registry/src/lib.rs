@@ -13,6 +13,7 @@
 //! - **未实现** OS 集成层(Windows 注册表 / macOS plist / Codex TOML 注入),
 //!   按 docs/refactor/migration.md §4 拆分,留给 Stage 2.5 的 `crates/codex_integration`。
 
+pub mod base_instructions;
 pub mod compact_thinking_policy;
 pub mod healing;
 pub mod model_alias;
@@ -23,6 +24,7 @@ pub mod raw_io;
 pub mod reasoning_effort_policy;
 pub mod schema;
 
+pub use base_instructions::CAS_BASE_INSTRUCTIONS;
 pub use compact_thinking_policy::{compact_disable_thinking_wire, DisableThinkingWire};
 #[allow(deprecated)]
 pub use healing::heal_builtin_extra_headers;
@@ -37,6 +39,7 @@ pub use model_context_policy::{
 };
 pub use paths::{
     config_dir, config_file, library_dir, resolve_home, sessions_db_file, tool_artifacts_db_file,
+    HOME_OVERRIDE_ENV,
 };
 pub use presets::builtin_presets;
 pub use raw_io::{load_raw_config, save_raw_config, IoError, RawConfig};

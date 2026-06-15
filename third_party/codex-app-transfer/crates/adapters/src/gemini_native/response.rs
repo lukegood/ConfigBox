@@ -24,9 +24,11 @@
 //!     response.content_part.done
 //!   [if reasoning:]
 //!     response.reasoning_summary_part.added  ← summary_index=0
-//!     response.reasoning_summary_text.delta  ← 增量
+//!     response.reasoning_summary_text.delta  ← 增量(summary 通道,旧版兼容)
+//!     response.reasoning_text.delta          ← 增量(content 通道,v26.608+ 渲染)
 //!     response.reasoning_summary_text.done
 //!     response.reasoning_summary_part.done
+//!     response.reasoning_text.done           ← content 通道完毕
 //!   [if function_call:]
 //!     response.function_call_arguments.delta  ← 一次性 emit 完整 args(Gemini 不增量)
 //!     response.function_call_arguments.done
@@ -37,7 +39,8 @@
 //!
 //! Gemini → Responses 字段映射:
 //! - `candidates[].content.parts[].text` (thought≠true) → output_text.delta
-//! - `candidates[].content.parts[].text` (thought=true) → reasoning_summary_text.delta
+//! - `candidates[].content.parts[].text` (thought=true) → reasoning_summary_text.delta(summary 通道)
+//!   + reasoning_text.delta(content 通道,v26.608+ 渲染);双发兼容新旧版 Codex
 //! - `candidates[].content.parts[].functionCall {name, args}` → function_call output_item
 //!   (args 序列化成 JSON string 灌进 function_call_arguments.delta)
 //! - `candidates[].groundingMetadata` → output_text.annotation.added(在 message 内)
@@ -53,7 +56,7 @@ use serde_json::{json, Value};
 
 use crate::core::events::{build_tool_namespace_map, emit_sse_event as emit_event};
 use crate::responses::global_response_session_cache;
-use crate::responses::request::tools::APPLY_PATCH_TOOL_NAME;
+use crate::responses::request::tools::{APPLY_PATCH_TOOL_NAME, TOOL_SEARCH_TOOL_NAME};
 use crate::types::{ByteStream, ResponseSessionPlan};
 
 use super::grounding::convert_grounding_metadata_to_annotations;
@@ -151,6 +154,12 @@ struct ClosedFunctionCall {
     /// emit `status="incomplete"`,让严格读 envelope 终态的客户端不把畸形 patch 当完整
     /// 执行(破坏性半应用防护,对齐 #322)。仅 apply_patch 分支可能置 true。
     apply_patch_incomplete: bool,
+    /// [MOC-217] `Some(args)` 当 name==tool_search:envelope output[] + 流式 wire 都
+    /// emit 成 `tool_search_call`(`arguments` 是 JSON object、`execution:"client"`),而非
+    /// function_call —— Codex router 对 tool_search 期待 `ToolPayload::ToolSearch`,收
+    /// Function payload 不识别为 builtin(同 apply_patch 收 Function 会 abort 的机制)。
+    /// 值是 functionCall.args(确保 object;非 object 包成 `{"raw":...}`)。
+    tool_search_arguments: Option<Value>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -195,6 +204,9 @@ pub struct GeminiToResponsesConverter {
     /// P0-E:已 close 的非 message/reasoning/function_call 类 items
     /// (image_generation_call / 等扩展 type),emit_completed 也按 output_index 排序
     closed_other_items: Vec<(u32, Value)>,
+    /// [MOC-210] proxy 出图履约从合成 `_casRevisedPrompt` part 暂存的 prompt,
+    /// 紧随其后的 inlineData → emit_inline_data 取用填 revised_prompt 后清空。
+    pending_image_prompt: Option<String>,
 
     // ─ 终态 ─
     has_seen_tool_calls: bool,
@@ -251,6 +263,11 @@ impl GeminiToResponsesConverter {
         // **build namespace map 必须先于 move**(struct field 顺序里
         // original_request 在前会先 move 走,后面 tool_namespace_map 拿不到 ref)
         let tool_namespace_map = build_tool_namespace_map(original_request.as_ref());
+        // [MOC-194] 每请求记忆 cwd(同 chat 的 with_original_request):带 cwd 的 turn-start 请求
+        // 不产生 apply_patch,只在此记忆才能供后续不带 cwd 的 apply_patch 请求回退。
+        crate::responses::apply_patch_preflight::remember_cwd_from_request(
+            original_request.as_ref(),
+        );
         Self {
             buffer: Vec::new(),
             accumulated_json: String::new(),
@@ -269,6 +286,7 @@ impl GeminiToResponsesConverter {
             closed_messages: Vec::new(),
             closed_reasonings: Vec::new(),
             closed_other_items: Vec::new(),
+            pending_image_prompt: None,
             has_seen_tool_calls: false,
             final_finish_reason: None,
             final_usage: None,
@@ -549,6 +567,49 @@ impl GeminiToResponsesConverter {
                         }
                     }));
                 }
+                // [MOC-217] tool_search_call 的 envelope item(`arguments`=object、
+                // execution=client)。session 历史用 chat-format,必须重建成 function-type
+                // tool_call(name=tool_search,arguments=stringify(object)) —— 跟请求侧
+                // `responses/request.rs:652` 的 tool_search_call 回放形态一致。否则下一轮
+                // previous_response_id 续话时 assistant 历史缺这条 tool_search call,新进来的
+                // tool_search_output(role:tool)无匹配 functionCall → Gemini BadRequest / 断多轮。
+                Some("tool_search_call") => {
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    // envelope arguments 是 JSON object;chat function.arguments 要 string。
+                    let arguments = match item.get("arguments") {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(other) => {
+                            serde_json::to_string(other).unwrap_or_else(|_| "{}".to_owned())
+                        }
+                        None => "{}".to_owned(),
+                    };
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": "tool_search",
+                            "arguments": arguments,
+                        }
+                    }));
+                }
+                // [MOC-210] 出图轮:session 历史是 chat-format,承载不了 image bytes
+                // (~1.5MB base64 逐轮回放也不经济)。记一条文本标记,让下一轮模型从历史
+                // 知道"上一轮已成功生成图片",避免它误以为没出图而用同 prompt 反复重调
+                // image_gen(MOC-210 实测重试根因之一)。revised_prompt 若有则带上,帮模型
+                // 区分自己之前画了什么。
+                Some("image_generation_call") => {
+                    let note = match item.get("revised_prompt").and_then(|v| v.as_str()) {
+                        Some(p) if !p.trim().is_empty() => {
+                            format!("[已生成图片] (prompt: {p})")
+                        }
+                        _ => "[已生成图片]".to_owned(),
+                    };
+                    text_parts.push(note);
+                }
                 _ => {}
             }
         }
@@ -702,9 +763,22 @@ impl GeminiToResponsesConverter {
             }
             if let Some(content) = &candidate.content {
                 for part in &content.parts {
+                    // [MOC-210] proxy 出图履约的旁路 part:只携带 prompt(无 text/inlineData),
+                    // 暂存给紧随其后的 inlineData → image_generation_call.revised_prompt。
+                    if let Some(rp) = &part.revised_prompt {
+                        if !rp.trim().is_empty() {
+                            self.pending_image_prompt = Some(rp.clone());
+                        }
+                        continue;
+                    }
                     // text part
                     if let Some(text) = &part.text {
-                        if part.thought == Some(true) {
+                        if text.is_empty() {
+                            // [Phase0 gemini-tool-fold] Gemini 在 functionCall 之后
+                            // 常发 {"text":""} 空 part:不开 message/reasoning item ——
+                            // 空 item 既渲染空白行,又打断 Codex 按「连续 tool item」
+                            // 分组的工具折叠(对齐 chat 路径 emit_text_delta 空守卫)。
+                        } else if part.thought == Some(true) {
                             // reasoning text:必要时关 message + 开 reasoning
                             if self.open_message.is_some() {
                                 self.close_message(out);
@@ -733,11 +807,11 @@ impl GeminiToResponsesConverter {
                         if self.open_reasoning.is_some() {
                             self.close_reasoning(out);
                         }
-                        // P1-B:thoughtSignature 在 functionCall part 上时编码进 call_id,
-                        // client roundtrip 时由请求侧 decode_tool_call_id_signature 拆出
-                        // signature 写回 outgoing functionCall part(LiteLLM
-                        // _encode_tool_call_id_with_signature 模式)。Gemini 3 多轮
-                        // thinking 链才不会断。
+                        // P1-B → MOC-218:thoughtSignature 不编码进 call_id(旧
+                        // `call_X~~sig~~Y` 内联格式)——改写进 global ToolCallCache,
+                        // 请求侧 decode_tool_call_id_signature 反查注入 functionCall
+                        // part 的 thought_signature(旧格式兼容保留在 decode 侧)。
+                        // Gemini 3 多轮 thinking 链不断、call_id 恒短(≤64)。
                         self.emit_function_call(
                             out,
                             &fc.name,
@@ -878,7 +952,7 @@ impl GeminiToResponsesConverter {
     /// 客户端能正确识别 + 显示。`type` 字段额外塞 upstream HTTP status 方便诊断。
     ///
     /// **`codex_code` 必须是 Codex 客户端 `response.failed` handler 认识的 retry-control
-    /// code**(见 [`codex_retry_code`] 的文档):Codex 只按 `error.code` 字符串决定是否
+    /// code**(见 [`crate::codex_retry_code`] 的文档):Codex 只按 `error.code` 字符串决定是否
     /// 重试,不认识的 code 一律落 `Retryable` → `CodexErr::Stream`(`is_retryable()=true`)
     /// → 卡死重发到 max_retries(MOC-79 实证)。`upstream_kind` 是我们内部的语义分类
     /// (`bad_request` / `auth_error` / …),作为 `error.upstream_error_kind` 诊断字段保留
@@ -969,24 +1043,38 @@ impl GeminiToResponsesConverter {
             // [MOC-75] apply_patch 的 envelope item 也必须是 custom_tool_call(input=
             // patch),跟流式 wire 一致 —— 否则严格客户端读 envelope 终态会当成
             // function_call → Codex router abort。其余工具仍走 function_call。
-            let mut item = match &fc.apply_patch_input {
-                Some(input) => json!({
-                    "type": "custom_tool_call",
+            // [MOC-217] tool_search 的 envelope 终态也必须是 tool_search_call(跟流式 wire
+            // 一致),否则严格读 envelope output[] 的客户端把它当 function_call → Codex router
+            // 不识别为 builtin。优先于 apply_patch / function 判定。
+            let mut item = if let Some(args) = &fc.tool_search_arguments {
+                json!({
+                    "type": "tool_search_call",
                     "id": fc.item_id.clone(),
                     "call_id": fc.call_id.clone(),
-                    "name": fc.name.clone(),
-                    "input": input,
-                    // [MOC-75] 畸形 patch envelope 终态也 incomplete(对齐流式 + 破坏性防护)
-                    "status": if fc.apply_patch_incomplete { "incomplete" } else { "completed" },
-                }),
-                None => json!({
-                    "type": "function_call",
-                    "id": fc.item_id.clone(),
-                    "call_id": fc.call_id.clone(),
-                    "name": fc.name.clone(),
-                    "arguments": fc.arguments_json_str.clone(),
+                    "execution": "client",
+                    "arguments": args,
                     "status": "completed",
-                }),
+                })
+            } else {
+                match &fc.apply_patch_input {
+                    Some(input) => json!({
+                        "type": "custom_tool_call",
+                        "id": fc.item_id.clone(),
+                        "call_id": fc.call_id.clone(),
+                        "name": fc.name.clone(),
+                        "input": input,
+                        // [MOC-75] 畸形 patch envelope 终态也 incomplete(对齐流式 + 破坏性防护)
+                        "status": if fc.apply_patch_incomplete { "incomplete" } else { "completed" },
+                    }),
+                    None => json!({
+                        "type": "function_call",
+                        "id": fc.item_id.clone(),
+                        "call_id": fc.call_id.clone(),
+                        "name": fc.name.clone(),
+                        "arguments": fc.arguments_json_str.clone(),
+                        "status": "completed",
+                    }),
+                }
             };
             // namespace 字段(Codex.app dispatch MCP server 必填;apply_patch 无 namespace)
             if let Some(ns) = fc.namespace.as_ref() {
@@ -1226,8 +1314,6 @@ impl GeminiToResponsesConverter {
                     "status": "in_progress",
                     "id": item_id,
                     "summary": [],
-                    "content": null,
-                    "encrypted_content": null,
                 },
             }),
         );
@@ -1251,19 +1337,39 @@ impl GeminiToResponsesConverter {
     }
 
     fn emit_reasoning_delta(&mut self, out: &mut Vec<u8>, delta: &str) {
-        let Some(rs) = self.open_reasoning.as_mut() else {
-            return;
+        let (item_id, output_index) = match self.open_reasoning.as_mut() {
+            Some(rs) => {
+                rs.text_acc.push_str(delta);
+                (rs.item_id.clone(), rs.output_index)
+            }
+            None => return,
         };
-        rs.text_acc.push_str(delta);
+        // summary 通道(保留,兼容旧版渲染)
         emit_event(
             out,
             &mut self.sequence_number,
             "response.reasoning_summary_text.delta",
             json!({
                 "type": "response.reasoning_summary_text.delta",
-                "item_id": rs.item_id,
-                "output_index": rs.output_index,
+                "item_id": item_id,
+                "output_index": output_index,
                 "summary_index": 0,
+                "delta": delta,
+            }),
+        );
+        // [verify content 通道] 新版 Codex(v26.608+)渲染思考块认 reasoning_text
+        // (content_index),GPT 直连走此通道(本地 session 实证:GPT reasoning
+        // summary:[] 却正常显示);transfer 此前只发 summary→被新版废弃不渲染。
+        // 双发 content 对齐 GPT,summary 留作旧版兼容。
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.reasoning_text.delta",
+            json!({
+                "type": "response.reasoning_text.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
                 "delta": delta,
             }),
         );
@@ -1300,13 +1406,33 @@ impl GeminiToResponsesConverter {
                 },
             }),
         );
+        // [verify content 通道] 对齐 GPT:补发 reasoning_text.done(content_index)
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.reasoning_text.done",
+            json!({
+                "type": "response.reasoning_text.done",
+                "item_id": rs.item_id,
+                "output_index": rs.output_index,
+                "content_index": 0,
+                "text": rs.text_acc,
+            }),
+        );
+        // [MOC-218 第三关] reasoning **item** 不带 `content` / `encrypted_content`:
+        // OpenAI Responses 后端对 input 里 reasoning item 硬校验 `content` 数组
+        // 长度必须 0(`array_above_max_length`,真 GPT 自家 rollout item 形态即
+        // `{type, summary, encrypted_content}` 无 content)、`encrypted_content`
+        // 假值有 MOC-13 invalid_encrypted_content 前科(null 行为未定义,缺失
+        // 最安全)。item 会被 Codex 持久化进会话历史,切真 GPT 时原样上发 ——
+        // 必须出生即合规。当轮渲染不受影响:新版(v26.608+)读 SSE
+        // `reasoning_text.delta` content 通道事件(上方保留双发,MOC-203),
+        // 实证 GPT 直连 summary:[] 仍正常显示 = 渲染靠事件流不靠 item 字段。
         let item = json!({
             "type": "reasoning",
             "status": "completed",
             "id": rs.item_id,
             "summary": [{ "type": "summary_text", "text": rs.text_acc }],
-            "content": null,
-            "encrypted_content": null,
         });
         emit_event(
             out,
@@ -1331,16 +1457,17 @@ impl GeminiToResponsesConverter {
         thought_signature: Option<&str>,
     ) {
         let item_id = format!("fc_{}", synthesize_id());
-        // P1-B:thoughtSignature 编码进 call_id 让客户端 roundtrip 不丢
-        // (LiteLLM _encode_tool_call_id_with_signature 模式)。
-        // 用 `~~sig~~` 分隔符(JSON-safe + 跟 hex/base64 互补不冲突),
-        // 请求侧 decode_tool_call_id_signature 反向拆。
-        let call_id = match thought_signature {
-            Some(sig) if !sig.is_empty() => {
-                format!("call_{}~~sig~~{sig}", synthesize_id())
-            }
-            _ => format!("call_{}", synthesize_id()),
-        };
+        // P1-B → MOC-218:thoughtSignature 的 roundtrip 不再走 call_id 内联编码
+        // (旧 `call_X~~sig~~Y` 格式把 call_id 撑到数 KB,持久化进 Codex rollout
+        // 后,会话切真 GPT 时被 OpenAI Responses 后端的 call_id ≤64 校验 400 拒,
+        // string_above_max_length)。签名改写进 global_tool_call_cache(见下方
+        // save),请求侧 decode_tool_call_id_signature 反查注入;cache miss 裸发,
+        // 上游实测容忍(MOC-218)。旧分隔符 `~~sig~~` 仅在 decode 侧保留兼容
+        // (修复前的会话历史里 call_id 仍是内联格式)。
+        let call_id = format!("call_{}", synthesize_id());
+        let cached_signature = thought_signature
+            .filter(|sig| !sig.is_empty())
+            .map(str::to_owned);
         let output_index = self.next_output_index;
         self.next_output_index += 1;
         // OpenAI function_call.arguments 是 JSON 字符串,Gemini 是结构化对象 → 序列化
@@ -1368,6 +1495,19 @@ impl GeminiToResponsesConverter {
         // close_tool_call;Gemini 不增量,无 interrupted 半截风险,故不走 incomplete)。
         if name == APPLY_PATCH_TOOL_NAME {
             let input = crate::responses::extract_apply_patch_input(&args_json_str);
+            // [apply_patch 中间层] 同 chat 路径:白名单逐条恢复已知格式错误(双边 @@ / 上下文失配 /
+            // 空 Update+Move / 缺信封)。gemini args 一次性完整,无流式截断顾虑 → json_complete=true。
+            let preflight_cwd = crate::responses::apply_patch_preflight::extract_cwd(
+                self.original_request.as_ref(),
+            );
+            let (input, preflight_repairs) =
+                crate::responses::apply_patch_preflight::optimize_patch(
+                    &input,
+                    preflight_cwd.as_deref(),
+                    /* json_complete = */ true,
+                );
+            let preflight_repairs_val =
+                crate::responses::apply_patch_preflight::repairs_to_value(&preflight_repairs);
             let has_begin = input.contains("*** Begin Patch");
             // [MOC-75 review] 两类畸形/截断都 emit `status="incomplete"` 阻止 Codex 执行
             // partial/invalid apply_patch(destructive,partial 执行可能写错目标 —— 对齐
@@ -1449,6 +1589,32 @@ impl GeminiToResponsesConverter {
             } else {
                 "completed"
             };
+            // [apply-patch 诊断页] 记录本次 apply_patch 决策(原始 args → 提取 V4A → 校验/响应级
+            // 截断 verdict → completed/incomplete),供诊断查看器「apply-patch」页精修。gemini args
+            // 一次性结构、无流式 JSON 截断,故 json_truncation 恒 None;finishReason 非 STOP 的响应级
+            // 截断折叠进 v4a_truncation(detail 带 finishReason)。默认关、关时零开销。
+            let gemini_response_trunc = response_truncated.then(|| {
+                format!(
+                    "response-level truncation: finishReason={}",
+                    self.final_finish_reason.as_deref().unwrap_or("(none)")
+                )
+            });
+            crate::core::apply_patch_trace::emit(
+                &crate::core::apply_patch_trace::ApplyPatchTrace {
+                    source: "gemini_native",
+                    model: &self.model,
+                    call_id: &call_id,
+                    fc_id: &item_id,
+                    args_raw: &args_json_str,
+                    input: &input,
+                    interrupted: false,
+                    json_truncation: None,
+                    v4a_truncation: gemini_response_trunc.as_deref(),
+                    v4a_validation: v4a_err.as_ref().map(|e| (e.line, e.message.as_str())),
+                    decision: status,
+                    repairs: (!preflight_repairs.is_empty()).then_some(&preflight_repairs_val),
+                },
+            );
             emit_event(
                 out,
                 &mut self.sequence_number,
@@ -1512,13 +1678,15 @@ impl GeminiToResponsesConverter {
                 }),
             );
             // incomplete 不写 cache —— 下一轮引用此 call_id 会拿到 incomplete 上下文反而
-            // 误导;让 orphan repair 路径补占位(对齐 chat 路径)。
+            // 误导;让 orphan repair 路径补占位(对齐 chat 路径)。incomplete 时
+            // thoughtSignature 同样不存(签名属于完整调用,上游容忍缺失)。
             if !incomplete {
                 crate::responses::global_tool_call_cache().save(
                     &call_id,
                     crate::responses::ToolCallEntry {
                         name: name.to_owned(),
                         arguments: args_json_str.clone(),
+                        thought_signature: cached_signature.clone(),
                     },
                 );
             }
@@ -1531,6 +1699,101 @@ impl GeminiToResponsesConverter {
                 namespace: None,
                 apply_patch_input: Some(input),
                 apply_patch_incomplete: incomplete,
+                tool_search_arguments: None,
+            });
+            return;
+        }
+
+        // [MOC-217] tool_search:Codex 0.130+ builtin,把所有 MCP 工具(含 cat-webfetch)
+        // defer。请求侧已把 `type:"tool_search"` 降级成 function(responses_tools_to_chat_tools
+        // 的 tool_search 分支),Gemini 回来的 functionCall.name=="tool_search"。这里重打包成
+        // Responses `tool_search_call` wire(`arguments` 是 JSON **object** 不是 string;
+        // `execution:"client"`),否则 Codex router 收 function_call(name=tool_search)不识别为
+        // builtin → 无法本地 BM25 dispatch 发现工具。对齐 chat 路径 `responses/converter.rs`
+        // is_tool_search 分支 + 本文件 apply_patch 同款重打包(wire schema 实证:
+        // `protocol/src/models.rs:2674-2715`)。Gemini 一次性给完整 args,无流式截断,故不走
+        // apply_patch 那套 incomplete 防护。
+        if name == TOOL_SEARCH_TOOL_NAME {
+            // Gemini functionCall.args 已是结构化 Value;Codex `ToolSearchCall.arguments` 要
+            // object(`router.rs` 用 serde_json::from_value::<SearchToolCallParams>)。非 object
+            // (模型 misbehave)包成 {"raw":<stringified>} 让 Codex 端可 surface 而非静默丢 query。
+            let arguments_value = if args.is_object() {
+                args.clone()
+            } else {
+                // 模型 misbehave(args 非 object):包 {raw} 兜底,query 不丢(Codex 端会 reject
+                // 但能 surface)。带 warn 对齐 chat 路径 `converter.rs` 同款兜底 + 本仓"fallback
+                // 必带 warn"约定,避免这层静默(否则只能从 Codex 端 reject 反推,定位成本高)。
+                tracing::warn!(
+                    target: "adapters::tool_search",
+                    call_id = %call_id,
+                    "gemini tool_search args 非 object;emit {{raw:...}} fallback(Codex 会 reject,但日志保留模型意图)",
+                );
+                json!({ "raw": args_json_str })
+            };
+            // open:in_progress + 空 arguments;close:completed + 完整 arguments。BM25 query 短,
+            // 不流式增量(对齐 chat 路径 converter.rs tool_search 分支)。
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "tool_search_call",
+                        "id": item_id.clone(),
+                        "call_id": call_id.clone(),
+                        "execution": "client",
+                        "arguments": {},
+                        "status": "in_progress",
+                    },
+                }),
+            );
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "tool_search_call",
+                        "id": item_id.clone(),
+                        "call_id": call_id.clone(),
+                        "execution": "client",
+                        "arguments": arguments_value.clone(),
+                        "status": "completed",
+                    },
+                }),
+            );
+            // name 反查不需要 cache(tool_search_call 历史由共享 chat 转换器重建,
+            // `responses/request.rs:652/695`,name 不走 gemini 的 cache 反查路径,
+            // 对齐 chat 路径省冗余 disk write)。但 **thoughtSignature 需要**
+            // (MOC-218 review 修):重建出的 assistant.tool_calls 带原 call_id,
+            // 经 `extract_tool_call` → `decode_tool_call_id_signature` 反查注入
+            // ——修复前签名内联在 call_id 里天然 roundtrip,本分支不写 cache 会
+            // 让 tool_search 的签名链必断(行为回归)。仅有签名时写,保留
+            // 无签名场景的省写意图。
+            if let Some(sig) = cached_signature.as_ref() {
+                crate::responses::global_tool_call_cache().save(
+                    &call_id,
+                    crate::responses::ToolCallEntry {
+                        name: name.to_owned(),
+                        arguments: args_json_str.clone(),
+                        thought_signature: Some(sig.clone()),
+                    },
+                );
+            }
+            self.closed_function_calls.push(ClosedFunctionCall {
+                item_id,
+                output_index,
+                call_id,
+                name: name.to_owned(),
+                arguments_json_str: args_json_str,
+                namespace: None,
+                apply_patch_input: None,
+                apply_patch_incomplete: false,
+                tool_search_arguments: Some(arguments_value),
             });
             return;
         }
@@ -1602,12 +1865,14 @@ impl GeminiToResponsesConverter {
         // P0-G:写 global ToolCallCache (call_id → name + arguments) 让下轮
         // function_call_output 即便 Codex.app 不重发 prior function_call 也能 lookup
         // (Codex.app 是 stateful client,默认依赖 server 维护 mapping)。复用项目
-        // 已有 ResponsesAdapter converter.rs:665 同款模式。
+        // 已有 ResponsesAdapter converter.rs:665 同款模式。thoughtSignature 一并
+        // 入 cache(MOC-218,decode 侧反查注入)。
         crate::responses::global_tool_call_cache().save(
             &call_id,
             crate::responses::ToolCallEntry {
                 name: name.to_owned(),
                 arguments: args_json_str.clone(),
+                thought_signature: cached_signature.clone(),
             },
         );
         self.closed_function_calls.push(ClosedFunctionCall {
@@ -1619,6 +1884,7 @@ impl GeminiToResponsesConverter {
             namespace: namespace_for,
             apply_patch_input: None,
             apply_patch_incomplete: false,
+            tool_search_arguments: None,
         });
     }
 
@@ -1627,20 +1893,28 @@ impl GeminiToResponsesConverter {
     /// 模型在 response 里直接生成 inline_data (image/audio/video base64),
     /// 转 Responses output_item type="image_generation_call" + result 含
     /// mime_type + data。Codex.app 旧版可能不识别此 item 但 wire 上不丢。
-    fn emit_inline_data(&mut self, out: &mut Vec<u8>, mime: &str, data: &str) {
-        let item_id = format!("img_{}", synthesize_id());
+    fn emit_inline_data(&mut self, out: &mut Vec<u8>, _mime: &str, data: &str) {
+        // [MOC-210] 对齐 codex-rs `ResponseItem::ImageGenerationCall`
+        // (protocol/src/models.rs):`{ id: String, status: String, revised_prompt:
+        // Option<String>, result: String }`。`result` 必须是**裸 base64 字符串**(Codex
+        // 据此 base64-decode 存到 generated_images/<thread>/<id>.png)。早期实现把 result
+        // 写成对象 `{type,mime_type,data}` → Codex 反序列化 `result: String` 失败、报
+        // "invalid image generation payload" 丢弃整个 item → 图不渲染、模型误以为没出图
+        // 而用同一 prompt 反复重试(MOC-210 实测)。id 前缀对齐真机的 `ig_`。
+        let item_id = format!("ig_{}", synthesize_id());
         let output_index = self.next_output_index;
         self.next_output_index += 1;
-        let item = json!({
+        let mut item = json!({
             "type": "image_generation_call",
             "id": item_id,
             "status": "completed",
-            "result": {
-                "type": "inline_data",
-                "mime_type": mime,
-                "data": data,
-            },
+            "result": data,
         });
+        // [MOC-210] 出图履约带来的原始 prompt → revised_prompt(供 session 历史区分多图,
+        // 见 build_assistant_message_for_session)。仅 take 一次,避免错配后续图片。
+        if let Some(prompt) = self.pending_image_prompt.take() {
+            item["revised_prompt"] = Value::String(prompt);
+        }
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1707,20 +1981,9 @@ impl GeminiToResponsesConverter {
 // ByteStream wrapper
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// 上游错误 body 最大读取字节数。Gemini error 通常 <1KB;CDN HTML 错误页 / proxy
-/// 异常体可能数 MB。无 cap → 失败请求并发时内存放大攻击面。截断后剩余 bytes 直接 drop
-/// (上游已经表态错误,我们不需要 forward 完整 body,只需要 error message 给用户)。
-const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
-
 /// 用户可见 error message 截断阈值。Responses error envelope 无文档化硬上限,选 2000
 /// 给操作者足够诊断信息(stack trace / quota detail)又不至于撑爆 SSE event。
 const MAX_USER_ERROR_MESSAGE_CHARS: usize = 2000;
-
-/// 薄封装:`crate::codex_retry_code`(共享于 adapters crate lib.rs)。
-/// 完整文档 + 维护见 [`crate::codex_retry_code`]。
-fn codex_retry_code(upstream_kind: &str) -> &str {
-    crate::codex_retry_code(upstream_kind)
-}
 
 /// 上游 4xx/5xx 错误 → Responses SSE failure 流。
 ///
@@ -1730,12 +1993,12 @@ fn codex_retry_code(upstream_kind: &str) -> &str {
 /// 含 error code + message。客户端能识别 + 显示用户级错误。
 ///
 /// 错误分类(status code + Gemini `error.status` + message 关键词)→ 语义 kind,
-/// 再经 [`codex_retry_code`] 映射成 Codex 认识的 `error.code`(控制是否重试):
+/// 再经 [`crate::codex_retry_code`] 映射成 Codex 认识的 `error.code`(控制是否重试):
 /// - 401 / UNAUTHENTICATED → `auth_error` → `invalid_prompt`(永久,surface)
 /// - 403 / PERMISSION_DENIED → `permission_denied` → `invalid_prompt`(永久,surface)
 /// - 408 / 504 → `timeout` → 保留(瞬时,Codex 重试)
 /// - 429 + RESOURCE_EXHAUSTED → `quota_exceeded` → 保留(瞬时:Gemini 429 混 per-minute
-///   限流与日级配额,无法可靠区分 → 走 Codex 重试,见 [`codex_retry_code`])
+///   限流与日级配额,无法可靠区分 → 走 Codex 重试,见 [`crate::codex_retry_code`])
 /// - 429 其他 → `rate_limited` → 保留(瞬时,指数退避 retry)
 /// - 400 + SAFETY/blockReason → `content_filter` → `invalid_prompt`(永久,surface)
 /// - 400 其他 → `bad_request` → `invalid_prompt`(永久,surface;**MOC-79 卡死点**)
@@ -1743,18 +2006,18 @@ fn codex_retry_code(upstream_kind: &str) -> &str {
 /// - 502 / 5xx 其他 → `server_error` → 保留(瞬时,Codex 重试)
 /// - 其他 → `upstream_error` → 保留(瞬时)
 ///
-/// 防御性失败处理(本身**不能**埋新 silent failure):
+/// 防御性失败处理(本身**不能**埋新 silent failure;body 收集骨架复用
+/// [`crate::core::failure_stream::collect_upstream_error_body`],MOC-118):
 /// - upstream ByteStream Err mid-read → 把 transport error 拼进用户 message,降级
 ///   `code = "upstream_transport_error"`(operator log 也会记)
-/// - body 超过 [`MAX_UPSTREAM_ERROR_BODY_BYTES`] → 截断,在 message 后缀标 `…(truncated)`
-/// - body 非 UTF-8 → `from_utf8_lossy` 替换,在 message 后缀标 `(non-UTF-8 body)`
+/// - body 超 cap → 截断,在 message 后缀标 `[body truncated]`
+/// - body 非 UTF-8 → `from_utf8_lossy` 替换,在 message 后缀标 `[non-UTF-8 body]`
 /// - 任何分支都**保证** emit `response.failed`,客户端永远不会卡住
 pub fn convert_gemini_error_to_responses_failure_stream(
     upstream_status: http::StatusCode,
     upstream_stream: ByteStream,
     original_request: Option<Value>,
 ) -> ByteStream {
-    use futures_util::stream::StreamExt;
     let status_u16 = upstream_status.as_u16();
     let s: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = Box::pin(
         stream::unfold(
@@ -1764,33 +2027,16 @@ pub fn convert_gemini_error_to_responses_failure_stream(
                     return None;
                 }
                 // 收上游 error body, cap 防 DoS, 记录 transport err 防 silent swallow
-                let mut body = Vec::with_capacity(1024);
-                let mut transport_err: Option<String> = None;
-                let mut truncated = false;
-                while let Some(chunk) = input.next().await {
-                    match chunk {
-                        Ok(b) => {
-                            let remaining =
-                                MAX_UPSTREAM_ERROR_BODY_BYTES.saturating_sub(body.len());
-                            if remaining == 0 {
-                                truncated = true;
-                                break;
-                            }
-                            let take = b.len().min(remaining);
-                            body.extend_from_slice(&b[..take]);
-                            if take < b.len() {
-                                truncated = true;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            transport_err = Some(e.to_string());
-                            break;
-                        }
-                    }
-                }
-                let was_lossy = std::str::from_utf8(&body).is_err();
-                let raw_text = String::from_utf8_lossy(&body).into_owned();
+                // (骨架共享见 core;truncated/lossy 后缀按 gemini 自己的格式拼)
+                let collected = crate::core::failure_stream::collect_upstream_error_body(
+                    &mut input,
+                    crate::core::failure_stream::MAX_UPSTREAM_ERROR_BODY_BYTES,
+                )
+                .await;
+                let transport_err = collected.transport_err;
+                let truncated = collected.truncated;
+                let was_lossy = collected.lossy;
+                let raw_text = collected.text;
                 let parsed: Option<Value> = serde_json::from_str(&raw_text).ok();
 
                 // 提 Gemini error.message,支持 object {"error":{...}} 与 array [{"error":{...}}] 两种 shape
@@ -1949,7 +2195,7 @@ pub fn convert_gemini_error_to_responses_failure_stream(
 
                 let mut conv = GeminiToResponsesConverter::new(orig, None);
                 // `code` 是内部语义分类;真正写进 envelope.error.code 的是 Codex 认识的
-                // retry-control code(见 codex_retry_code)。语义 kind 保留在 upstream_error_kind。
+                // retry-control code(见 crate::codex_retry_code)。语义 kind 保留在 upstream_error_kind。
                 let out = conv.emit_failure(
                     crate::codex_retry_code(code),
                     code,
@@ -2174,6 +2420,166 @@ mod tests {
         assert!(fc["call_id"].as_str().unwrap().starts_with("call_"));
     }
 
+    /// [MOC-218] thoughtSignature 不再编码进 call_id(旧 `call_X~~sig~~Y` 内联
+    /// 格式把 call_id 撑到数 KB,持久化进 rollout 后会话切真 GPT 被 OpenAI
+    /// Responses 后端的 call_id ≤64 校验 400 拒)。断言:① call_id 短格式
+    /// (无 `~~sig~~` 且 ≤64);② 签名进 global ToolCallCache 供 decode 反查。
+    #[test]
+    fn function_call_thought_signature_kept_out_of_call_id_and_cached() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":{"q":"weather"}},"thoughtSignature":"MOC218_TEST_SIG_BLOB"}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let completed = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let output = &completed.1["response"]["output"];
+        let fc = output
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .unwrap();
+        let call_id = fc["call_id"].as_str().unwrap();
+        assert!(call_id.starts_with("call_"));
+        assert!(
+            !call_id.contains("~~sig~~"),
+            "签名不得内联进 call_id,got {call_id}"
+        );
+        assert!(
+            call_id.len() <= 64,
+            "call_id 必须 ≤64(OpenAI Responses 后端上限),got len={}",
+            call_id.len()
+        );
+        let cached = crate::responses::global_tool_call_cache()
+            .get(call_id)
+            .expect("function_call entry 应已写入 global cache");
+        assert_eq!(
+            cached.thought_signature.as_deref(),
+            Some("MOC218_TEST_SIG_BLOB"),
+            "thoughtSignature 应入 cache 供请求侧反查"
+        );
+    }
+
+    /// [MOC-218 review 修] tool_search 分支的 thoughtSignature 同样必须入 cache:
+    /// tool_search_call 历史经共享转换器重建后带原 call_id 回到 gemini decode
+    /// 路径,不写 cache = 签名链必断(修复前内联编码天然 roundtrip)。
+    #[test]
+    fn tool_search_thought_signature_cached_for_roundtrip() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"tool_search","args":{"query":"web fetch"}},"thoughtSignature":"MOC218_TS_SIG"}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let added = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, p)| {
+                n == "response.output_item.added" && p["item"]["type"] == "tool_search_call"
+            })
+            .expect("应 emit tool_search_call item");
+        let call_id = added.1["item"]["call_id"].as_str().unwrap().to_owned();
+        assert!(!call_id.contains("~~sig~~"));
+        let cached = crate::responses::global_tool_call_cache()
+            .get(&call_id)
+            .expect("tool_search 带签名时 entry 应入 cache");
+        assert_eq!(cached.thought_signature.as_deref(), Some("MOC218_TS_SIG"));
+    }
+
+    // [MOC-217] tool_search 必须重打包成 tool_search_call wire(arguments=object、
+    // execution=client),否则 Codex router 收 function_call(name=tool_search)不识别为
+    // builtin → 无法本地 BM25 dispatch 发现 cat-webfetch 等 defer 的 MCP 工具。
+    #[test]
+    fn tool_search_function_call_rewritten_to_tool_search_call_wire() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"tool_search","args":{"query":"web fetch"}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        // 流式 output_item.added / done 必须是 tool_search_call type(不是 function_call)
+        let added = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, p)| {
+                n == "response.output_item.added" && p["item"]["type"] == "tool_search_call"
+            })
+            .expect("output_item.added 必须含 tool_search_call");
+        assert_eq!(added.1["item"]["execution"], "client");
+        let done = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, p)| {
+                n == "response.output_item.done" && p["item"]["type"] == "tool_search_call"
+            })
+            .expect("output_item.done 必须含 tool_search_call");
+        assert_eq!(
+            done.1["item"]["arguments"]["query"], "web fetch",
+            "arguments 必须是 JSON object 且含 query(不是 stringify)"
+        );
+        assert_eq!(done.1["item"]["status"], "completed");
+        // 普通 function 的 arguments delta/done 不应出现(走 tool_search 专用序列)
+        let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
+        assert!(
+            !names.contains(&"response.function_call_arguments.delta".into()),
+            "tool_search 不走 function_call_arguments 流式"
+        );
+        // envelope output[] 终态也必须是 tool_search_call
+        let completed = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.completed")
+            .expect("response.completed 应存在");
+        let out = &completed.1["response"]["output"];
+        let ts = out
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "tool_search_call")
+            .expect("envelope output 必须含 tool_search_call(不是 function_call)");
+        assert_eq!(ts["arguments"]["query"], "web fetch");
+        assert_eq!(ts["execution"], "client");
+    }
+
+    // [MOC-217] session 历史(下一轮 previous_response_id 续话)必须把 tool_search_call
+    // envelope item 重建成 chat-format function tool_call(name=tool_search),否则历史缺这条
+    // call,新进来的 tool_search_output(role:tool)无匹配 → Gemini BadRequest / 断多轮。
+    #[tokio::test]
+    async fn tool_search_call_rebuilt_into_session_assistant_message() {
+        let response_id = format!("resp_gn_ts_{}", synthesize_id());
+        let session = ResponseSessionPlan {
+            response_id: response_id.clone(),
+            messages: vec![json!({"role":"user","content":"fetch a url"})],
+        };
+        let raw = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"tool_search","args":{"query":"web fetch"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}
+
+"#;
+        let mut converted =
+            convert_gemini_to_responses_stream(input_stream(raw), None, Some(session));
+        while let Some(chunk) = converted.next().await {
+            let _ = chunk.expect("stream chunk should be valid");
+        }
+        let saved = global_response_session_cache()
+            .get(&response_id)
+            .expect("session 必须保存");
+        let assistant = saved
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "assistant")
+            .expect("应有 assistant message");
+        let tc = &assistant["tool_calls"][0];
+        assert_eq!(
+            tc["function"]["name"], "tool_search",
+            "tool_search_call 必须重建成 name=tool_search 的 function tool_call"
+        );
+        // arguments 是 stringify 的 object(chat function.arguments 要 string)
+        let args_str = tc["function"]["arguments"].as_str().unwrap();
+        let args: Value = serde_json::from_str(args_str).unwrap();
+        assert_eq!(args["query"], "web fetch");
+    }
+
     // [MOC-75] apply_patch 必须重打包成 custom_tool_call wire(Codex CLI router
     // 硬要求),且 input 必须是完整 patch 文本 —— 修复前 args 空 → aborted。
     #[test]
@@ -2379,6 +2785,62 @@ mod tests {
         // reasoning summary text 应该是 "thinking step"
         let r = output.iter().find(|i| i["type"] == "reasoning").unwrap();
         assert_eq!(r["summary"][0]["text"], "thinking step");
+
+        // [MOC-203] content 通道双发(v26.608+ 渲染):delta/done + envelope content
+        assert!(names.contains(&"response.reasoning_text.delta".into()));
+        assert!(names.contains(&"response.reasoning_text.done".into()));
+        let text_done = events
+            .iter()
+            .map(|s| parse_event(s.as_str()))
+            .find(|(n, _)| n == "response.reasoning_text.done")
+            .unwrap();
+        assert_eq!(text_done.1["content_index"], 0);
+        // gemini 不注入 **Thinking** header,content 通道 = 原始思考文本
+        assert_eq!(text_done.1["text"], "thinking step");
+        // [MOC-218 第三关] item 不带 content / encrypted_content:OpenAI 后端
+        // 对 input reasoning item 硬校验 content 数组长度 0,假 encrypted 有
+        // MOC-13 前科;content 通道只走 SSE 事件(上方断言),item 持久化形态
+        // 必须出生即合规(切真 GPT 历史原样上发)。
+        assert!(r.get("content").is_none(), "reasoning item 不得带 content");
+        assert!(
+            r.get("encrypted_content").is_none(),
+            "reasoning item 不得带 encrypted_content"
+        );
+        let item_added = events
+            .iter()
+            .map(|s| parse_event(s.as_str()))
+            .find(|(n, d)| n == "response.output_item.added" && d["item"]["type"] == "reasoning")
+            .unwrap();
+        assert!(item_added.1["item"].get("content").is_none());
+    }
+
+    /// MOC-203 折叠修复锁定:gemini functionCall 后常发 `{"text":""}` 空 part,
+    /// 不得为它开空 message item(空白行 + 打断 Codex 同轮工具折叠分组);
+    /// 空 thought part 同理不开 reasoning item。
+    #[test]
+    fn empty_text_part_after_function_call_does_not_open_message_item() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":{}}},{"text":""},{"text":"","thought":true}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let parsed: Vec<(String, Value)> = events.iter().map(|s| parse_event(s.as_str())).collect();
+        // 不产生任何 message / reasoning item,也无空 text delta
+        assert!(parsed
+            .iter()
+            .all(|(n, _)| n != "response.output_text.delta"));
+        assert!(parsed
+            .iter()
+            .filter(|(n, _)| n == "response.output_item.added")
+            .all(|(_, d)| d["item"]["type"] == "function_call"));
+        // envelope 只有 function_call 一个 item
+        let completed = parsed
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let output = completed.1["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "function_call");
     }
 
     #[test]
@@ -2772,24 +3234,27 @@ mod tests {
     #[test]
     fn codex_retry_code_maps_permanent_to_whitelist_keeps_transient() {
         // 永久错误 → Codex 白名单(非重试):用户看到错误能换模型
-        assert_eq!(codex_retry_code("bad_request"), "invalid_prompt");
-        assert_eq!(codex_retry_code("content_filter"), "invalid_prompt");
-        assert_eq!(codex_retry_code("auth_error"), "invalid_prompt");
-        assert_eq!(codex_retry_code("permission_denied"), "invalid_prompt");
+        assert_eq!(crate::codex_retry_code("bad_request"), "invalid_prompt");
+        assert_eq!(crate::codex_retry_code("content_filter"), "invalid_prompt");
+        assert_eq!(crate::codex_retry_code("auth_error"), "invalid_prompt");
+        assert_eq!(
+            crate::codex_retry_code("permission_denied"),
+            "invalid_prompt"
+        );
         // 其余一律保留原 code → Codex Retryable(该重试 / 拿不准别误杀,别动)
         // quota_exceeded:Gemini 429 混 per-minute 限流,不映射非重试 insufficient_quota
-        assert_eq!(codex_retry_code("quota_exceeded"), "quota_exceeded");
+        assert_eq!(crate::codex_retry_code("quota_exceeded"), "quota_exceeded");
         // service_unavailable:瞬时过载,不映射非重试 server_is_overloaded
         assert_eq!(
-            codex_retry_code("service_unavailable"),
+            crate::codex_retry_code("service_unavailable"),
             "service_unavailable"
         );
-        assert_eq!(codex_retry_code("timeout"), "timeout");
-        assert_eq!(codex_retry_code("rate_limited"), "rate_limited");
-        assert_eq!(codex_retry_code("server_error"), "server_error");
-        assert_eq!(codex_retry_code("upstream_error"), "upstream_error");
+        assert_eq!(crate::codex_retry_code("timeout"), "timeout");
+        assert_eq!(crate::codex_retry_code("rate_limited"), "rate_limited");
+        assert_eq!(crate::codex_retry_code("server_error"), "server_error");
+        assert_eq!(crate::codex_retry_code("upstream_error"), "upstream_error");
         assert_eq!(
-            codex_retry_code("upstream_transport_error"),
+            crate::codex_retry_code("upstream_transport_error"),
             "upstream_transport_error"
         );
     }
@@ -2807,7 +3272,7 @@ mod tests {
     fn failure_stream_503_service_unavailable_distinct_from_500() {
         let s = drive_failure_stream(503, r#"{"error":{"message":"overloaded"}}"#);
         // 503 是瞬时 → 保留 service_unavailable(落 Codex Retryable,该重试);
-        // **不**映射 server_is_overloaded(那会变 is_retryable=false 立即断,见 codex_retry_code)
+        // **不**映射 server_is_overloaded(那会变 is_retryable=false 立即断,见 crate::codex_retry_code)
         assert!(s.contains("\"code\":\"service_unavailable\""));
         assert!(!s.contains("\"code\":\"server_is_overloaded\""));
         assert!(s.contains("\"upstream_error_kind\":\"service_unavailable\""));
@@ -3077,5 +3542,103 @@ mod tests {
             args["input"], "*** Begin Patch\n*** End Patch",
             "arguments 必须是 {{\"input\":<patch>}},与请求侧回放形态一致"
         );
+    }
+
+    // [MOC-210] 模型 inlineData 输出必须转成 codex-rs 认的 image_generation_call:
+    // `result` 是**裸 base64 字符串**(非对象)、id 前缀 `ig_`、status=completed。
+    // result 写成对象会让 Codex 报 "invalid image generation payload" 丢弃 → 图不渲染。
+    #[test]
+    fn inline_data_emits_image_generation_call_with_base64_string_result() {
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let raw = br#"data: {"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"QUJDRA=="}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events = drive_to_events(&mut conv, &[raw]);
+        let item = events
+            .iter()
+            .map(|e| parse_event(e).1)
+            .find(|v| {
+                v.get("item")
+                    .and_then(|i| i.get("type"))
+                    .and_then(|t| t.as_str())
+                    == Some("image_generation_call")
+            })
+            .map(|v| v["item"].clone())
+            .expect("必须 emit image_generation_call output item");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(
+            item["result"],
+            Value::String("QUJDRA==".to_owned()),
+            "result 必须是裸 base64 字符串,不能是 {{type,mime_type,data}} 对象"
+        );
+        assert!(
+            item["result"].is_string(),
+            "result 必须是 String(codex-rs ImageGenerationCall.result: String)"
+        );
+        assert!(
+            item["id"].as_str().unwrap().starts_with("ig_"),
+            "id 前缀对齐真机 ig_"
+        );
+    }
+
+    // [MOC-210] 出图轮必须在 session 历史留痕(文本标记),否则下一轮模型看不到"已出图"
+    // 会用同 prompt 反复重调 image_gen。
+    #[test]
+    fn image_generation_call_recorded_in_session_as_marker() {
+        let output_items = vec![json!({
+            "type": "image_generation_call",
+            "id": "ig_abc",
+            "status": "completed",
+            "result": "QUJDRA==",
+            "revised_prompt": "a fluffy cat"
+        })];
+        let msg = GeminiToResponsesConverter::build_assistant_message_for_session(&output_items)
+            .expect("出图轮必须产生 assistant session 消息(不能被 _=>{{}} 丢弃)");
+        let content = msg["content"].as_str().unwrap_or("");
+        assert!(
+            content.contains("已生成图片"),
+            "session content 必须含出图标记,实际: {content}"
+        );
+        assert!(
+            content.contains("a fluffy cat"),
+            "revised_prompt 应带进标记帮模型区分,实际: {content}"
+        );
+    }
+
+    // [MOC-210] 端到端验证 revised_prompt 真的从合成 `_casRevisedPrompt` part 流到
+    // image_generation_call(此前 emit_inline_data 从不设 revised_prompt、标记恒为通用,
+    // devin-review 指出测试只手造 item 没走真实路径)。这里喂「prompt 旁路 part + inlineData」
+    // 两个事件,断言产出的 item 带 revised_prompt、且 session 标记含该 prompt。
+    #[test]
+    fn revised_prompt_flows_from_synthetic_part_to_image_call_and_session() {
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let prompt_event =
+            br#"data: {"candidates":[{"content":{"parts":[{"_casRevisedPrompt":"a fluffy cat on a sofa"}]}}]}
+
+"#;
+        let image_event = br#"data: {"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"QUJDRA=="}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events = drive_to_events(&mut conv, &[prompt_event, image_event]);
+        let item = events
+            .iter()
+            .map(|e| parse_event(e).1)
+            .find(|v| {
+                v.get("item")
+                    .and_then(|i| i.get("type"))
+                    .and_then(|t| t.as_str())
+                    == Some("image_generation_call")
+            })
+            .map(|v| v["item"].clone())
+            .expect("必须 emit image_generation_call");
+        assert_eq!(
+            item["revised_prompt"], "a fluffy cat on a sofa",
+            "revised_prompt 必须从旁路 part 流到 item,实际: {item}"
+        );
+        // 旁路 part 自身不得产出任何 output_text(否则 prompt 会泄漏到对话可见区)
+        let leaked = events
+            .iter()
+            .any(|e| e.contains("a fluffy cat on a sofa") && e.contains("output_text"));
+        assert!(!leaked, "prompt 旁路 part 不能泄漏成 output_text");
     }
 }

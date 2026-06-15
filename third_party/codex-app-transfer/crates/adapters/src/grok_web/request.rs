@@ -35,8 +35,8 @@
 //! - ⚠️ tools / web_search / MCP namespace 字段:**忽略**(server-side state 自动注入)
 //!
 //! 主入口:[`responses_body_to_grok_request_with_session`](生产路径,mapper 用)。
-//! 兼容入口:[`responses_body_to_grok_request`] / [`responses_body_to_grok_request_with_tracker`]
-//! (test fixture,**无 session cache → 不走 core → 丢历史**,prod 别用)。
+//! 测试 fixture:`responses_body_to_grok_request_with_tracker`(`#[cfg(test)]`,
+//! **无 session cache → 不走 core → 丢历史**,prod 别用)。
 //!
 //! 协议事实详见本 module 各 type 的 doc comment(`super::types`、`super::parent_response`),
 //! 以及 `crates/adapters/src/grok_web/mod.rs` 顶层文档。
@@ -75,8 +75,8 @@ pub struct GrokRequestConversion {
 /// state。本 fn 虽 `pub`,但当前唯一 caller 是同 crate 的
 /// [`crate::mapper::grok_web::prepare_grok_web_request`](已同步改);外部 crate
 /// 无引用,签名 break 实际影响为零。Test fixture 路径走
-/// [`responses_body_to_grok_request`] / [`responses_body_to_grok_request_with_tracker`]
-/// (`pub(crate)` 物理隔离,跨 crate 不可见)。
+/// `responses_body_to_grok_request_with_tracker`(`#[cfg(test)]` 物理隔离,
+/// prod build 不存在)。
 ///
 /// 双保险(grok.com 后端契约层面):
 /// 1. **client 端历史拼接**(本 fn 主路径):把 merged messages flatten 成 grok
@@ -113,7 +113,17 @@ pub fn responses_body_to_grok_request_with_session(
         Some(session_cache),
     )?;
     let merged_messages = conversion.response_session.messages;
-    let message = flatten_messages_to_grok_single_string(&merged_messages);
+    // [MOC-193] wire 源用 conversion.body(去重版)而非 merged_messages(session
+    // 全量版):两者在 dedupe_repeated_instruction_messages 处分叉(此前 identical,
+    // 用哪个无差),grok 拍平单字符串发上游同样不该带 N 份重复指令块;session save
+    // 仍用全量,与 gemini_native / anthropic_messages 的消费模式对齐。
+    let wire_messages = conversion
+        .body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_else(|| merged_messages.clone());
+    let message = flatten_messages_to_grok_single_string(&wire_messages);
 
     let parent_response_id = resolve_parent_response_id(body, Some(global_tracker()));
     let is_reasoning = parse_reasoning_flag(body);
@@ -134,24 +144,19 @@ pub fn responses_body_to_grok_request_with_session(
     })
 }
 
-/// **测试 fixture / 兼容入口**(`pub(crate)` 物理隔离 prod 误用):Codex Responses
+/// **测试 fixture**(`#[cfg(test)]` 物理隔离 prod 误用):Codex Responses
 /// body → grok payload,**不走 core**,会丢历史 message + compaction +
 /// function_call_output + reasoning 等非 `type=message` 输入项。
 ///
-/// 此路径**只在 unit test 用**作为 cache-free 简化 harness;prod 必须走
-/// [`responses_body_to_grok_request_with_session`]。
+/// 此路径**只在 unit test 用**作为 cache-free 简化 harness(允许注入
+/// tracker);prod 必须走 [`responses_body_to_grok_request_with_session`]。
+/// 原无-tracker 兼容入口 `responses_body_to_grok_request` 已无调用方,
+/// MOC-118 随 dead-code 清理删除。
 ///
 /// `instructions` 字段:本 fn 单独抽出来塞进 `custom_instructions` 字段(走
 /// grok wire `customInstructions`)— core 路径在 messages[0]=system 里处理,
 /// 本 fn 不走 core,messages 不含 system,故必须独立 surface。
-pub(crate) fn responses_body_to_grok_request(
-    body: &Value,
-    provider: &Provider,
-) -> Result<GrokChatRequest, AdapterError> {
-    responses_body_to_grok_request_with_tracker(body, provider, Some(global_tracker()))
-}
-
-/// **测试 fixture**(允许注入 tracker)。`pub(crate)` 物理隔离 prod 误用。
+#[cfg(test)]
 pub(crate) fn responses_body_to_grok_request_with_tracker(
     body: &Value,
     provider: &Provider,
@@ -489,7 +494,9 @@ fn extract_message_content_text(content: Option<&Value>) -> String {
 }
 
 /// 无 session_cache 的 fallback:从 body.input 数组按 Codex Responses spec 抽 messages,
-/// **不**走 core(测试 fixture 路径)。生产路径用 with_session 入口。
+/// **不**走 core(测试 fixture 路径,仅 [`responses_body_to_grok_request_with_tracker`]
+/// 调用)。生产路径用 with_session 入口。
+#[cfg(test)]
 fn extract_messages_from_input_only(body: &Value) -> Result<Vec<Value>, AdapterError> {
     let mut out: Vec<Value> = Vec::new();
     // 字符串形态:整段当 user
@@ -1119,6 +1126,51 @@ mod tests {
             "无历史 + 单 user message 时 plan 应只含本轮 1 条消息,got: {:?}",
             conv.response_session.messages
         );
+    }
+
+    #[test]
+    fn moc193_grok_wire_deduped_but_session_plan_keeps_full_history() {
+        // [MOC-193] grok wire 源必须用 conversion.body(去重版):cache 历史已
+        // 累积 2 份 identical system 指令块 + 本轮 Codex 又重发 1 份 → 拍平后的
+        // grok message 只含 1 份;session plan(回写 cache)仍 3 份全量。
+        let env_content = "<permissions instructions>BIG block</permissions instructions>";
+        let cache = ResponseSessionCache::new(8, std::time::Duration::from_secs(60));
+        cache.save(
+            "resp_prev",
+            vec![
+                json!({"role": "system", "content": env_content}),
+                json!({"role": "user", "content": "u1"}),
+                json!({"role": "assistant", "content": "a1"}),
+                json!({"role": "system", "content": env_content}),
+                json!({"role": "user", "content": "u2"}),
+                json!({"role": "assistant", "content": "a2"}),
+            ],
+        );
+        let body = json!({
+            "model": "gpt_5_codex",
+            "previous_response_id": "resp_prev",
+            "input": [
+                // developer role:不命中 core merge 仅删 current[0] system 头的
+                // 既有去重(MOC-193 的洞正在于此),merge 后 session 累积 3 份
+                {"type": "message", "role": "developer", "content": env_content},
+                {"type": "message", "role": "user", "content": "u3"}
+            ]
+        });
+        let p = make_provider();
+        let conv = responses_body_to_grok_request_with_session(&body, &p, &cache).unwrap();
+        assert_eq!(
+            conv.request.message.matches(env_content).count(),
+            1,
+            "grok 拍平 wire 只留第一份,got: {}",
+            conv.request.message
+        );
+        let session_env = conv
+            .response_session
+            .messages
+            .iter()
+            .filter(|m| m["content"].as_str() == Some(env_content))
+            .count();
+        assert_eq!(session_env, 3, "session plan 保全量,不碰重建敏感区");
     }
 
     #[test]

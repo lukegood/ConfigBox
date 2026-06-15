@@ -65,16 +65,49 @@ pub struct Settings {
     /// 写入 `~/.codex/config.toml` 的 `sandbox_workspace_write.network_access`,
     /// 控制 `sandbox_mode = workspace-write`(Codex 默认)下 shell 能否联网。
     ///
-    /// **默认 `true`**(#212):解决小白配置完后撞"Codex 看似挂了"的 pain point
-    /// (Codex CLI 默认 `false`,模型用 `curl` 被 sandbox 拦截)。专业用户可在
-    /// UI 上自行关闭。关闭**不影响** Codex 内置 `web_search` 工具(走 OpenAI
-    /// 缓存,不需要 `network_access`)。
+    /// **默认 `false`**(MOC-185):full access(danger-full-access + approval=never)
+    /// 等于完全信任模型、有风险,缺省关;需要联网 / 无审批的用户在 UI 自行开启。
+    /// 关闭**不影响** Codex 内置 `web_search` 工具(走 OpenAI 缓存,不需要
+    /// `network_access`)。已显式设过此 bool 的老 config 照旧解析、不被覆盖
+    /// (serde 反序列化仅在字段缺失时套默认)。
     #[serde(default = "default_codex_network_access")]
     pub codex_network_access: bool,
+
+    /// 内置联网抓取工具的后端档位 (MOC-144): `off`(不暴露抓取工具) / `curl`(reqwest
+    /// 静态 GET) / `wreq`(浏览器 TLS 指纹, 绕 Cloudflare JS 挑战) / `headless`(headless
+    /// Chromium 跑 JS, 取渲染后 DOM)。**独立于** [`Self::codex_network_access`](后者管
+    /// Codex 沙箱 shell 的联网权限, 是两套机制)。**默认 `auto`**(MOC-215:从 `off` 改,
+    /// 让内置联网工具开箱可用;web_search 仍受 chrome_ready gate 保护、不静默下载)。
+    #[serde(default = "default_web_fetch_backend")]
+    pub web_fetch_backend: String,
+
+    /// 「诊断模式」开关(MOC-169/MOC-185):开启后启动独立端口诊断流量查看器
+    /// (默认 `127.0.0.1:18090`)并采集 forward-trace / MCP 流量。**默认 `false`** —— 纯
+    /// 开发者诊断,普通用户零影响、仅本地 loopback;正文按结构化 credential 脱敏但
+    /// prompt/代码/回复完整落盘,故默认关。**MOC-185 起改为 session 级一次性**:UI 开关
+    /// 纯运行时起/停、退出 transfer 即关,**不再持久化也不随启动自启**,故本字段已不被
+    /// 写入 / 读取(保留仅为兼容解析遗留 config);开发者长期采集走 env `CAS_DIAG_TRACE`。
+    #[serde(default)]
+    pub trace_viewer_enabled: bool,
 }
 
 fn default_codex_network_access() -> bool {
-    true
+    false
+}
+
+/// 内置联网抓取后端的默认档(MOC-215: off→auto,开箱即用)。**单一真源** —— typed serde 默认
+/// (本文件)与**所有读 raw JSON config 的 fallback**(src-tauri:current_backend / 启动 sync /
+/// save·import 比较)都引这个常量,防 drift。`auto` 安全:web_fetch 用 curl/wreq 不需 Chrome;
+/// web_search 仍受 mcp_webfetch_server 的 chrome_ready gate 保护,Chrome 未就绪时不暴露、不静默
+/// 下载 ~86MB。用户可在设置里改回 off。
+///
+/// **Why 提常量**(devin/codex bot review #445):此前只改了 typed serde 默认,raw 读取点仍 hardcode
+/// `"off"` → 老用户(config 缺该字段)UI 经 serde 显示 auto、但启动 sync 读 raw 退 off、不注册 MCP,
+/// 工具不激活,违背开箱即用。统一引常量根治。
+pub const DEFAULT_WEB_FETCH_BACKEND: &str = "auto";
+
+fn default_web_fetch_backend() -> String {
+    DEFAULT_WEB_FETCH_BACKEND.to_owned()
 }
 
 impl Default for Settings {
@@ -89,7 +122,9 @@ impl Default for Settings {
             expose_all_provider_models: false,
             restore_codex_on_exit: true,
             update_url: DEFAULT_UPDATE_URL.to_owned(),
-            codex_network_access: true,
+            codex_network_access: false,
+            web_fetch_backend: default_web_fetch_backend(),
+            trace_viewer_enabled: false,
         }
     }
 }
@@ -122,7 +157,8 @@ pub struct Provider {
     #[serde(default)]
     pub sort_index: i64,
     /// 透传任何此结构未显式枚举的字段(notices / baseUrlOptions /
-    /// requestOptionPresets / baseUrlHint / docsUrl / ...).
+    /// requestOptionPresets / baseUrlHint / docsUrl / ...)。历史字段(如 MOC-227
+    /// 移除的 `summaryModel`)若残留在用户 config 也经此透传, 无主但无害。
     #[serde(flatten)]
     pub extra: IndexMap<String, Value>,
 }

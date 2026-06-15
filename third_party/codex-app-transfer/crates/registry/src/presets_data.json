@@ -187,6 +187,33 @@
     "isBuiltin": true
   },
   {
+    "id": "zhipu-coding",
+    "name": "智谱 GLM Coding",
+    "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+    "docsUrl": "https://docs.bigmodel.cn/cn/coding-plan/overview",
+    "authScheme": "bearer",
+    "apiFormat": "openai_chat",
+    "extraHeaders": {
+      "User-Agent": "claude-cli/2.1.175 (external, cli)"
+    },
+    "models": {
+      "gpt_5_5": "glm-4.7",
+      "gpt_5_4": "glm-4.7",
+      "gpt_5_4_mini": "glm-4.6",
+      "gpt_5_3_codex": "glm-4.6",
+      "default": "glm-4.7"
+    },
+    "modelCapabilities": {
+      "glm-4.7": {
+        "context_window": 200000
+      },
+      "glm-4.6": {
+        "context_window": 200000
+      }
+    },
+    "isBuiltin": true
+  },
+  {
     "id": "bailian",
     "name": "阿里云百炼",
     "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -248,9 +275,12 @@
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
     "models": {
-      "default": "MiniMax-M2.7"
+      "default": "MiniMax-M3"
     },
     "modelCapabilities": {
+      "MiniMax-M3": {
+        "context_window": 1000000
+      },
       "MiniMax-M2.7": {
         "context_window": 204800
       }
@@ -258,7 +288,7 @@
     "notices": [
       {
         "type": "info",
-        "text": "MiniMax M2.x 走 OpenAI 兼容 chat completions 端点,代理自动剥不兼容字段(reasoning_effort / response_format / parallel_tool_calls 等)+ tool 剥 strict + 连续 system 合并;响应侧 reasoning_details 拆 reasoning + <think> 兜底拆分仅对 MiniMax 启用。"
+        "text": "MiniMax M2.x / M3 走 OpenAI 兼容 chat completions 端点,代理自动剥不兼容字段(reasoning_effort / response_format / parallel_tool_calls 等)+ tool 剥 strict + 连续 system 合并;响应侧 reasoning_details 拆 reasoning + <think> 兜底拆分仅对 MiniMax 启用。M3 上下文 1M(官方 1,048,576,本项目按 1M 判定)。"
       },
       {
         "type": "info",
@@ -376,7 +406,10 @@
     "name": "Antigravity",
     "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
     "baseUrlOptions": [
-      {"value": "https://cloudcode-pa.googleapis.com", "label": "prod (legacy / 自动 self-heal 用)"}
+      {
+        "value": "https://cloudcode-pa.googleapis.com",
+        "label": "prod (legacy / 自动 self-heal 用)"
+      }
     ],
     "docsUrl": "https://antigravity.google.com/",
     "authScheme": "google_oauth_antigravity",

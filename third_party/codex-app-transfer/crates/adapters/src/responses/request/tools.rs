@@ -9,6 +9,13 @@ use super::provider_looks_like;
 /// wire re-shape — they must trigger on the exact same tool name.
 pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 
+/// Codex 0.130+ `tool_search` builtin name. Request side lowers `type:"tool_search"`
+/// into a chat/function tool with this name; response side (`converter.rs` chat path,
+/// `gemini_native/response.rs` Gemini path) re-shapes the model's function call back
+/// into a `tool_search_call` wire — both must key off this exact name. See MOC-32
+/// (chat path) and MOC-217 (gemini/antigravity path).
+pub(crate) const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
+
 /// Chat-path replacement for Codex CLI's freeform `apply_patch` description.
 /// Original upstream text says "do not wrap the patch in JSON" because the
 /// Responses API freeform/lark grammar accepts raw text — but on the
@@ -32,8 +39,8 @@ pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
     "Edit files using the apply_patch tool. ",
     "**ALWAYS use this tool to write file content** — new files, single-line edits, and full-file rewrites alike. ",
     "**NEVER use shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / any `>` redirect to write actual file content** — doing so bypasses the Codex diff UI and audit trail. ",
-    "(The narrow exception is seeding a totally empty file with `printf '\\n' > <path>` before calling `*** Update File:` — see gotcha 3; that's a setup step, not a content bypass.) ",
-    "For full-file rewrites or large changes where almost every line differs, use `*** Delete File: <path>` followed by `*** Add File: <path>` (with `+` prefix on every line of the new content) inside a single patch — this is more concise than a long `-`/`+` diff and is the correct apply_patch idiom for large rewrites. ",
+    "(To create brand-new or empty files, use `*** Add File: <path>` — not a shell redirect.) ",
+    "**PREFER SURGICAL TARGETED EDITS.** To change or replace existing content, emit ONLY the specific `-` (old) and `+` (new) lines for what actually changes, with minimal context. Do NOT regenerate the whole file/section and append it; do NOT rewrite an entire file just because part of it changed. Reserve full-file replacement (`*** Delete File: <path>` then `*** Add File: <path>` with every line `+`-prefixed, in one patch) for genuine cases ONLY: creating brand-new content, or when almost every line truly differs. ",
     "Call this function with a single `input` string containing a V4A patch. ",
     "**The patch MUST start with `*** Begin Patch` as the literal first line** (no leading whitespace, no other content before it), and end with `*** End Patch`. ",
     "Each file operation header is one of `*** Add File: <path>`, ",
@@ -134,10 +141,10 @@ pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
     "is NOT V4A — the trailing `@@` becomes literal text and breaks context matching.\n",
     "2. Do NOT combine `*** Add File: foo` and `*** Update File: foo` in the SAME patch — Update reads the file before Add lands on disk. ",
     "Either make Add File write the final content in one shot, or split into two separate patches.\n",
-    "3. `*** Update File:` cannot operate on a completely empty file. Use shell to write at least one line first, then apply_patch.\n",
+    "3. To populate a brand-new or empty file, use `*** Add File: <path>` with every line `+`-prefixed (not `*** Update File:`).\n",
     "4. In a multi-line file, lone `+` lines without a corresponding `-` APPEND below the previous context — they do NOT replace any existing line. ",
     "To change a line, use `-` to remove the old line AND `+` to add the new one; do not omit the `-`.\n",
-    "5. If multiple Update attempts on the same file fail with `Failed to find context` errors, fall back to a Delete File + Add File pair within the same patch (semantically equivalent to a full rewrite) — this avoids anchor-matching fragility.\n",
+    "5. If an Update fails with `Failed to find context`, the `-`/context lines did not match the file byte-for-byte. Re-read the file (`cat <path>` / `sed -n`) and fix those lines to match exactly, then retry the SAME surgical Update. Do NOT escalate to rewriting or re-appending the whole file/section — keep the edit targeted to the lines that change.\n",
     "6. `*** Begin Patch` MUST be the literal first line of `input` — no preamble, no whitespace, no `*** Add File:` directly. Forgetting it causes `invalid patch: The first line of the patch must be '*** Begin Patch'`.\n",
     "7. `*** Update File: <old>` + `*** Move to: <new>` requires at least one hunk (rename-only is NOT supported via Move). For pure rename without content change, use `*** Delete File: <old>` + `*** Add File: <new>` (copy original content with `+` prefix). Empty Update+Move fails with `Update file hunk for path '<old>' is empty`."
 );
@@ -162,9 +169,9 @@ pub(crate) const APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT: &str = concat!(
     "(blank lines as bare `+`). Relative paths only. ",
     "`-` lines and space-prefixed context MUST be byte-exact to the file's current content ",
     "(read via `cat <path>` first if unsure) — guessing produces `Failed to find context` errors. ",
-    "Chat-path gotchas: do not Add+Update the same path in one patch; Update cannot ",
-    "operate on a totally empty file; lone `+` without `-` appends instead of replacing. ",
-    "If Update fails repeatedly, fall back to Delete File + Add File in one patch. ",
+    "**PREFER surgical targeted Update** (`-` old line + `+` new line for ONLY the changed lines, minimal context) — do NOT regenerate or append the whole file/section. ",
+    "Chat-path gotchas: do not Add+Update the same path in one patch; for brand-new/empty files use `*** Add File:` (not Update); lone `+` without `-` APPENDS rather than replaces — to replace a line, pair `-` (old) with `+` (new). ",
+    "If Update fails with `Failed to find context`, re-read the file (`cat`) and fix the `-`/context lines to be byte-exact, then retry the SAME targeted Update — do NOT escalate to rewriting the whole file. ",
     "**`*** Begin Patch` MUST be the literal first line of `input`** (no preamble). ",
     "**`*** Update File: <old>` + `*** Move to: <new>` requires ≥1 hunk** — for pure rename use `*** Delete File:` + `*** Add File:` instead."
 );
@@ -208,6 +215,17 @@ pub fn convert_responses_tool_to_chat_tool(
                 }
             }
             let strict = obj.get("strict").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Codex 部分内置工具(list_mcp_resources / load_workspace_dependencies /
+            // read_thread_terminal 等,参数全 optional 或无参)的 parameters schema 省略了
+            // `required` 数组。OpenAI / DeepSeek 官方等宽容上游默认当空集放行;但严格 OpenAI
+            // 兼容中转网关(如 AIOHub)的 validator 要求 object schema 显式带 `required`,读到
+            // 缺失字段得 null → 报 `null is not of type "array"` 把整轮请求 400 拒掉
+            // (MOC-188,用户反馈 fb-63e74a8a)。统一补 `required:[]`(语义中性,对宽容上游
+            // no-op)。`strict:true` 工具按 OpenAI 规范须 required 列全 properties,补空反而
+            // 违规 → 仅 non-strict 补,strict 工具原样透传(详见 core::schema 文档)。
+            if !strict {
+                crate::core::schema::ensure_object_schema_required(&mut parameters);
+            }
             vec![json!({
                 "type": "function",
                 "function": {
@@ -335,10 +353,19 @@ pub fn convert_responses_tool_to_chat_tool(
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let parameters = obj
+            let mut parameters = obj
                 .get("parameters")
                 .cloned()
                 .unwrap_or_else(|| json!({"type":"object","properties":{},"required":[]}));
+            // tool_search 也合成 strict:false 的 chat function;与 function 分支同样要补
+            // 缺失的 required —— 透传 Codex 给的 parameters 若 all-optional/缺 required,
+            // 同样会被严格中转网关 400 拒(MOC-188 同源,review 反馈)。先确保顶层
+            // type:object,再补 required:[](恒 strict:false,故无条件补)。
+            if let Some(po) = parameters.as_object_mut() {
+                po.entry("type")
+                    .or_insert_with(|| Value::String("object".into()));
+            }
+            crate::core::schema::ensure_object_schema_required(&mut parameters);
             vec![json!({
                 "type": "function",
                 "function": {
@@ -349,8 +376,15 @@ pub fn convert_responses_tool_to_chat_tool(
                 },
             })]
         }
+        // [MOC-210] 注意:Codex 内置 `image_generation` 工具在这条 chat-format 通用通道里
+        // **仍然 drop**(落下面 `other`)。出图履约只在 antigravity(走 gemini 请求侧的
+        // `responses_tools_to_chat_tools`,且只对 antigravity flavor 暴露 image_gen)+ proxy
+        // 响应流拦截实现 —— 没有任何 openai_chat-format provider 能履约 image_gen。若在此
+        // 无条件降级成 function tool 暴露,普通 chat provider 的模型可能真去调它 → proxy 不
+        // 拦截 → Codex 收到无 executor 的 function_call 卡等 function_call_output(code-review
+        // I-1)。故这里不特判,保持 drop。
         // Responses 专属类型(local_shell / file_search / computer_use* /
-        // code_interpreter / image_generation / mcp 等)Chat 端点不认,丢弃。
+        // code_interpreter / mcp 等)Chat 端点不认,丢弃。
         // warn_once 防多轮重发刷屏(借鉴 mimo2codex `reqToChat.ts:158-172` warnOnce)。
         other => {
             crate::warn_once_drop_tool(other);
