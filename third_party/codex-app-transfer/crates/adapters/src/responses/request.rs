@@ -42,6 +42,20 @@ const TOOL_OUTPUT_INLINE_MAX_CHARS: usize = 4_000;
 const TOOL_OUTPUT_HEAD_CHARS: usize = 1_200;
 const TOOL_OUTPUT_TAIL_CHARS: usize = 1_200;
 const TOOL_OUTPUT_VISIBLE_MAX_CHARS: usize = 5_000;
+/// 最新 1 条 tool 输出"保留全文"的上限(MOC-190): 当前轮刚产生的 tool 输出全文进上下文, 但 ≤ 此
+/// 上限 —— 超过(如巨型 shell grep 924k)仍走 bounding, 防单条撑爆。100k ≈ web_fetch 全文上限。
+const TOOL_OUTPUT_KEEP_FULL_MAX_CHARS: usize = 100_000;
+
+thread_local! {
+    /// MOC-190: compact 转换期间置 true —— compact 是压缩历史, 不保留最新 tool 全文(与 normal turn
+    /// 区分;两者共用 `input_field_to_messages` 转换路径)。`compact.rs` 在转换前后 set/reset。
+    static COMPACT_NO_KEEP_RECENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 设置 compact 转换标志(见 [`COMPACT_NO_KEEP_RECENT`])。compact 调转换前 `true`、之后 `false`。
+pub(crate) fn set_compact_no_keep_recent(v: bool) {
+    COMPACT_NO_KEEP_RECENT.with(|c| c.set(v));
+}
 
 /// 把 Responses API 请求体转换成 OpenAI Chat Completions 请求体.
 pub fn responses_body_to_chat_body(input: &Value) -> Result<Value, AdapterError> {
@@ -82,9 +96,21 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     // **cache miss + input 空** → build_messages_from_input 返回
     // PreviousResponseNotFound,proxy 层 IntoResponse 会转成标准 OpenAI 400
     // (`code: "previous_response_not_found"`)让 Codex CLI fail-fast。
-    let merge_result = build_messages_from_input(input, session_cache)?;
+    let (merge_result, current_tool_count) = build_messages_from_input(input, session_cache)?;
     let history_lost = merge_result.history_lost;
     let mut messages = merge_result.messages;
+    // MOC-190: merge(cached history + 当前)后统一重新压缩 tool 输出。当前轮(本次 input)新产生的**所有**
+    // function_call_output 都保留全文(模型一轮可能调多个工具, 每条都该全文进 LLM); cached 历史轮的旧
+    // tool 输出压缩。**按位置**区分而非 call_id: merge 把 cached 拼在前、当前轮在后, 故当前轮的 tool
+    // message 是末尾 N 个(N = current_tool_count, 由 build_messages_from_input 在已转换的 current_messages
+    // 上数好带出 —— 不重复转换 / 不重复触发 artifact 存储, chatgpt-codex P2)。位置法不依赖 ID, 兼容
+    // ID-less / 别名 / 多 tool / tool_search_output 等。compact(压缩历史)强制 0 → 全压缩(P1 防累积 + P2)。
+    let keep_count = if COMPACT_NO_KEEP_RECENT.with(|c| c.get()) {
+        0
+    } else {
+        current_tool_count
+    };
+    recompress_stale_full_tool_outputs(&mut messages, keep_count);
     messages = merge_consecutive_user_messages(messages);
     messages = merge_consecutive_assistant_messages(messages);
     repair_tool_call_ids(
@@ -132,6 +158,9 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     // (`code: "previous_response_not_found"`),与 OpenAI 服务端真实行为对齐。
     // 此处不再有"messages 为空"分支:进到这里 messages 必非空。
     let session_messages = messages.clone();
+    // [MOC-193] wire-level 去重必须在 session_messages clone **之后**:cache 保持
+    // 全量原貌(session 重建敏感区不动,MOC-142/168/190),只有发上游的 body 瘦身。
+    dedupe_repeated_instruction_messages(&mut messages);
     result.insert("messages".into(), Value::Array(messages));
 
     // tools(function / custom 直接处理,namespace 递归展平,web_search /
@@ -301,13 +330,23 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
 fn build_messages_from_input(
     body: &Value,
     session_cache: Option<&ResponseSessionCache>,
-) -> Result<MergeResult, AdapterError> {
+) -> Result<(MergeResult, usize), AdapterError> {
     let mut messages: Vec<Value> = Vec::new();
-    if let Some(msg) = body
-        .get("instructions")
-        .and_then(build_instructions_message)
-    {
-        messages.push(msg);
+    // [MOC-153] 剥掉 transfer 注入的 catalog base_instructions sentinel。
+    // transfer 给 catalog 条目写非空 `CAS_BASE_INSTRUCTIONS`(修"第三方会话切真 GPT
+    // 续话报 400"),Codex 会把它作为顶层 instructions 发给**每个** turn —— 包括转发给
+    // 第三方 chat provider 的请求。该 sentinel 对第三方纯属噪音(历史上第三方顶层
+    // instructions 本就为空;仅在注册 apply_patch 的 first turn 才有下方注入的 chat-path
+    // 指引),命中即跳过、保持第三方请求与历史行为一致、零污染。非 sentinel 的真实
+    // instructions 照常转为 system 头。
+    let instructions = body.get("instructions");
+    let skip_cas_sentinel = instructions
+        .map(is_cas_injected_base_instructions)
+        .unwrap_or(false);
+    if !skip_cas_sentinel {
+        if let Some(msg) = instructions.and_then(build_instructions_message) {
+            messages.push(msg);
+        }
     }
 
     // 紧跟 Codex CLI 自带 instructions 之后注入 apply_patch chat-path 指引
@@ -348,8 +387,20 @@ fn build_messages_from_input(
         .get("input")
         .map(input_field_to_messages)
         .unwrap_or_default();
+    // 当前轮转换后产出的 role:tool message 数 —— 随返回带出, 供 recompress 定位末尾 N 个。在这里数(而非
+    // 上层再转换一次)避免重复触发 keep_recent_tool_output_full 的 artifact 存储副作用(chatgpt-codex P2)。
+    // 当前轮的 tool 是 current_messages **末尾连续**的那一组(被任意非 tool message 隔断之前的更早
+    // tool 属历史)。stateless client 无 previous_response_id、把完整 transcript 直接塞进 input 时,
+    // 只有最新一组该保留全文, 不是数组里所有 function_call_output —— 否则历史 web_fetch 各留 100k 累积
+    // 撑爆, 绕过 P1(chatgpt-codex P2)。
+    let current_tool_count = current_messages
+        .iter()
+        .rev()
+        .take_while(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+        .count();
     messages.extend(current_messages);
-    merge_messages_with_previous_response(messages, body, session_cache)
+    let merge_result = merge_messages_with_previous_response(messages, body, session_cache)?;
+    Ok((merge_result, current_tool_count))
 }
 
 fn build_instructions_message(instructions: &Value) -> Option<Value> {
@@ -387,13 +438,35 @@ fn build_instructions_message(instructions: &Value) -> Option<Value> {
     }
 }
 
+/// [MOC-153] 顶层 instructions 是否就是 transfer 注入给 catalog 的 sentinel
+/// ([`codex_app_transfer_registry::CAS_BASE_INSTRUCTIONS`])。命中即在转发给第三方
+/// chat provider 时剥离,详见 [`build_messages_from_input`] 与 registry 模块文档。
+///
+/// 兼容 wire 上 instructions 既可能是裸 string、也可能是 `{ "text" | "content": ... }`
+/// 对象;精确匹配常量值(不 trim,catalog→session_meta→wire 全程原样传递)。
+fn is_cas_injected_base_instructions(instructions: &Value) -> bool {
+    let text = match instructions {
+        Value::String(s) => Some(s.as_str()),
+        Value::Object(obj) => obj
+            .get("text")
+            .or_else(|| obj.get("content"))
+            .and_then(|v| v.as_str()),
+        _ => None,
+    };
+    text == Some(codex_app_transfer_registry::CAS_BASE_INSTRUCTIONS)
+}
+
 /// 把 `body.input` 字段(可能是 string 也可能是 array)展开成 messages 列表.
 fn input_field_to_messages(input: &Value) -> Vec<Value> {
     let items = extract_input_items(input);
+    // MOC-190: input 是「当前轮」新产生的 —— 其**所有** function_call_output 都保留全文(模型一轮可能
+    // 调多个工具, 每条都该全文进 LLM)。compact(压缩历史)不保留。cached history 里之前轮当「当前」存入
+    // 的旧全文, 由 merge 后的 recompress 按 call_id 压缩 —— 那才是历史轮。
+    let keep_current_tools = !COMPACT_NO_KEEP_RECENT.with(|c| c.get());
     let mut out = Vec::new();
     let mut pending_reasoning: Option<String> = None;
 
-    for item in items {
+    for item in items.iter() {
         let Some(obj) = item.as_object() else {
             continue;
         };
@@ -401,7 +474,8 @@ fn input_field_to_messages(input: &Value) -> Vec<Value> {
             pending_reasoning = Some(extract_reasoning_text(obj));
             continue;
         }
-        let mut item_messages = input_item_to_messages(obj);
+        let is_fco = obj.get("type").and_then(|v| v.as_str()) == Some("function_call_output");
+        let mut item_messages = input_item_to_messages(obj, keep_current_tools && is_fco);
         for msg in &mut item_messages {
             if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
                 if let Some(reasoning) = pending_reasoning.take() {
@@ -515,7 +589,7 @@ fn strip_codex_reasoning_prefix(text: &str) -> &str {
 }
 
 /// 单个 Responses input item → 一条或多条 Chat message.
-fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
+fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool) -> Vec<Value> {
     let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match item_type {
@@ -558,8 +632,17 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
                 .get("output")
                 .cloned()
                 .unwrap_or(Value::String(String::new()));
-            let output_str =
-                normalize_tool_output_for_context(Some(call_id.as_str()), output_value);
+            // [apply-patch 诊断页] apply_patch 是 freeform custom 工具,但 Codex 回灌结果**可能**
+            // 用 `function_call_output`(实测 chat 路径)或 `custom_tool_call_output`(下方 arm)。
+            // 两处都挂,内部按 pending call_id 精确配对 —— 只有我们发过的 completed apply_patch call
+            // 才发射,shell 等其它工具的 function_call_output 不会命中。必须在 output_value 被移走前调。
+            crate::core::apply_patch_trace::emit_result(&call_id, &output_value);
+            // MOC-190: 最新 1 条 tool 输出保留全文(当前轮全文进 LLM); 历史轮照常压缩。
+            let output_str = if keep_full {
+                keep_recent_tool_output_full(Some(call_id.as_str()), output_value)
+            } else {
+                normalize_tool_output_for_context(Some(call_id.as_str()), output_value)
+            };
             vec![json!({
                 "role": "tool",
                 "tool_call_id": call_id,
@@ -712,6 +795,11 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
                 .get("output")
                 .cloned()
                 .unwrap_or(Value::String(String::new()));
+            // [apply-patch 诊断页] 抓 apply_patch 的**结果回灌**(Codex apply 后塞回模型的输出)。
+            // 只在 call_id 命中我们发过的 completed apply_patch call(pending)时发射,故历史重放
+            // 的重复结果 / 非 apply_patch 的 custom 工具结果都不会进 —— 必须在 output_value 被
+            // normalize 移走**之前**调。默认关、关时零开销。
+            crate::core::apply_patch_trace::emit_result(&call_id, &output_value);
             let output_str =
                 normalize_tool_output_for_context(Some(call_id.as_str()), output_value);
             vec![json!({
@@ -824,7 +912,10 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
 /// 收集 Codex 发现的工具(namespace/function 结构)。Codex 0.130+ 把 MCP 工具
 /// defer 到 tool_search,发现的工具只出现在 tool_search_output.tools,**不在**
 /// body.tools[];不注入 chat tools[] 则 LLM 永远看不到 → 无法调用。
-fn discovered_tools_from_tool_search_output(input: &Value) -> Vec<Value> {
+///
+/// `pub(crate)`:gemini_native 请求侧复用同一发现逻辑(MOC-217),避免 gemini
+/// 重写一套 namespace 提取后漂移。参数是整个 body(内部取 `.input`)。
+pub(crate) fn discovered_tools_from_tool_search_output(input: &Value) -> Vec<Value> {
     let Some(items) = input.get("input").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -855,7 +946,9 @@ fn discovered_tools_from_tool_search_output(input: &Value) -> Vec<Value> {
 
 /// 按 `function.name` 去重 chat tools(保留首次出现 — body.tools[] builtin 在
 /// 发现工具之前 extend,故 builtin 优先)。空 name 不参与去重(全保留)。
-fn dedup_chat_tools_by_name(tools: &mut Vec<Value>) {
+///
+/// `pub(crate)`:gemini_native 请求侧注入 discovered tools 后同样需去重(MOC-217)。
+pub(crate) fn dedup_chat_tools_by_name(tools: &mut Vec<Value>) {
     let mut seen = std::collections::HashSet::new();
     tools.retain(|t| {
         let name = t
@@ -903,6 +996,70 @@ fn extract_tool_search_output_tool_names(item: &serde_json::Map<String, Value>) 
         );
     }
     names
+}
+
+/// MOC-190 P1: merge(拼接 cached history + 当前)后统一收口 —— 只保留全局最新 1 条 tool message
+/// 全文, 更早的若超 inline 阈值且尚未压缩(不含外置标记)则重新 bound。覆盖 session cache 里之前
+/// 作为 latest 存入的全文(它们在当轮已非最新, 不该再占满上下文);已 bound 的跳过防嵌套。
+fn recompress_stale_full_tool_outputs(messages: &mut [Value], keep_recent_count: usize) {
+    // keep_recent_count = 当前轮(本次 input)新产生的 function_call_output 数。merge 把 cached 拼在前、
+    // 当前轮在后, 故当前轮的 tool message 是**末尾 keep_recent_count 个** —— 这些保留全文(模型一轮调多
+    // 工具时每条都该全文); 更靠前的(cached 历史)若超阈值且未压缩则重新 bound。按位置而非 call_id, 兼容
+    // ID-less / 别名(recompress 在 repair_tool_call_ids 前跑, 此刻 tool_call_id 可能还没补)。N=0 → 全压缩。
+    let tool_positions: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+        .map(|(i, _)| i)
+        .collect();
+    let keep: std::collections::HashSet<usize> = tool_positions
+        .iter()
+        .rev()
+        .take(keep_recent_count)
+        .copied()
+        .collect();
+    for (i, m) in messages.iter_mut().enumerate() {
+        if keep.contains(&i) {
+            continue; // 当前轮的(末尾 N 个), 保留全文
+        }
+        if m.get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+        let Some(content) = m.get("content").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // 只压缩"看起来是全文"的(超 inline 阈值);已是 bounded evidence(含外置标记)的跳过防嵌套。
+        if content.chars().count() <= TOOL_OUTPUT_INLINE_MAX_CHARS
+            || content.contains("[Tool output stored outside model context]")
+        {
+            continue;
+        }
+        let call_id = m
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let bounded = normalize_tool_output_for_context(
+            call_id.as_deref(),
+            Value::String(content.to_owned()),
+        );
+        if let Some(obj) = m.as_object_mut() {
+            obj.insert("content".into(), Value::String(bounded));
+        }
+    }
+}
+
+/// 最新 1 条 tool 输出保留全文(MOC-190): ≤ 上限直接全文(当前轮全文进 LLM), 超过仍 bound 防撑爆。
+/// 与 [`normalize_tool_output_for_context`] 互补 —— 后者无条件压缩, 本函数给"当前轮那条"开全文绿灯。
+pub(crate) fn keep_recent_tool_output_full(call_id: Option<&str>, output_value: Value) -> String {
+    let raw = match output_value {
+        Value::String(s) => s,
+        other => serde_json::to_string(&other).unwrap_or_default(),
+    };
+    if raw.chars().count() <= TOOL_OUTPUT_KEEP_FULL_MAX_CHARS {
+        raw
+    } else {
+        normalize_tool_output_for_context(call_id, Value::String(raw))
+    }
 }
 
 pub(crate) fn normalize_tool_output_for_context(
@@ -1156,6 +1313,59 @@ fn image_url_for_chat(value: Value, detail: &str) -> Value {
         Value::Object(_) => value,
         Value::String(url) => json!({ "url": url, "detail": detail }),
         other => json!({ "url": value_to_chat_string(&other), "detail": detail }),
+    }
+}
+
+/// [MOC-193] wire-level 去重 merged 历史里逐轮累积的重复指令块。
+///
+/// Codex 每轮(或每个新任务)在 input 里重发 developer 指令(`<user_instructions>` +
+/// `<environment_context>`,实测 ~37KB 一份),`merge_messages_with_previous_response`
+/// 的去重只覆盖 `current[0]` 的 system 头,中段 developer 块逐轮滚雪球(实测一次请求
+/// 3 份 identical,纯冗余 ~74KB)。本函数对 role ∈ {system, developer} 且**整条消息
+/// 序列化完全一致**的,只保留**第一份**;user/assistant/tool 一律不碰。
+///
+/// - 保第一份而非最新:历史保持 append-only,上游 prompt cache 前缀逐轮稳定;留最新
+///   会让块位置逐轮后移,前缀 diverge 全量 cache miss,省 token 反拖慢 TTFB。
+///   注意这与 OpenAI 官方 /responses 服务端重放语义相反端(官方会保留全部 N 份、
+///   最新一份天然靠近对话尾部)——内容 exact-identical 信息无损,只损 recency
+///   锚定,权衡取 prompt cache 前缀稳定;若未来长对话质量回退疑似与此相关,
+///   用下方 `MOC193_INSTRUCTION_DEDUPED` 日志归因。
+/// - exact-identical 是 fail-safe 方向:内容有任何差异(如含时间戳)即不删,最坏
+///   情况是优化不生效,不会误删。
+/// - 调用点在 `session_messages` clone 之后:cache 保全量,仅 wire 瘦身,可秒回滚。
+fn dedupe_repeated_instruction_messages(messages: &mut Vec<Value>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dropped_count = 0usize;
+    let mut dropped_bytes = 0usize;
+    messages.retain(|msg| {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "system" && role != "developer" {
+            return true;
+        }
+        // 整条消息(role + content + 其余字段)做 key:任何字段差异都视为不同,不删
+        let key = msg.to_string();
+        let key_bytes = key.len();
+        if seen.insert(key) {
+            true
+        } else {
+            dropped_count += 1;
+            dropped_bytes += key_bytes;
+            false
+        }
+    });
+    // 命中才 emit(MOC-48 observability 模式):forward-trace 里 outbound 消息数
+    // 少于 session cache 全量时,operator 据此归因是 dedupe 而非 history 丢失;
+    // 同时验证省流是否真实兑现(Codex 若给 env block 加时间戳,本优化会静默失效)。
+    // info 级而非 debug:telemetry bridge(src-tauri/telemetry_bridge.rs)按
+    // LevelFilter::INFO 兜底,debug 进不了 logs viewer / proxy-*.log;每请求
+    // 最多一条,与 MINIMAX_SYS_CONVERT_SPLIT 同级不刷屏。
+    if dropped_count > 0 {
+        tracing::info!(
+            error_id = "MOC193_INSTRUCTION_DEDUPED",
+            dropped_count,
+            dropped_bytes,
+            "wire-level 去重重复 system/developer 指令块(session cache 保全量,仅上游 body 瘦身)"
+        );
     }
 }
 
@@ -2064,6 +2274,8 @@ fn provider_supports_vision(provider: Option<&Provider>, model: Option<&str>) ->
             // 智谱 GLM 文本旗舰模型（官方明确为文本模型，视觉走 GLM-5V 等独立模型）
             "glm-5.1",
             "glm-4.7",
+            // GLM Coding Plan 套餐档（zhipu-coding preset 的 mini/codex 槽,同纯文本）
+            "glm-4.6",
             // 阿里云百炼 Qwen 标准版（视觉能力走 Qwen-VL 系列）
             "qwen3.6-plus",
             "qwen3.6-flash",
@@ -2586,7 +2798,7 @@ use tools::{
 const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
     "[apply_patch chat-path guidance — injected by codex-app-transfer adapter because the upstream lark grammar constraint is unavailable on chat function-call providers]\n",
     "\n",
-    "**ALWAYS use the `apply_patch` tool to write file content** — new files, single-line edits, and full-file rewrites alike. **NEVER use shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / any `>` redirect to write actual file content** — doing so bypasses the Codex diff UI and audit trail. (The narrow exception in rule 5 below — `printf '\\n' > <path>` to seed an empty file before `*** Update File:` — is an apply_patch preparation step, not a content bypass.) For full-file rewrites or large changes where almost every line differs, use `*** Delete File: <path>` followed by `*** Add File: <path>` (every line of the new content prefixed with `+`) inside the same patch — this is more concise than a long `-`/`+` diff and is the correct apply_patch idiom for large rewrites.\n",
+    "**ALWAYS use the `apply_patch` tool to write file content** — new files, single-line edits, and full-file rewrites alike. **NEVER use shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / any `>` redirect to write actual file content** — doing so bypasses the Codex diff UI and audit trail. (To create a brand-new or empty file, use `*** Add File: <path>` — not a shell redirect.) **PREFER surgical targeted edits**: to change or replace existing content, emit ONLY the specific `-` (old) and `+` (new) lines for what actually changes; do NOT regenerate the whole file/section and append it, and do NOT rewrite an entire file just because part of it changed. Reserve full-file replacement (`*** Delete File: <path>` then `*** Add File: <path>` with every line `+`-prefixed, in one patch) for genuine cases ONLY: creating brand-new content, or when almost every line truly differs.\n",
     "\n",
     "When you call the `apply_patch` tool, follow these rules empirically observed with non-OpenAI chat providers:\n",
     "\n",
@@ -2608,11 +2820,11 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
     "\n",
     "4. Do NOT combine `*** Add File: <path>` and `*** Update File: <path>` for the same path in a single patch. The Update step reads the file before the Add step lands on disk, so it sees an empty file and fails. Either: (a) make `*** Add File:` write the final content in one shot, or (b) split into two separate `apply_patch` invocations.\n",
     "\n",
-    "5. `*** Update File:` cannot operate on a totally empty file. If the target is empty, first use shell (e.g. `printf '\\n' > <path>`) to write at least one line, then call `apply_patch`.\n",
+    "5. To populate a brand-new or empty file, use `*** Add File: <path>` with every line `+`-prefixed (not `*** Update File:`, not a shell redirect).\n",
     "\n",
     "6. In a multi-line file, lone `+` lines without a corresponding `-` line APPEND below the previous context — they do NOT replace any existing line. To change an existing line, you MUST include BOTH a `-` line (removing the old content) AND a `+` line (adding the new content).\n",
     "\n",
-    "7. If repeated Update File attempts on the same target fail with `Failed to find context` errors, fall back to a Delete File + Add File pair within the same patch (semantically equivalent to a full rewrite, avoids anchor-matching fragility).\n",
+    "7. If an Update fails with `Failed to find context`, the `-`/context lines did not match the file byte-for-byte — re-read the file (`cat <path>` / `sed -n`) and fix those lines to match exactly, then retry the SAME surgical Update. Do NOT escalate to rewriting or re-appending the whole file; keep the edit targeted to the lines that change.\n",
     "\n",
     "8. `*** Begin Patch` MUST be the literal first line of the `input` string — no leading whitespace, no other content before it, never put `*** Add File:` or any operation header directly. Forgetting this causes `invalid patch: The first line of the patch must be '*** Begin Patch'`.\n",
     "\n",
@@ -2641,7 +2853,7 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
 const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH: &str = concat!(
     "[apply_patch chat-path 指引 — 由 codex-app-transfer adapter 注入,因为上游 lark 语法约束在 chat function-call provider 上不可用]\n",
     "\n",
-    "**务必使用 `apply_patch` tool 写文件内容** —— 新建文件、单行编辑、整文件重写都一样。**绝不使用 shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / 任何 `>` 重定向来写实际文件内容** —— 这样做会绕过 Codex diff UI 和审计 trail。(下面规则 5 提到的窄例外 — `printf '\\n' > <path>` 在 `*** Update File:` 之前播种空文件 — 是 apply_patch 的预处理步骤,不是内容旁路。)对于整文件重写或几乎每行都不同的大改动,在同一 patch 内用 `*** Delete File: <path>` 加上 `*** Add File: <path>`(新内容每行前缀 `+`)—— 这比长 `-`/`+` diff 更精简,是大重写的正确 apply_patch 用法。\n",
+    "**务必使用 `apply_patch` tool 写文件内容** —— 新建文件、单行编辑、整文件重写都一样。**绝不使用 shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / 任何 `>` 重定向来写实际文件内容** —— 这样做会绕过 Codex diff UI 和审计 trail。(新建或空文件用 `*** Add File: <path>` —— 不要用 shell 重定向。)**优先外科式针对性编辑**:要改/替换已有内容时,只发改动那几行的 `-`(旧)和 `+`(新);**不要**整段重新生成再追加,**不要**因为改了一部分就整文件重写。整文件替换(同一 patch 内 `*** Delete File: <path>` + `*** Add File: <path>`、每行前缀 `+`)**仅限**真正需要时:新建全新内容,或几乎每行都不同。\n",
     "\n",
     "调用 `apply_patch` tool 时,遵循以下基于非 OpenAI chat provider 实战观察总结的规则:\n",
     "\n",
@@ -2663,11 +2875,11 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH: &str = concat!(
     "\n",
     "4. **不要**在同一 patch 内对同一路径同时用 `*** Add File: <path>` 和 `*** Update File: <path>`。Update 步骤会在 Add 步骤落盘前读文件,看到空文件后失败。要么 (a) 让 `*** Add File:` 一次性写最终内容,要么 (b) 拆成两个独立的 `apply_patch` 调用。\n",
     "\n",
-    "5. `*** Update File:` **不能**作用于完全空的文件。目标为空时先用 shell(例如 `printf '\\n' > <path>`)写至少一行,再调 `apply_patch`。\n",
+    "5. 新建或空文件用 `*** Add File: <path>`、每行前缀 `+`(不要用 `*** Update File:`,也不要用 shell 重定向)。\n",
     "\n",
     "6. 多行文件里,**没有**对应 `-` 行的孤立 `+` 行会**追加**在上文 context 之下 —— **不会**替换任何已有行。要修改已有行,**必须**同时包含 `-` 行(删旧内容)和 `+` 行(加新内容)。\n",
     "\n",
-    "7. 同一目标上多次 Update File 都报 `Failed to find context` 错误时,fallback 到同一 patch 内的 Delete File + Add File 组合(语义上等价于整文件重写,绕开 anchor 匹配的脆弱性)。\n",
+    "7. Update 报 `Failed to find context` 时,说明 `-`/context 行跟文件 byte 对不上 —— 重新 `cat <path>` / `sed -n` 读文件、把这些行改成完全一致,再重试**同一个**针对性 Update。**不要**升级成整文件重写/重新追加,把编辑保持在改动的那几行。\n",
     "\n",
     "8. `*** Begin Patch` **必须**是 `input` 字符串的字面第一行 —— 不能有前导空格,前面不能有其它内容,绝不能直接写 `*** Add File:` 或任何操作 header。漏了会触发 `invalid patch: The first line of the patch must be '*** Begin Patch'`。\n",
     "\n",
@@ -2688,10 +2900,10 @@ fn apply_patch_chat_path_guidance_for_current_language() -> &'static str {
 /// 内置联网工具引导(中文)。真机实测:模型对"找数据/查定价"类任务 shell-first —— 单次会话
 /// 18 次 shell curl vs 1 次 web_search(即便 web_search/web_fetch 已暴露),curl 抓外网被防火墙/
 /// 反爬拦截后白费多轮、退化到可能过时的训练数据。引导模型优先用工具(MOC-12 followup)。
-const WEB_TOOLS_SYSTEM_GUIDANCE_ZH: &str = "联网获取信息时(实时事实 / 价格 / 文档 / 新闻 / 版本号 / 任何你不确定或可能已过时的内容),**优先用 `web_search` 和 `web_fetch` 工具,不要用 shell 的 curl / wget / python 去抓 URL 或搜索引擎**。本机对外网访问受限,shell 直连通常被防火墙 / 反爬拦截(返回空或 403),会白费多轮尝试、最后只能靠可能过时的记忆作答;而这两个工具经 codex-app-transfer 代理(浏览器 TLS 指纹 + headless 渲染)能真正抓到。用法:先 `web_search(query)` 找信息源,再对结果里的 URL 用 `web_fetch(url, 你的问题)` 读正文。";
+const WEB_TOOLS_SYSTEM_GUIDANCE_ZH: &str = "联网获取信息时(实时事实 / 价格 / 文档 / 新闻 / 版本号 / 任何你不确定或可能已过时的内容),**优先用 `web_search` 和 `web_fetch` 工具,不要用 shell 的 curl / wget / python 去抓 URL 或搜索引擎**。本机对外网访问受限,shell 直连通常被防火墙 / 反爬拦截(返回空或 403),会白费多轮尝试、最后只能靠可能过时的记忆作答;而这两个工具经 codex-app-transfer 代理(浏览器 TLS 指纹 + headless 渲染)能真正抓到。用法:先 `web_search(query)` 找信息源,再用 `web_fetch(url)` 读该页**完整正文**(返回全文、自己读)。之前抓过的某 URL 若在对话历史里被折叠 / 压缩、需要回看完整原文, 用 `read_url_local(url)` 从本地缓存取回, 不必重新联网。";
 
 /// 内置联网工具引导(English)。见 [`WEB_TOOLS_SYSTEM_GUIDANCE_ZH`]。
-const WEB_TOOLS_SYSTEM_GUIDANCE_EN: &str = "When you need information from the web (current facts, prices, docs, news, version numbers — anything you're unsure of or that may be outdated), PREFER the `web_search` and `web_fetch` tools. Do NOT use shell curl / wget / python to fetch URLs or scrape search engines: outbound network here is restricted and direct HTTP is usually blocked by firewalls / anti-bot (empty body or 403), wasting many turns before you fall back to possibly-stale memory. These two tools route through codex-app-transfer's proxy (browser TLS fingerprint + headless rendering) and actually work. Usage: `web_search(query)` to find sources, then `web_fetch(url, your-question)` to read each result's page.";
+const WEB_TOOLS_SYSTEM_GUIDANCE_EN: &str = "When you need information from the web (current facts, prices, docs, news, version numbers — anything you're unsure of or that may be outdated), PREFER the `web_search` and `web_fetch` tools. Do NOT use shell curl / wget / python to fetch URLs or scrape search engines: outbound network here is restricted and direct HTTP is usually blocked by firewalls / anti-bot (empty body or 403), wasting many turns before you fall back to possibly-stale memory. These two tools route through codex-app-transfer's proxy (browser TLS fingerprint + headless rendering) and actually work. Usage: `web_search(query)` to find sources, then `web_fetch(url)` to read the page's FULL text (full content — read it yourself). If a URL you fetched earlier got folded/compressed in the conversation history and you need the full original again, use `read_url_local(url)` to pull it from the local cache instead of re-fetching.";
 
 /// 按当前 user 语言偏好选内置联网工具引导。
 fn web_tools_guidance_for_current_language() -> &'static str {

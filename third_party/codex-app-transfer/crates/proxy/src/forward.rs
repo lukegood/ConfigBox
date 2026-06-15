@@ -28,12 +28,13 @@ use codex_app_transfer_adapters::{
 };
 use codex_app_transfer_registry::strip_internal_model_suffix;
 use futures_core::Stream;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use thiserror::Error;
 
 use crate::diagnostics::{
-    forward_trace_enabled, write_chatgpt_backend_trace, write_forward_trace_jsonl,
-    write_upstream_error_bundle, ForwardTraceInput, UpstreamErrorBundleInput,
+    forward_trace_enabled, write_chatgpt_backend_trace, write_codex_response_trace,
+    write_forward_trace_jsonl, write_upstream_error_bundle, ForwardTraceInput,
+    UpstreamErrorBundleInput,
 };
 use crate::resolver::{AuthScheme, ResolveError, ResolvedProvider, SharedResolver};
 use crate::telemetry::proxy_telemetry;
@@ -133,14 +134,29 @@ pub enum ForwardError {
     },
 }
 
+fn build_error_cause_chain(err: &dyn std::error::Error, top: &str) -> String {
+    let mut out = top.to_string();
+    let mut src = err.source();
+    while let Some(e) = src {
+        let es = e.to_string();
+        if !out.contains(&es) {
+            out.push_str(" → ");
+            out.push_str(&es);
+        }
+        src = e.source();
+    }
+    out
+}
+
 impl axum::response::IntoResponse for ForwardError {
     fn into_response(self) -> Response {
         let message = self.to_string();
         let telemetry = proxy_telemetry();
         telemetry.stats.record(false);
+        let log_message = build_error_cause_chain(&self, &message);
         telemetry
             .logs
-            .add("ERROR", format!("proxy request failed: {message}"));
+            .add("ERROR", format!("proxy request failed: {log_message}"));
 
         // OauthUnavailable 单独走 401 + structured JSON,提示用户重新登录(2026-05-11
         // silent-failure 修)。原版走 502 + plain text "proxy error: invalid header: ..."
@@ -384,6 +400,8 @@ pub async fn forward_handler(
     // disable web_search,prepare_request 会输出不带 web_search 工具的 body。
     let original_body_bytes_for_retry = body_bytes.clone();
     let mut plan = adapter.prepare_request(&client_path, body_bytes, &resolved.provider)?;
+    let is_antigravity =
+        codex_app_transfer_adapters::is_antigravity_api_format(&resolved.provider.api_format);
 
     // 5. 拼上游 URL —— base 末尾去 `/`,plan.upstream_path 必含 `/`
     let upstream_url = build_upstream_url(&resolved.upstream_base, &plan.upstream_path);
@@ -590,10 +608,27 @@ pub async fn forward_handler(
             // 响应体由 TracedStream tee(不破流式),Drop 时连同 ctx 写一行 jsonl。
             let trace_ctx = forward_trace_enabled()
                 .then(|| make_trace_ctx(st.as_u16(), resp.headers().clone()));
-            let raw = Box::pin(
+            let raw: codex_app_transfer_adapters::ByteStream = Box::pin(
                 resp.bytes_stream()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
             );
+            let is_sse = hs
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.contains("event-stream"))
+                .unwrap_or(false);
+            let raw = if is_antigravity && is_sse {
+                intercept_image_gen_stream(
+                    raw,
+                    state.clone(),
+                    parts.method.clone(),
+                    parts.headers.clone(),
+                    resolved.clone(),
+                    resolved.upstream_base.clone(),
+                )
+            } else {
+                raw
+            };
             Box::pin(TracedStream::new(
                 raw,
                 t_send,
@@ -668,11 +703,30 @@ pub async fn forward_handler(
 
     // 8. 把 ResponsePlan 还原成 axum Response
     let mut builder = Response::builder().status(response_plan.status);
+    let codex_status = response_plan.status.as_u16();
+    let codex_method = parts.method.as_str().to_string();
+    let codex_path = client_path.clone();
+    let codex_ct = response_plan
+        .headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let headers_out = builder
         .headers_mut()
         .ok_or_else(|| ForwardError::Header("response builder lacks headers".into()))?;
     *headers_out = response_plan.headers;
-    Ok(builder.body(Body::from_stream(response_plan.stream))?)
+    let codex_stream: codex_app_transfer_adapters::ByteStream = if forward_trace_enabled() {
+        Box::pin(CodexRespStream::new(
+            response_plan.stream,
+            codex_method,
+            codex_path,
+            codex_status,
+            codex_ct,
+        ))
+    } else {
+        response_plan.stream
+    };
+    Ok(builder.body(Body::from_stream(codex_stream))?)
 }
 
 /// [MOC-104 relay] relay 模式 `chatgpt_base_url=<proxy>/backend-api` 后,Codex 的
@@ -826,6 +880,9 @@ async fn passthrough_chatgpt_backend(
 /// forward-trace(MOC-89)成功路径上限:tee 的响应体最多缓冲这么多字节(与 diagnostics
 /// 的 body cap 一致;`redact_body` 还会再 cap 一次)。仅 gate 开时分配。
 const MAX_TRACE_BODY_BYTES: usize = 256 * 1024;
+/// codex_response tee 缓冲上限:比 forward 大,以完整逐字节验证大输出的 transfer 转换
+/// (转换后 SSE 常 >256KB)。仅 gate 开 + 仅 codex_response 流分配,普通转发不受影响。
+const MAX_CODEX_RESP_TEE_BYTES: usize = 2 * 1024 * 1024;
 
 /// forward-trace 成功路径在 [`TracedStream`] 里随流携带的 owned 上下文。流走完(Drop)时
 /// 借这些字段 + tee 到的响应体构造 [`ForwardTraceInput`] 写一行 jsonl。仅 gate 开时为
@@ -939,6 +996,73 @@ impl Drop for TracedStream {
                 // resp_buf 可能被 cap 截断;total_bytes 是 tee 累计真实全长 → 传它修正 truncated_bytes
                 write_trace_from_ctx(&ctx, &self.resp_buf, self.total_bytes);
             }
+        }
+    }
+}
+
+/// tee **proxy→Codex 转换后响应**:passthrough + 累积(cap [`MAX_CODEX_RESP_TEE_BYTES`]),
+/// 流走完(Drop)写一条 `codex_response` trace。仅 gate 开时 wrap。
+struct CodexRespStream {
+    inner: codex_app_transfer_adapters::ByteStream,
+    method: String,
+    client_path: String,
+    status: u16,
+    content_type: Option<String>,
+    buf: Vec<u8>,
+    total: usize,
+}
+
+impl CodexRespStream {
+    fn new(
+        inner: codex_app_transfer_adapters::ByteStream,
+        method: String,
+        client_path: String,
+        status: u16,
+        content_type: Option<String>,
+    ) -> Self {
+        Self {
+            inner,
+            method,
+            client_path,
+            status,
+            content_type,
+            buf: Vec::new(),
+            total: 0,
+        }
+    }
+}
+
+impl Stream for CodexRespStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.total += chunk.len();
+                if this.buf.len() < MAX_CODEX_RESP_TEE_BYTES {
+                    let room = MAX_CODEX_RESP_TEE_BYTES - this.buf.len();
+                    let take = room.min(chunk.len());
+                    this.buf.extend_from_slice(&chunk[..take]);
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            other => other,
+        }
+    }
+}
+
+impl Drop for CodexRespStream {
+    fn drop(&mut self) {
+        if forward_trace_enabled() {
+            write_codex_response_trace(
+                &self.method,
+                &self.client_path,
+                self.status,
+                self.content_type.as_deref(),
+                &self.buf,
+                self.total,
+            );
         }
     }
 }
@@ -1593,6 +1717,242 @@ fn classify_oauth_service_error(e: codex_app_transfer_gemini_oauth::ServiceError
         reason: e.to_string(),
         needs_login,
     }
+}
+
+// ───────────────────── [MOC-210] antigravity 原生出图履约 ─────────────────────
+
+/// 出图子请求响应体上限(base64 后约 2-3 MB/图,留富余)。履约路径不走 adapters 的
+/// `/v1/images` JSON cap,这里独立兜底防超大响应 OOM。
+const MAX_IMAGE_FULFILL_BYTES: usize = 32 * 1024 * 1024;
+
+/// SSE 事件边界:返回 `buf` 中首个完整事件的结束偏移(含分隔符,可直接 `drain(..end)`)。
+fn next_sse_event_end(buf: &[u8]) -> Option<usize> {
+    let n = buf.len();
+    let mut i = 0;
+    while i < n {
+        if i + 4 <= n && &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i + 4);
+        }
+        if i + 2 <= n && &buf[i..i + 2] == b"\n\n" {
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn detect_image_gen_event(event: &[u8]) -> Option<String> {
+    if !event.windows(b"image_gen".len()).any(|w| w == b"image_gen") {
+        return None;
+    }
+    codex_app_transfer_adapters::extract_image_gen_prompt(event)
+}
+
+fn synth_gemini_text_event(text: &str) -> Bytes {
+    let v = serde_json::json!({
+        "response": {
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": text }] },
+                "finishReason": "STOP"
+            }]
+        }
+    });
+    Bytes::from(format!("data: {v}\n\n"))
+}
+
+fn synth_image_prompt_event(prompt: &str) -> Bytes {
+    let v = serde_json::json!({
+        "response": {
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "_casRevisedPrompt": prompt }] }
+            }]
+        }
+    });
+    Bytes::from(format!("data: {v}\n\n"))
+}
+
+async fn fulfill_image_gen(
+    prompt: &str,
+    state: &ProxyState,
+    method: &http::Method,
+    inbound_headers: &HeaderMap,
+    resolved: &ResolvedProvider,
+    upstream_base: &str,
+) -> Bytes {
+    let telemetry = proxy_telemetry();
+    let plan = match codex_app_transfer_adapters::build_antigravity_image_gen_request(
+        prompt,
+        &resolved.provider,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            telemetry
+                .logs
+                .add("ERROR", format!("[MOC-210] image_gen 请求构造失败: {e}"));
+            return synth_gemini_text_event(
+                "图像生成失败: 出图请求构造错误。请稍后重试；如果持续失败，请反馈诊断信息。",
+            );
+        }
+    };
+    let url = build_upstream_url(upstream_base, &plan.upstream_path);
+    match build_and_send_upstream(
+        state,
+        method,
+        inbound_headers,
+        resolved,
+        &plan.body,
+        &plan.upstream_headers,
+        &url,
+    )
+    .await
+    {
+        Ok((resp, _)) => {
+            let st = resp.status();
+            let mut body_buf: Vec<u8> = Vec::new();
+            let mut byte_stream = resp.bytes_stream();
+            loop {
+                match byte_stream.next().await {
+                    Some(Ok(chunk)) => {
+                        if body_buf.len() + chunk.len() > MAX_IMAGE_FULFILL_BYTES {
+                            telemetry.logs.add(
+                                "ERROR",
+                                format!(
+                                    "[MOC-210] 出图响应超过上限 {MAX_IMAGE_FULFILL_BYTES} bytes,中断"
+                                ),
+                            );
+                            return synth_gemini_text_event("图像生成失败: 出图响应过大。请重试。");
+                        }
+                        body_buf.extend_from_slice(&chunk);
+                    }
+                    Some(Err(e)) => {
+                        telemetry
+                            .logs
+                            .add("ERROR", format!("[MOC-210] 出图响应读取失败: {e}"));
+                        return synth_gemini_text_event("图像生成失败: 读取出图响应中断。请重试。");
+                    }
+                    None => break,
+                }
+            }
+            if st.is_success() {
+                telemetry.logs.add(
+                    "INFO",
+                    format!(
+                        "[MOC-210] 出图子请求返回 {} ({} bytes)",
+                        st.as_u16(),
+                        body_buf.len()
+                    ),
+                );
+                let mut out = synth_image_prompt_event(prompt).to_vec();
+                out.extend_from_slice(&body_buf);
+                Bytes::from(out)
+            } else {
+                let body = Bytes::from(body_buf);
+                telemetry.logs.add(
+                    "ERROR",
+                    format!(
+                        "[MOC-210] 出图子请求 {} 失败: {}",
+                        st.as_u16(),
+                        String::from_utf8_lossy(&body)
+                            .chars()
+                            .take(120)
+                            .collect::<String>()
+                    ),
+                );
+                synth_gemini_text_event(
+                    "图像生成失败: 上游出图接口返回错误。请检查 Antigravity 配额或网络后重试。",
+                )
+            }
+        }
+        Err(e) => {
+            telemetry
+                .logs
+                .add("ERROR", format!("[MOC-210] 出图子请求发送失败: {e}"));
+            synth_gemini_text_event("图像生成失败: 无法连接出图接口。请检查网络后重试。")
+        }
+    }
+}
+
+fn intercept_image_gen_stream(
+    mut upstream: codex_app_transfer_adapters::ByteStream,
+    state: ProxyState,
+    method: http::Method,
+    inbound_headers: HeaderMap,
+    resolved: ResolvedProvider,
+    upstream_base: String,
+) -> codex_app_transfer_adapters::ByteStream {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut captured_prompt: Option<String> = None;
+        let mut suppressed_after: usize = 0;
+        loop {
+            while let Some(end) = next_sse_event_end(&buf) {
+                let event: Vec<u8> = buf.drain(..end).collect();
+                if captured_prompt.is_some() {
+                    suppressed_after += 1;
+                    continue;
+                }
+                if let Some(prompt) = detect_image_gen_event(&event) {
+                    proxy_telemetry().logs.add(
+                        "INFO",
+                        format!(
+                            "[MOC-210] 截获 image_gen 调用,流末将发出图子请求(prompt 前40: {})",
+                            prompt.chars().take(40).collect::<String>()
+                        ),
+                    );
+                    captured_prompt = Some(prompt);
+                    continue;
+                }
+                if tx.send(Ok(Bytes::from(event))).await.is_err() {
+                    return;
+                }
+            }
+            match upstream.next().await {
+                Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                Some(Err(e)) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+                None => break,
+            }
+        }
+        if captured_prompt.is_none() && !buf.is_empty() {
+            if let Some(prompt) = detect_image_gen_event(&buf) {
+                captured_prompt = Some(prompt);
+                buf.clear();
+            }
+        }
+        match captured_prompt {
+            None => {
+                if !buf.is_empty() {
+                    let _ = tx.send(Ok(Bytes::from(buf))).await;
+                }
+            }
+            Some(prompt) => {
+                if suppressed_after > 1 {
+                    proxy_telemetry().logs.add(
+                        "WARN",
+                        format!(
+                            "[MOC-210] image_gen 后抑制了 {suppressed_after} 个尾随事件(预期 ≤1)"
+                        ),
+                    );
+                }
+                let img = fulfill_image_gen(
+                    &prompt,
+                    &state,
+                    &method,
+                    &inbound_headers,
+                    &resolved,
+                    &upstream_base,
+                )
+                .await;
+                let _ = tx.send(Ok(img)).await;
+            }
+        }
+    });
+    Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }))
 }
 
 fn inject_auth(

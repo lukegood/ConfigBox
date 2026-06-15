@@ -47,6 +47,12 @@ DEFAULT_CONTEXT_WINDOW = 258_400
 ONE_M_CONTEXT_WINDOW = 1_000_000
 AUTO_COMPACT_TRIGGER_PERCENT = 80
 DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
+CAS_BASE_INSTRUCTIONS = (
+    "You are a coding agent operating inside the Codex CLI, collaborating with the user in their "
+    "workspace. Read and edit files, run commands, and complete software-engineering tasks "
+    "precisely. Make minimal, correct changes, verify your work before reporting, and follow any "
+    "project- or task-specific instructions provided later in the conversation."
+)
 MODEL_SLOT_TO_CODEX_ID = {
     "gpt_5_5": "gpt-5.5",
     "gpt_5_4": "gpt-5.4",
@@ -75,6 +81,7 @@ DOCUMENTED_CONTEXT_WINDOWS = {
     "mimo-v2-omni": 262_144,
     "glm-5.1": 200_000,
     "glm-4.7": 200_000,
+    "glm-4.6": 200_000,
     "qwen3.6-plus": ONE_M_CONTEXT_WINDOW,
     "qwen3.6-flash": ONE_M_CONTEXT_WINDOW,
     "minimax-m3": ONE_M_CONTEXT_WINDOW,
@@ -148,6 +155,29 @@ CONFIGBOX_GATEWAY_PRESETS: list[dict[str, Any]] = [
             "apiFormat": "openai_chat",
             "authScheme": "bearer",
             "models": {"default": "glm-5.1", "gpt_5_5": "glm-5.1", "gpt_5_4": "glm-4.7"},
+        },
+    },
+    {
+        "id": "zhipu-coding",
+        "name": "智谱 GLM Coding",
+        "description": "智谱 Coding Plan 编程接口，内置 Claude CLI User-Agent。",
+        "provider": {
+            "name": "智谱 GLM Coding",
+            "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+            "apiFormat": "openai_chat",
+            "authScheme": "bearer",
+            "extraHeaders": {"User-Agent": "claude-cli/2.1.175 (external, cli)"},
+            "models": {
+                "default": "glm-4.7",
+                "gpt_5_5": "glm-4.7",
+                "gpt_5_4": "glm-4.7",
+                "gpt_5_4_mini": "glm-4.6",
+                "gpt_5_3_codex": "glm-4.6",
+            },
+            "modelCapabilities": {
+                "glm-4.7": {"context_window": 200_000},
+                "glm-4.6": {"context_window": 200_000},
+            },
         },
     },
     {
@@ -1078,12 +1108,24 @@ def context_window_for_model(provider: dict[str, Any], model: str) -> int:
     explicit = explicit_context_window(provider, clean)
     if explicit is not None:
         return explicit
-    documented = DOCUMENTED_CONTEXT_WINDOWS.get(clean.lower())
+    documented = documented_context_window(clean)
     if documented is not None:
         return documented
     if model_supports_1m(provider, clean):
         return ONE_M_CONTEXT_WINDOW
     return DEFAULT_CONTEXT_WINDOW
+
+
+def documented_context_window(model: str) -> int | None:
+    key = model.strip().lower()
+    if key and "image" not in key and (
+        key.startswith("gemini-1.5")
+        or key.startswith("gemini-2")
+        or key.startswith("gemini-3")
+        or key.startswith("gemini-pro-agent")
+    ):
+        return ONE_M_CONTEXT_WINDOW
+    return DOCUMENTED_CONTEXT_WINDOWS.get(key)
 
 
 def explicit_context_window(provider: dict[str, Any], model: str) -> int | None:
@@ -1197,7 +1239,7 @@ def builtin_catalog_template(slug: str) -> dict[str, Any] | None:
         "additional_speed_tiers": [],
         "availability_nux": None,
         "upgrade": None,
-        "base_instructions": "",
+        "base_instructions": CAS_BASE_INSTRUCTIONS,
         "supports_reasoning_summaries": True,
         "default_reasoning_summary": "none",
         "support_verbosity": True,
@@ -1230,7 +1272,7 @@ def generic_catalog_template() -> dict[str, Any]:
         "additional_speed_tiers": [],
         "availability_nux": None,
         "upgrade": None,
-        "base_instructions": "",
+        "base_instructions": CAS_BASE_INSTRUCTIONS,
         "supports_reasoning_summaries": False,
         "default_reasoning_summary": "auto",
         "support_verbosity": False,

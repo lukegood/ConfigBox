@@ -71,6 +71,7 @@ def test_apply_codex_writes_catalog_and_context_window(tmp_path: Path):
     assert gpt55["display_name"] == "DeepSeek / deepseek-v4-pro"
     assert gpt55["context_window"] == 1_000_000
     assert gpt55["auto_compact_token_limit"] == 800_000
+    assert gpt55["base_instructions"] == gateway.CAS_BASE_INSTRUCTIONS
     snapshot = json.loads((gateway_dir / "codex-snapshot.json").read_text(encoding="utf-8"))
     assert snapshot["runtimeContents"]["config"] == 'model = "gpt-5.5"\n'
 
@@ -181,6 +182,20 @@ def test_minimax_preset_uses_m3_with_one_m_context(tmp_path: Path):
     assert provider["modelCapabilities"]["MiniMax-M3"]["context_window"] == 1_000_000
     assert catalog[0]["display_name"] == "MiniMax / MiniMax-M3"
     assert catalog[0]["context_window"] == 1_000_000
+
+
+def test_zhipu_coding_preset_uses_configbox_schema(tmp_path: Path):
+    gateway, *_ = load_gateway(tmp_path)
+
+    presets = gateway.list_presets()["presets"]
+    zhipu = next(item for item in presets if item["id"] == "zhipu-coding")
+    provider = gateway.normalize_provider(zhipu["provider"])
+
+    assert provider["apiFormat"] == "openai_chat"
+    assert provider["baseUrl"] == "https://open.bigmodel.cn/api/coding/paas/v4"
+    assert provider["extraHeaders"]["User-Agent"] == "claude-cli/2.1.175 (external, cli)"
+    assert provider["models"]["default"] == "glm-4.7"
+    assert provider["models"]["gpt_5_3_codex"] == "glm-4.6"
 
 
 def test_antigravity_models_fall_back_to_preset_seed_when_gateway_is_stopped(tmp_path: Path):

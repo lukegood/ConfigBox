@@ -27,8 +27,22 @@ pub fn documented_context_window(model_id: &str) -> Option<u64> {
         // MiniMax
         "minimax-m2.7" => Some(204_800),
         "minimax-m3" => Some(ONE_M_CONTEXT_WINDOW),
-        // Google Gemini (当前 preset 默认模型)
-        "gemini-3.1-flash-lite" | "gemini-2.5-flash" | "gemini-3-flash" => {
+        // Google Gemini:仅限**确有 ≥1M 上下文**的世代 —— Gemini 1.5 / 2.x / 3.x
+        // (antigravity 全系落在 2.x / 3.x,且上游 `antigravity_models.json` 对它们都
+        // 声明 context_length = 1_048_576)。真机 antigravity 实际映射的是带后缀的 id
+        // (`gemini-3-flash-agent` / `gemini-3.1-pro-low` 等,已被版本前缀覆盖),唯
+        // `gemini-pro-agent`(antigravity 的 Gemini 3.1 Pro 别名)无版本号前缀,单列。
+        // 逐 id 精确枚举追不上上游上新,故按世代前缀统一判 1M。
+        // **不**放宽到裸 `gemini-pro` / `gemini-1.0-*` 等老世代(真实上限 ~32k):给它们
+        // 误报 1M 会让 autocompact 等到 800k 才触发、反而撑爆上游(#453 P2);老 id 维持
+        // None → 落 258_400 兜底(与改动前一致,无回归)。`gemini-*-image` 是图像模型
+        // (`context_length` 为 null,见 MOC-222),不参与文本上下文,排除。
+        m if !m.contains("image")
+            && (m.starts_with("gemini-1.5")
+                || m.starts_with("gemini-2")
+                || m.starts_with("gemini-3")
+                || m.starts_with("gemini-pro-agent")) =>
+        {
             Some(ONE_M_CONTEXT_WINDOW)
         }
         _ => None,
@@ -137,6 +151,64 @@ mod tests {
         assert_eq!(documented_context_window("MiniMax-M2.7"), Some(204_800));
         assert_eq!(documented_context_window("MiniMax-M3"), Some(1_000_000));
         assert_eq!(documented_context_window("unknown-model"), None);
+    }
+
+    #[test]
+    fn documented_context_window_matches_all_gemini_text_models_as_1m() {
+        // 真机 antigravity 实际映射到 Codex 槽位的带后缀 id —— 之前逐 id 精确匹配
+        // 全部漏掉,落 258_400 兜底;前缀匹配后统一 1M。
+        for id in [
+            "gemini-3-flash-agent",
+            "gemini-3.5-flash-low",
+            "gemini-3.5-flash-extra-low",
+            "gemini-3.1-pro-low",
+            "gemini-3.1-pro-high",
+            "gemini-pro-agent", // 注意:以 `gemini-pro` 开头,非 `gemini-3`
+            // 仍保留原精确匹配的三个
+            "gemini-3-flash",
+            "gemini-2.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-pro",
+        ] {
+            assert_eq!(
+                documented_context_window(id),
+                Some(ONE_M_CONTEXT_WINDOW),
+                "{id} 应判 1M",
+            );
+        }
+        // 大小写/空白归一
+        assert_eq!(
+            documented_context_window("  Gemini-3-Flash-Agent  "),
+            Some(ONE_M_CONTEXT_WINDOW),
+        );
+    }
+
+    #[test]
+    fn documented_context_window_excludes_gemini_image_models() {
+        // 图像模型 context_length 为 null(MOC-222 单独接入),不走文本上下文兜底。
+        assert_eq!(documented_context_window("gemini-3.1-flash-image"), None);
+        assert_eq!(
+            documented_context_window("gemini-3-pro-image-preview"),
+            None
+        );
+    }
+
+    #[test]
+    fn documented_context_window_excludes_legacy_gemini_without_1m() {
+        // 老世代 gemini(真实上限 ~32k)不能误报 1M —— 否则手动映射这些 id 时
+        // autocompact 等到 800k 才触发、反而撑爆上游(#453 P2)。维持 None → 兜底。
+        for id in [
+            "gemini-pro",     // 裸名 = Gemini 1.0 Pro
+            "gemini-1.0-pro", // 1.0 世代
+            "gemini-1.0-pro-vision",
+        ] {
+            assert_eq!(documented_context_window(id), None, "{id} 不应判 1M");
+        }
+        // 但 Gemini 1.5+ 世代仍判 1M
+        assert_eq!(
+            documented_context_window("gemini-1.5-pro"),
+            Some(ONE_M_CONTEXT_WINDOW),
+        );
     }
 
     #[test]

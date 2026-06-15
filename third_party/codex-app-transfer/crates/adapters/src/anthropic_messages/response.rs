@@ -35,6 +35,13 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// anthropic_messages adapter 响应侧编排。
+///
+/// compact 双轨:
+/// - `compact_v2=true`(remote compaction v2)→ 共享 [`build_compact_v2_response_plan`] SSE 流;
+///   `extract_compact_summary_text` 已兼容 anthropic `content[].{type:"text",text}` 形态。
+/// - `compact_v2=false`(V1)→ [`build_anthropic_compact_response_plan`](anthropic 自有非流式 JSON 包装)。
+/// - `is_compact=false` → 普通 anthropic messages → responses SSE 转换。
 pub fn build_anthropic_messages_response_plan(
     upstream_status: StatusCode,
     mut upstream_headers: HeaderMap,
@@ -43,8 +50,18 @@ pub fn build_anthropic_messages_response_plan(
     original_responses_request: Option<Value>,
     tool_name_maps: AnthropicToolNameMaps,
     is_compact: bool,
+    compact_v2: bool,
 ) -> Result<ResponsePlan, AdapterError> {
     if is_compact {
+        // [MOC-198] V2 走共享 SSE 包装(其 wire 无关提取器已兼容 anthropic
+        // content[].text 形态);V1 维持 anthropic 自有 JSON 包装。
+        if compact_v2 {
+            return crate::responses::compact::build_compact_v2_response_plan(
+                upstream_status,
+                upstream_headers,
+                upstream_stream,
+            );
+        }
         return build_anthropic_compact_response_plan(
             upstream_status,
             upstream_headers,
@@ -648,8 +665,6 @@ impl AnthropicMessagesToResponsesConverter {
                     "status": "in_progress",
                     "id": item_id,
                     "summary": [],
-                    "content": null,
-                    "encrypted_content": null,
                 },
             }),
         );
@@ -705,6 +720,9 @@ impl AnthropicMessagesToResponsesConverter {
                 },
             }),
         );
+        // [MOC-218 第三关] item 不带 content / encrypted_content(对齐 gemini /
+        // chat 路径):OpenAI 后端对 input reasoning item 硬校验 content,null
+        // 假值同样有被拒风险;item 持久化进历史、切真 GPT 原样上发须出生合规。
         let item = json!({
             "type": "reasoning",
             "id": reasoning.item_id,
@@ -713,8 +731,6 @@ impl AnthropicMessagesToResponsesConverter {
                 "type": "summary_text",
                 "text": reasoning.text_acc,
             }],
-            "content": null,
-            "encrypted_content": null,
         });
         emit_event(
             out,
@@ -831,6 +847,7 @@ impl AnthropicMessagesToResponsesConverter {
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_owned(),
+                    thought_signature: None,
                 },
             );
         }

@@ -900,6 +900,138 @@ fn namespace_with_two_inner_functions_flattens_to_two_function_tools() {
     );
 }
 
+// ── MOC-188: function tool parameters 缺 `required` 数组的 strict-aware 补全 ──
+// 严格 OpenAI 兼容中转网关(AIOHub 等)要求 object schema 显式带 required,缺失会被
+// 400 拒(`null is not of type "array"`)。helper 的单元边界见 core/schema.rs;这里
+// 覆盖 function 分支端到端、按 strict 把关的行为。
+
+#[test]
+fn function_tool_missing_required_gets_empty_array_when_not_strict() {
+    // list_mcp_resources 真实形态:strict:false、有 properties、无 required。
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [
+            {"type":"function","name":"list_mcp_resources",
+             "description":"Lists resources provided by MCP servers.",
+             "parameters":{"type":"object","properties":{
+                "cursor":{"type":"string"},"server":{"type":"string"}},
+                "additionalProperties":false},
+             "strict":false}
+        ]
+    });
+    let out = convert(req);
+    let func = &out["tools"][0]["function"];
+    assert_eq!(func["name"], "list_mcp_resources");
+    assert_eq!(
+        func["parameters"]["required"],
+        json!([]),
+        "strict:false 缺 required 的 function tool 必须补 required:[]"
+    );
+    // properties 原样保留,不被改
+    assert!(func["parameters"]["properties"]["cursor"].is_object());
+}
+
+#[test]
+fn function_tool_strict_true_missing_required_left_untouched() {
+    // strict:true 工具按 OpenAI 规范须 required 列全 properties,补空数组反而违规 →
+    // 原样透传,把校验留给上游。
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [
+            {"type":"function","name":"strict_tool",
+             "description":"",
+             "parameters":{"type":"object","properties":{"x":{"type":"string"}}},
+             "strict":true}
+        ]
+    });
+    let out = convert(req);
+    assert!(
+        out["tools"][0]["function"]["parameters"]
+            .get("required")
+            .is_none(),
+        "strict:true 工具缺 required 不应被补"
+    );
+}
+
+#[test]
+fn function_tool_existing_required_preserved() {
+    // 已带 required:helper 是 no-op。
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [
+            {"type":"function","name":"search",
+             "description":"",
+             "parameters":{"type":"object","properties":{
+                "query":{"type":"string"}},"required":["query"]},
+             "strict":false}
+        ]
+    });
+    let out = convert(req);
+    assert_eq!(
+        out["tools"][0]["function"]["parameters"]["required"],
+        json!(["query"]),
+        "已有 required 必须原样保留"
+    );
+}
+
+#[test]
+fn namespace_inner_function_missing_required_gets_empty_array() {
+    // MOC-188 真实受害类:MCP server 工具包在 namespace 里,展平后内层 function 缺
+    // required 同样要被补(端到端锁定 namespace 递归 → function 分支 → helper 这条链路)。
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [
+            {"type":"namespace","name":"mcp__notion__","tools":[
+                {"type":"function","name":"notion_search",
+                 "description":"Search.",
+                 "parameters":{"type":"object","properties":{},"additionalProperties":false},
+                 "strict":false}
+            ]}
+        ]
+    });
+    let out = convert(req);
+    let tool = &out["tools"][0];
+    assert_eq!(tool["function"]["name"], "notion_search");
+    assert_eq!(
+        tool["function"]["parameters"]["required"],
+        json!([]),
+        "namespace 展平后的内层 function 缺 required 也必须补"
+    );
+}
+
+#[test]
+fn tool_search_missing_required_gets_empty_array() {
+    // tool_search 分支也合成 strict:false 的 chat function;Codex 给的 parameters 若
+    // 缺 required(all-optional)同样要补,否则经严格网关 400(MOC-188 同源,review 反馈)。
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [{
+            "type": "tool_search",
+            "execution": "client",
+            "description": "discovery",
+            "parameters": {"type":"object","properties":{"query":{"type":"string"}}}
+        }]
+    });
+    let out = convert(req);
+    let func = &out["tools"][0]["function"];
+    assert_eq!(func["name"], "tool_search");
+    assert_eq!(
+        func["parameters"]["required"],
+        json!([]),
+        "tool_search 缺 required 也必须补"
+    );
+}
+
 #[test]
 fn namespace_alongside_top_level_function_both_kept() {
     // 实测真实场景:tools 数组同时含顶级 function + namespace 包,展平
@@ -1718,6 +1850,26 @@ fn vision_blacklist_blocks_mimo_v2_pro_and_v2_5_pro() {
 }
 
 #[test]
+fn vision_blacklist_blocks_glm_text_models() {
+    // GLM 文本旗舰(glm-5.1 / glm-4.7 + Coding Plan 套餐档 glm-4.6)官方明确
+    // 为纯文本模型,视觉走独立 GLM-5V;带图请求必须 strip 降级,不能透传给
+    // 纯文本上游(否则 400)。glm-4.6 是 zhipu-coding preset 的 mini/codex 槽。
+    for model in ["glm-5.1", "glm-4.7", "glm-4.6"] {
+        let req = vision_request_for(model);
+        let mut p = provider(
+            "zhipu-coding",
+            "智谱 GLM Coding",
+            "https://open.bigmodel.cn/api/coding/paas/v4",
+        );
+        p.models.insert("default".into(), model.into());
+        assert!(
+            !image_url_kept(&req, &p),
+            "{model} 官方纯文本,带图必须 strip"
+        );
+    }
+}
+
+#[test]
 fn vision_check_uses_body_model_not_provider_default() {
     // 关键:provider.default = "kimi-k2.6"(支持视觉),但 body 实际请求
     // moonshot-v1-8k(纯文本)→ 必须按 body model 判定,strip 图。
@@ -1959,6 +2111,60 @@ fn empty_instructions_is_skipped() {
     let msgs = out["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0]["role"], "user");
+}
+
+#[test]
+fn cas_sentinel_instructions_stripped_for_third_party() {
+    // [MOC-153] transfer 注入给 catalog 的 base_instructions sentinel 不能转发给第三方
+    // chat provider:命中即剥离,第三方请求与历史"顶层 instructions 为空"时字节级一致
+    // (只剩 user 输入,无 system 头)。sentinel 只为"切真 GPT 续话"过后端校验而存在。
+    let out = convert(json!({
+        "model": "x",
+        "instructions": codex_app_transfer_registry::CAS_BASE_INSTRUCTIONS,
+        "input": "hi"
+    }));
+    let msgs = out["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "sentinel 应被剥离,不产生 system 头");
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[0]["content"], "hi");
+}
+
+#[test]
+fn cas_sentinel_instructions_as_object_text_stripped() {
+    // 兼容 instructions 以 { "text": ... } 对象形态出现时也精确剥离。
+    let out = convert(json!({
+        "instructions": { "text": codex_app_transfer_registry::CAS_BASE_INSTRUCTIONS },
+        "input": "hi"
+    }));
+    let msgs = out["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["role"], "user");
+}
+
+#[test]
+fn cas_sentinel_instructions_as_object_content_stripped() {
+    // helper doc 声称同时认 { "text" | "content": ... };锁住 content 键分支(与
+    // build_instructions_message 的取值口径对称)。
+    let out = convert(json!({
+        "instructions": { "content": codex_app_transfer_registry::CAS_BASE_INSTRUCTIONS },
+        "input": "hi"
+    }));
+    let msgs = out["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["role"], "user");
+}
+
+#[test]
+fn non_sentinel_instructions_not_stripped() {
+    // 只精确剥离 sentinel;其它任何非空 instructions(真实用户/Codex 指令)照常作 system 头。
+    let out = convert(json!({
+        "instructions": "You are Codex, a coding agent.",
+        "input": "hi"
+    }));
+    let msgs = out["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["role"], "system");
+    assert_eq!(msgs[0]["content"], "You are Codex, a coding agent.");
 }
 
 #[test]
@@ -2258,9 +2464,11 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
         // (5) 空文件 + lone `+` APPEND + Delete+Add fallback 兜底
         assert!(guidance.contains("empty file") || guidance.contains("totally empty"));
         assert!(guidance.contains("APPEND") || guidance.contains("append"));
+        // P3(MOC-194):Update 失败 → 修锚点重试针对性 Update,**不再** fallback 整写(bypass 已删)
         assert!(
-            guidance.contains("Delete File + Add File"),
-            "guidance 必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{guidance}"
+            guidance.contains("retry the SAME surgical Update")
+                && !guidance.contains("fall back to a Delete File + Add File"),
+            "guidance 应诱导修锚点重试针对性 Update、不诱导整写 fallback:{guidance}"
         );
         // Round 7 实证修复(t0002 漏写 Begin Patch + t0020 Move 空 hunk):
         assert!(
@@ -2283,18 +2491,18 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
                 && guidance.contains("NEVER use shell"),
             "guidance 必须强 normative 禁 shell redirect:{guidance}"
         );
+        // P3:优先针对性编辑,整文件替换仅限 genuine cases(删「整写是 idiom」诱导)
         assert!(
-            guidance.contains("full-file rewrites")
+            guidance.contains("PREFER surgical targeted edits")
+                && guidance.contains("Reserve full-file replacement")
                 && guidance.contains("`*** Delete File:")
                 && guidance.contains("`*** Add File:"),
-            "guidance 必须明示 large rewrite 走 Delete File + Add File:{guidance}"
+            "guidance 应优先针对性、整写仅限 genuine cases:{guidance}"
         );
-        // 必须含 rule 5 `printf '\n' > <path>` carve-out 明示
-        // (防 Devin pre-merge review 报跟 rule 5 冲突,2026-05-22)
+        // P3:新/空文件走 Add File,不再 shell-seed(删 printf carve-out)
         assert!(
-            guidance.contains("narrow exception in rule 5")
-                && guidance.contains("preparation step, not a content bypass"),
-            "guidance 必须 carve-out rule 5 的 `printf '\\n' > <path>` setup 用法:{guidance}"
+            guidance.contains("brand-new or empty file") && guidance.contains("`*** Add File:"),
+            "guidance 应指引新/空文件用 Add File(非 shell):{guidance}"
         );
     });
 }
@@ -2568,8 +2776,9 @@ fn function_call_output_non_string_is_json_serialized() {
 }
 
 #[test]
-fn large_function_call_output_is_bounded_before_chat_history() {
-    let huge_line = "function veryLongMinifiedBundle(){return 'x';}".repeat(2_000);
+fn large_function_call_output_over_limit_is_bounded() {
+    // MOC-190: 当前轮 tool 输出默认全文; 但**超 100k 上限**的单条仍 bound 防撑爆。
+    let huge_line = "function veryLongMinifiedBundle(){return 'x';}".repeat(3_000); // > 100k 字符
     let raw_output = format!(
         "Chunk ID: 44d863\n\
          Wall time: 0.1540 seconds\n\
@@ -2581,18 +2790,20 @@ fn large_function_call_output_is_bounded_before_chat_history() {
     );
 
     let out = convert(json!({
-        "input": [{
-            "type": "function_call_output",
-            "call_id": "tool_large",
-            "output": raw_output
-        }]
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "tool_large",
+                "output": raw_output
+            }
+        ]
     }));
     let tool_msg = out["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|m| m["role"] == "tool")
-        .expect("应当有 tool 消息");
+        .find(|m| m["role"] == "tool" && m["tool_call_id"] == "tool_large")
+        .expect("应当有 tool_large 消息");
 
     assert_eq!(tool_msg["tool_call_id"], "tool_large");
     let content = tool_msg["content"].as_str().unwrap();
@@ -2612,6 +2823,230 @@ fn large_function_call_output_is_bounded_before_chat_history() {
         content.len() < 20_000,
         "模型可见 tool.content 应有界,实际长度 {}",
         content.len()
+    );
+}
+
+#[test]
+fn keep_current_round_all_tool_outputs_full() {
+    // MOC-190(修「一轮多 tool 只留 1 条」缺陷): current input 的多个 function_call_output(模型一轮
+    // 调多工具)**都**保留全文, 不是只留最新 1 条。两条都 <100k → 都全文。
+    let big_old = "OLDDATA ".repeat(1000); // ~8000 字符 > inline 阈值
+    let big_new = "NEWDATA ".repeat(1000); // ~8000 字符
+    let out = convert(json!({
+        "input": [
+            { "type": "function_call_output", "call_id": "c_old", "output": big_old.clone() },
+            { "type": "function_call_output", "call_id": "c_new", "output": big_new.clone() },
+        ]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let content_of = |cid: &str| {
+        messages
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == cid)
+            .unwrap_or_else(|| panic!("缺 {cid} tool 消息"))["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let old_c = content_of("c_old");
+    let new_c = content_of("c_new");
+    let mark = "[Tool output stored outside model context]";
+    // 同一轮的两条都保留全文(不压缩) —— 这正是修复点。
+    assert!(!old_c.contains(mark), "当前轮 c_old 应保留全文");
+    assert!(!new_c.contains(mark), "当前轮 c_new 应保留全文");
+    assert!(
+        old_c.contains("OLDDATA") && new_c.contains("NEWDATA"),
+        "两条都应是原始全文"
+    );
+}
+
+#[test]
+fn recompress_keeps_current_round_compresses_cached() {
+    // MOC-190: cached history 里之前轮存入的全文(c_old)+ 当前轮新产生的(c_new)。current 集合只含
+    // c_new → c_old 压缩、c_new 保留全文; 且对已压缩的幂等。
+    let big = "DATA ".repeat(2000); // ~10k > inline 阈值
+    let mut messages = vec![
+        json!({ "role": "tool", "tool_call_id": "c_old", "content": big.clone() }),
+        json!({ "role": "assistant", "content": "..." }),
+        json!({ "role": "tool", "tool_call_id": "c_new", "content": big.clone() }),
+    ];
+    // 当前轮只有 c_new(messages 末尾的 tool message)→ keep_recent_count=1。
+    recompress_stale_full_tool_outputs(&mut messages, 1);
+    let c_old = messages[0]["content"].as_str().unwrap();
+    let c_new = messages[2]["content"].as_str().unwrap();
+    assert!(
+        c_old.contains("[Tool output stored outside model context]"),
+        "cached 历史全文应被重新压缩"
+    );
+    assert!(
+        !c_new.contains("[Tool output stored outside model context]"),
+        "当前轮 tool 应保留全文"
+    );
+    // 幂等: 再跑一次不变(已压缩的含外置标记会被跳过)。
+    let snapshot = messages.clone();
+    recompress_stale_full_tool_outputs(&mut messages, 1);
+    assert_eq!(messages, snapshot, "幂等: 已压缩的不应再变");
+}
+
+#[test]
+fn keep_current_round_id_less_output_preserved() {
+    // chatgpt-codex P2: 当前轮 function_call_output 没有自己的 call_id, 靠前一个 function_call 配对
+    // (repair_tool_call_ids 后补 tool_call_id)。recompress 在 repair 之前跑、按位置(末尾 N 个)保留,
+    // 不依赖此刻还没有的 ID —— 否则 ID-less 的当前轮 tool 会被误当历史压缩。
+    let big = "DATA ".repeat(2000);
+    let out = convert(json!({
+        "input": [
+            { "type": "function_call", "call_id": "fc1", "name": "exec", "arguments": "{}" },
+            { "type": "function_call_output", "output": big.clone() }
+        ]
+    }));
+    let tool = out["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("应有 tool 消息");
+    assert!(
+        !tool["content"]
+            .as_str()
+            .unwrap()
+            .contains("[Tool output stored outside model context]"),
+        "ID-less 的当前轮 tool 输出应保留全文(按位置识别, 不依赖未补的 ID)"
+    );
+}
+
+#[test]
+fn stateless_full_transcript_only_keeps_latest_tool_group_full() {
+    // chatgpt-codex P2: stateless client(无 previous_response_id)把完整 transcript 塞进 input。只有
+    // 末尾连续的最新一组 tool 该保留全文, 更早的(被非 tool message 隔断)历史 tool 应压缩 —— 否则历史
+    // web_fetch 各留 100k 累积撑爆、绕过 P1。
+    let big_old = "OLDDATA ".repeat(1000); // ~8k > inline
+    let big_new = "NEWDATA ".repeat(1000);
+    let out = convert(json!({
+        "input": [
+            { "type": "function_call", "call_id": "fc_old", "name": "exec", "arguments": "{}" },
+            { "type": "function_call_output", "call_id": "fc_old", "output": big_old.clone() },
+            { "type": "message", "role": "assistant", "content": "中间回复, 隔断两组 tool" },
+            { "type": "function_call", "call_id": "fc_new", "name": "exec", "arguments": "{}" },
+            { "type": "function_call_output", "call_id": "fc_new", "output": big_new.clone() }
+        ]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let content_of = |cid: &str| {
+        messages
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == cid)
+            .unwrap_or_else(|| panic!("缺 {cid} tool 消息"))["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let mark = "[Tool output stored outside model context]";
+    assert!(
+        content_of("fc_old").contains(mark),
+        "stateless 历史一组 tool(被 assistant 隔断)应压缩"
+    );
+    assert!(
+        !content_of("fc_new").contains(mark),
+        "stateless 末尾最新一组 tool 应保留全文"
+    );
+}
+
+#[test]
+fn recompress_keeps_all_current_round_tools_full() {
+    // MOC-190: 模型一轮调多个工具 —— 当前轮 c_a + c_b(messages 末尾 2 个 tool), 它们**都**该保留全文
+    // (不是只留 1 条); cached 的 c_old 压缩。专防「一轮多 tool 只留最新 1 条」缺陷(read_url_local + web_fetch 同轮)。
+    let big = "DATA ".repeat(2000);
+    let mut messages = vec![
+        json!({ "role": "tool", "tool_call_id": "c_old", "content": big.clone() }),
+        json!({ "role": "tool", "tool_call_id": "c_a", "content": big.clone() }),
+        json!({ "role": "tool", "tool_call_id": "c_b", "content": big.clone() }),
+    ];
+    // 当前轮 2 个 tool(末尾 2 个)→ keep_recent_count=2, 都保留全文。
+    recompress_stale_full_tool_outputs(&mut messages, 2);
+    let mark = "[Tool output stored outside model context]";
+    assert!(
+        messages[0]["content"].as_str().unwrap().contains(mark),
+        "cached c_old 应压缩"
+    );
+    assert!(
+        !messages[1]["content"].as_str().unwrap().contains(mark),
+        "当前轮 c_a 应保留全文"
+    );
+    assert!(
+        !messages[2]["content"].as_str().unwrap().contains(mark),
+        "当前轮 c_b 应保留全文"
+    );
+}
+
+#[test]
+fn recompress_no_new_tool_compresses_even_latest_cached() {
+    // MOC-190 P2: 本轮没新 function_call_output(keep_recent_count=0), 即便最后一条 tool 整条来自
+    // cached history, 也要压缩 —— 否则同一历史页每个 follow-up 都全尺寸重发。
+    let big = "DATA ".repeat(2000); // ~10k > inline 阈值
+    let mut messages = vec![
+        json!({ "role": "tool", "tool_call_id": "c_cached", "content": big.clone() }),
+        json!({ "role": "user", "content": "普通问题, 本轮没抓新页" }),
+    ];
+    // 本轮没新 tool → keep_recent_count=0 → 全压缩。
+    recompress_stale_full_tool_outputs(&mut messages, 0);
+    let c = messages[0]["content"].as_str().unwrap();
+    assert!(
+        c.contains("[Tool output stored outside model context]"),
+        "本轮没新 tool 时, cached 的最后一条 tool 也应被压缩"
+    );
+}
+
+#[test]
+fn keep_latest_full_recognizes_single_object_input() {
+    // chatgpt-codex P2: input 可为单个 object(非 array)。keep_latest_full 必须也识别它含
+    // function_call_output, 否则当前轮 tool 输出会被 recompress 误压(extract_input_items 已接受单 object)。
+    let big = "DATA ".repeat(2000); // ~10k > inline
+    let out = convert(json!({
+        "input": { "type": "function_call_output", "call_id": "c_single", "output": big.clone() }
+    }));
+    let content = out["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool" && m["tool_call_id"] == "c_single")
+        .unwrap_or_else(|| panic!("缺 c_single tool 消息"))["content"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !content.contains("[Tool output stored outside model context]"),
+        "单 object input 的当前轮 tool 应保留全文(不被 recompress 误压)"
+    );
+    assert!(content.contains("DATA"), "应是原始全文");
+}
+
+#[test]
+fn keep_recent_full_tool_output_over_limit_falls_back_to_bounded() {
+    // MOC-190: 最新那条 >100k 字符时仍走 bounding 防撑爆(不无界保全文 —— 防巨型 shell grep 924k)。
+    let huge = "X".repeat(120_000); // > TOOL_OUTPUT_KEEP_FULL_MAX_CHARS(100k)
+    let out = convert(json!({
+        "input": [
+            { "type": "function_call_output", "call_id": "c_huge", "output": huge }
+        ]
+    }));
+    let content = out["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool" && m["tool_call_id"] == "c_huge")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // 即便是最新那条, >100k 也被 bound(防撑爆)。
+    assert!(
+        content.contains("[Tool output stored outside model context]"),
+        "最新但 >100k 的 tool 输出应被 bound"
+    );
+    assert!(
+        content.chars().count() < 20_000,
+        "bound 后应有界, 实际 {}",
+        content.chars().count()
     );
 }
 
@@ -2675,6 +3110,7 @@ fn orphan_tool_with_call_id_rebuilds_from_tool_call_cache() {
         super::super::tool_call_cache::ToolCallEntry {
             name: "shell".to_owned(),
             arguments: r#"{"cmd":"ls"}"#.to_owned(),
+            thought_signature: None,
         },
     );
     let mut messages = vec![json!({
@@ -2705,6 +3141,7 @@ fn orphan_tool_with_call_id_inserts_tool_call_into_existing_assistant() {
         super::super::tool_call_cache::ToolCallEntry {
             name: "search".to_owned(),
             arguments: "{}".to_owned(),
+            thought_signature: None,
         },
     );
     let mut messages = vec![
@@ -2861,6 +3298,7 @@ fn flush_uses_tool_name_from_cache_when_available() {
         super::super::tool_call_cache::ToolCallEntry {
             name: "web_search".to_owned(),
             arguments: "{}".to_owned(),
+            thought_signature: None,
         },
     );
     let mut messages = vec![
@@ -2927,6 +3365,7 @@ fn forward_and_reverse_orphans_both_get_repaired() {
         super::super::tool_call_cache::ToolCallEntry {
             name: "shell".to_owned(),
             arguments: "{}".to_owned(),
+            thought_signature: None,
         },
     );
     let mut messages = vec![
@@ -3328,10 +3767,11 @@ fn tools_custom_apply_patch_injects_v4a_format_hint() {
         outer.contains("*** Add File: hello.py"),
         "必须包含一个 Add File example:{outer}"
     );
-    // (5) Delete + Add File fallback 兜底(Update 反复失败时)
+    // (5) P3(MOC-194):Update 失败 → 修锚点重试针对性 Update,**不再**诱导整写 fallback(bypass 已删)
     assert!(
-        outer.contains("Delete File + Add File"),
-        "必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{outer}"
+        outer.contains("retry the SAME surgical Update")
+            && !outer.contains("fall back to a Delete File + Add File"),
+        "Update 失败应诱导修锚点重试针对性 Update、不诱导整写 fallback:{outer}"
     );
     // Round 7 实证修复(t0002 漏写 Begin Patch + t0020 Move 空 hunk):
     assert!(
@@ -3352,13 +3792,17 @@ fn tools_custom_apply_patch_injects_v4a_format_hint() {
         outer.contains("ALWAYS use this tool") && outer.contains("NEVER use shell"),
         "outer description 必须强 normative 禁 shell redirect:{outer}"
     );
+    // P3(MOC-194):优先针对性 Update,整文件替换仅限真正需要时(删掉「整写是正确 idiom」的 bypass 诱导)
     assert!(
-        outer.contains("full-file rewrites") && outer.contains("`*** Delete File:"),
-        "outer description 必须明示 large rewrite 走 Delete + Add File:{outer}"
+        outer.contains("PREFER SURGICAL TARGETED EDITS")
+            && outer.contains("Reserve full-file replacement")
+            && outer.contains("`*** Delete File:"),
+        "outer description 必须优先针对性编辑、整写仅限 genuine cases:{outer}"
     );
+    // 空/新文件走 Add File,不再诱导 shell seed
     assert!(
-        outer.contains("narrow exception is seeding a totally empty file"),
-        "outer description 必须 carve-out 空文件 seed 用法:{outer}"
+        outer.contains("brand-new or empty file") && outer.contains("`*** Add File:"),
+        "outer description 必须指引新/空文件用 Add File(非 shell):{outer}"
     );
 
     // 参数描述紧凑版必须含同样核心规则(round 4 修复后)
@@ -3897,4 +4341,141 @@ fn apply_patch_guidance_zh_covers_all_nine_rules() {
         );
         assert!(guidance.contains("绝不"), "missing **NEVER** equivalent");
     });
+}
+
+// ===== [MOC-193] wire-level 重复指令块去重 =====
+
+#[test]
+fn moc193_dedupe_keeps_first_identical_block_preserving_order() {
+    let env = json!({"role": "system", "content": "<environment_context>BIG ~37KB</environment_context>"});
+    let mut msgs = vec![
+        json!({"role": "system", "content": "instructions"}),
+        env.clone(),
+        json!({"role": "user", "content": "u1"}),
+        json!({"role": "assistant", "content": "a1"}),
+        env.clone(),
+        json!({"role": "user", "content": "u2"}),
+        env.clone(),
+        json!({"role": "user", "content": "u3"}),
+    ];
+    dedupe_repeated_instruction_messages(&mut msgs);
+    // 保**第一份**位置(历史 append-only,上游 prompt cache 前缀稳定),
+    // 后两份删除,其余消息相对顺序不变
+    let contents: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        contents,
+        vec![
+            "instructions",
+            "<environment_context>BIG ~37KB</environment_context>",
+            "u1",
+            "a1",
+            "u2",
+            "u3"
+        ],
+        "应只删第 2/3 份 identical 块,实际 {msgs:#?}"
+    );
+}
+
+#[test]
+fn moc193_dedupe_is_failsafe_on_any_content_difference() {
+    let mut msgs = vec![
+        json!({"role": "system", "content": "env snapshot at 10:00"}),
+        json!({"role": "user", "content": "u1"}),
+        json!({"role": "system", "content": "env snapshot at 10:05"}),
+    ];
+    dedupe_repeated_instruction_messages(&mut msgs);
+    assert_eq!(
+        msgs.len(),
+        3,
+        "内容有任何差异(如时间戳)都不删 — fail-safe 方向"
+    );
+}
+
+#[test]
+fn moc193_dedupe_never_touches_user_assistant_tool_roles() {
+    let mut msgs = vec![
+        json!({"role": "user", "content": "same"}),
+        json!({"role": "user", "content": "same"}),
+        json!({"role": "assistant", "content": "same"}),
+        json!({"role": "assistant", "content": "same"}),
+        json!({"role": "tool", "tool_call_id": "t1", "content": "same"}),
+        json!({"role": "tool", "tool_call_id": "t1", "content": "same"}),
+    ];
+    dedupe_repeated_instruction_messages(&mut msgs);
+    assert_eq!(
+        msgs.len(),
+        6,
+        "user/assistant/tool 即使 identical 也一律不碰"
+    );
+}
+
+#[test]
+fn moc193_dedupe_handles_developer_role_kept_for_openai_official() {
+    // OpenAI official provider 走 keep_developer 分支,块的 role 保持 developer
+    let dev = json!({"role": "developer", "content": "<user_instructions>X</user_instructions>"});
+    let mut msgs = vec![
+        dev.clone(),
+        json!({"role": "user", "content": "u1"}),
+        dev.clone(),
+    ];
+    dedupe_repeated_instruction_messages(&mut msgs);
+    assert_eq!(msgs.len(), 2, "developer role 同样去重");
+    assert_eq!(msgs[0]["role"], "developer");
+    assert_eq!(msgs[1]["role"], "user");
+}
+
+/// 端到端锁定核心不变量:wire body 去重,session plan(回写 cache 的)保全量。
+/// 复现 MOC-193 实测场景:cache 历史已累积 2 份 identical developer 环境块,
+/// 本轮 Codex 又重发 1 份 → merge 后 3 份 → wire 1 份 / session 3 份。
+#[test]
+fn moc193_wire_deduped_but_session_plan_keeps_full_history() {
+    let env_content = "<environment_context>BIG ~37KB block</environment_context>";
+    let cache = ResponseSessionCache::new(1000, std::time::Duration::from_secs(3600));
+    cache.save(
+        "resp_prev",
+        vec![
+            json!({"role": "system", "content": "instructions"}),
+            json!({"role": "developer", "content": env_content}),
+            json!({"role": "user", "content": "u1"}),
+            json!({"role": "assistant", "content": "a1"}),
+            json!({"role": "developer", "content": env_content}),
+            json!({"role": "user", "content": "u2"}),
+            json!({"role": "assistant", "content": "a2"}),
+        ],
+    );
+
+    let conversion = responses_body_to_chat_body_for_provider_with_session(
+        &json!({
+            "previous_response_id": "resp_prev",
+            "input": [
+                {"type": "message", "role": "developer", "content": env_content},
+                {"type": "message", "role": "user", "content": "u3"}
+            ]
+        }),
+        None,
+        Some(&cache),
+    )
+    .unwrap();
+
+    let count_env = |msgs: &[Value]| {
+        msgs.iter()
+            .filter(|m| m["content"].as_str() == Some(env_content))
+            .count()
+    };
+
+    let wire = conversion.body["messages"].as_array().unwrap();
+    assert_eq!(count_env(wire), 1, "wire 上只留第一份,实际 {wire:#?}");
+    // 非 OpenAI official(provider=None)→ developer 已转 system
+    assert_eq!(wire[1]["role"], "system");
+    assert_eq!(wire[1]["content"], env_content, "保留的是第一份的位置");
+
+    let session = &conversion.response_session.messages;
+    assert_eq!(
+        count_env(session),
+        3,
+        "session plan(回写 cache)必须保全量 — wire-level only,不碰 session 重建敏感区"
+    );
 }

@@ -81,6 +81,19 @@ pub fn responses_body_to_gemini_request_with_session(
     // Step 1: Codex.app /responses → 归一化 chat-shape 中间表示
     let mut chat_body = responses_body_to_normalized_chat(body)?;
 
+    // [MOC-210] image_gen 出图工具只对 **antigravity** 暴露 —— 履约链路(proxy 响应流
+    // 截获 functionCall(image_gen) → 出图子请求)只对 antigravity flavor 生效。gemini-cli /
+    // gemini 直连虽共用本归一化路径(`responses_tools_to_chat_tools` 会无差别降级出
+    // image_gen),但它们没有履约端 → 模型若调用会变成 proxy 不拦截的 dangling function_call
+    // 让 Codex 卡等 function_call_output(code-review I-1)。故非 antigravity 在此剥掉。
+    if !crate::is_antigravity_api_format(&provider.api_format) {
+        if let Some(tools) = chat_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
+            tools.retain(|t| {
+                t.pointer("/function/name").and_then(|n| n.as_str()) != Some("image_gen")
+            });
+        }
+    }
+
     // Step 1.5: 复用 responses 输入主管道统一处理 previous_response_id +
     // tool_call_cache 修复接线，避免 gemini_native 维护并漂移一套历史恢复逻辑。
     let responses_conversion =
@@ -209,15 +222,28 @@ pub fn responses_body_to_normalized_chat(body: &Value) -> Result<Value, AdapterE
         })?;
 
     // tools[] 转 chat shape(保留 web_search,unwrap function/custom 等)
-    if let Some(tools) = body_obj.get("tools").and_then(|v| v.as_array()) {
-        let chat_tools = responses_tools_to_chat_tools(tools);
-        if !chat_tools.is_empty() {
-            chat_body.insert("tools".into(), Value::Array(chat_tools));
-        } else {
-            chat_body.remove("tools");
-        }
-    } else {
+    let mut chat_tools = body_obj
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|tools| responses_tools_to_chat_tools(tools))
+        .unwrap_or_default();
+    // [MOC-217] 注入 tool_search 发现的具体工具。它们只在 input[] 的
+    // `tool_search_output.tools`(namespace 包),**不在** body.tools[](真机 trace
+    // 实证:body.tools 恒为固定 18 个,发现的 cat-webfetch/web_fetch 等只在 output)。
+    // 不注入则模型调 tool_search 发现工具后,下一轮 tools 里仍没有它 → 无法调用 → 死循环
+    // 调 tool_search。对齐 chat 路径 `responses/request.rs:205`,复用同一 discovered
+    // helper;discovered 是 namespace 包,经 responses_tools_to_chat_tools 展平(并注入
+    // server prefix 给 Gemini 工具选择提供 context)。
+    for discovered in crate::responses::request::discovered_tools_from_tool_search_output(body) {
+        chat_tools.extend(responses_tools_to_chat_tools(std::slice::from_ref(
+            &discovered,
+        )));
+    }
+    crate::responses::request::dedup_chat_tools_by_name(&mut chat_tools);
+    if chat_tools.is_empty() {
         chat_body.remove("tools");
+    } else {
+        chat_body.insert("tools".into(), Value::Array(chat_tools));
     }
     // tool_choice 直接透传(Responses 跟 chat 形态一致)
     if let Some(tc) = body_obj.get("tool_choice") {
@@ -670,6 +696,76 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                 m.insert("type".into(), Value::String("web_search".into()));
                 out.push(Value::Object(m));
             }
+            "tool_search" => {
+                // [MOC-217] Codex 0.130+ `Feature::ToolSearchAlwaysDeferMcpTools`:所有
+                // MCP server 工具(含内置 cat-webfetch)都 defer 到 `tool_search` builtin,
+                // 模型先 BM25 query 发现具体工具再调用。Gemini 不认 `type=tool_search`,
+                // 降级成普通 function(name=tool_search,description+parameters 透传)→
+                // 下游 chat→Gemini 转 functionDeclaration。模型调用后 `response.rs::
+                // emit_function_call` 把 functionCall 重打包成 Responses `tool_search_call`
+                // wire(同 apply_patch→custom_tool_call)。
+                //
+                // 对齐 chat 路径 `responses/request/tools.rs:344`(MOC-32);gemini 路径此前
+                // 缺此分支 → tool_search 落下面 `other => warn_once_drop_tool` 被静默 drop,
+                // 致 antigravity/gemini 下所有 defer 的 MCP 工具(cat-webfetch 等)不可见。
+                let description = obj
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                // **Gemini-specific(与 chat 路径有意分歧)**:Codex 真机的 `tool_search` 工具
+                // **省略 `parameters`**(trace 实证:只有 type/execution/description)。chat 路径
+                // fallback 空 object schema 仍 work —— chat 模型能从 description 推断要传 BM25
+                // `query`;但 **Gemini 严格按 schema**,空 properties = "无可调用参数" → 模型返
+                // `{}` 而非 query → 响应侧转成空 `tool_search_call` → Codex BM25 拿空 query →
+                // 发现不了任何 defer 的 MCP 工具(cat-webfetch 等)→ 死循环,正是本 PR 要修的
+                // 问题(chatgpt-codex-connector review 实证)。故当 Codex 未给含 `query` 的
+                // schema 时,**合成显式 `{query:string, required:[query]}`**(Codex tool_search
+                // 期望 `SearchToolCallParams{query}`,见 converter.rs::normalize_tool_search_arguments)。
+                let mut parameters = obj.get("parameters").cloned().unwrap_or(Value::Null);
+                let has_query_prop = parameters
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .is_some_and(|p| p.contains_key("query"));
+                if has_query_prop {
+                    // Codex 显式给了含 query 的 schema → 透传 + 补 required(对齐 chat 路径)。
+                    if let Some(po) = parameters.as_object_mut() {
+                        po.entry("type")
+                            .or_insert_with(|| Value::String("object".into()));
+                    }
+                    crate::core::schema::ensure_object_schema_required(&mut parameters);
+                    // [chatgpt-codex-connector review] `ensure_object_schema_required` 只在 required
+                    // 缺失时补**空** `[]`,不把 query 加进 required。若 Codex 的 schema 有 query
+                    // property 但 required 不含它(或 =[]),Gemini 仍认为 query optional → 可合法返
+                    // `{}` → 空 BM25 → 暴露不了 defer 工具。tool_search 没 query 无意义,强制 query 必填。
+                    if let Some(required) = parameters
+                        .get_mut("required")
+                        .and_then(|r| r.as_array_mut())
+                    {
+                        if !required.iter().any(|r| r == "query") {
+                            required.push(Value::String("query".into()));
+                        }
+                    }
+                } else {
+                    parameters = json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query used to discover relevant tools via BM25 over deferred MCP tool metadata."
+                            }
+                        },
+                        "required": ["query"]
+                    });
+                }
+                let mut func = Map::new();
+                func.insert("name".into(), Value::String("tool_search".into()));
+                func.insert("description".into(), Value::String(description.to_owned()));
+                func.insert("parameters".into(), parameters);
+                let mut wrapper = Map::new();
+                wrapper.insert("type".into(), Value::String("function".into()));
+                wrapper.insert("function".into(), Value::Object(func));
+                out.push(Value::Object(wrapper));
+            }
             "custom" => {
                 // Codex.app custom freeform tool(Responses API freeform,无 JSON
                 // schema —— apply_patch 的 patch 是纯文本、靠 lark grammar 约束)。
@@ -782,7 +878,50 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                     out.push(tool);
                 }
             }
-            // computer_use_preview / file_search / image_generation 等 Gemini 不直接对应。
+            // [MOC-210] Codex 内置 image_generation 工具:此前落 `other` 被 drop →
+            // gemini 模型收不到 → 出图请求(imagegen 技能)报"工具不可用"退 CLI fallback。
+            // 改成降级为 functionDeclaration(name=image_gen),模型即可调用。
+            // 履约**不在 adapter 响应侧**(emit_function_call 没有也不该有 image_gen 特判),
+            // 而在 proxy:`forward.rs::intercept_image_gen_stream` 截获 functionCall(image_gen)
+            // → 发出图子请求(gemini-*-image)→ 注入图片 inlineData → 转 image_generation_call。
+            // 本分支对所有 gemini-family 无差别降级出 image_gen,非 antigravity 的会在
+            // `responses_body_to_gemini_request_with_session` 入口被剥掉(只 antigravity 有履约)。
+            "image_generation" => {
+                let description = obj
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(
+                        "Generate an image from a text description. Call this when the user asks \
+                         to create, draw, render, or generate a picture/photo/illustration/logo. \
+                         Provide a detailed visual `prompt`; the generated image is returned and \
+                         shown to the user.",
+                    )
+                    .to_owned();
+                // [MOC-210] 名字 `image_gen`(Codex 内部工具名 + 技能预期),不是
+                // `image_generation`(否则模型认不出 → 判不可用退 CLI)。
+                let mut func = Map::new();
+                func.insert("name".into(), Value::String("image_gen".into()));
+                func.insert("description".into(), Value::String(description));
+                func.insert(
+                    "parameters".into(),
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "description": "Detailed description of the image to generate."
+                            }
+                        },
+                        "required": ["prompt"],
+                    }),
+                );
+                let mut wrapper = Map::new();
+                wrapper.insert("type".into(), Value::String("function".into()));
+                wrapper.insert("function".into(), Value::Object(func));
+                out.push(Value::Object(wrapper));
+            }
+            // computer_use_preview / file_search 等 Gemini 不直接对应。
             // warn_once 让以后用户配新 tool 类型时能在 telemetry 立刻看到 silent drop。
             other => {
                 crate::warn_once_drop_tool(&format!("gemini_native:responses_tool:{other}"));
@@ -1109,8 +1248,9 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
                 for tc in tool_calls {
                     if let Some((id, name, args, sig)) = extract_tool_call(tc) {
                         tool_call_id_to_name.insert(id, name.clone());
-                        // P1-B:thoughtSignature 从 call_id 解出后写回 functionCall part,
-                        // Gemini 3 多轮 thinking 上下文不断
+                        // P1-B → MOC-218:thoughtSignature 由 decode_tool_call_id_signature
+                        // 三级回退(旧内联格式 → 本地 cache 反查 → miss 裸发)写回
+                        // functionCall part,Gemini 3 多轮 thinking 上下文不断
                         assistant_parts.push(Part {
                             function_call: Some(FunctionCall { name, args }),
                             thought_signature: sig,
@@ -1164,18 +1304,20 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
             // function_call + function_call_output 不会触发这条 path;若 Codex.app
             // 启用 session resume 而 SessionStore 还没实现,这条会触发 — 当前
             // 安全 BadRequest 让用户看到 "缺 SessionStore" 而不是 silent Gemini 400。
-            // **encoded vs clean call_id 兼容**(2026-05-11 修):
-            // tool message 的 tool_call_id 是 emit_function_call 的 encoded form
-            // ("call_X~~sig~~Y"),但 tool_call_id_to_name 是 extract_tool_call
-            // 解码后的 clean form 作 key("call_X")。 lookup 两次试:先 encoded
-            // 后 clean 才不漏 — 不然即使 prior function_call 在同 input,
-            // tool_call_id_to_name lookup MISS,误判没 prior → BadRequest
+            // **encoded vs clean call_id 兼容**(2026-05-11;MOC-218 后仍保留):
+            // MOC-218 前 emit_function_call 产生 encoded call_id("call_X~~sig~~Y"),
+            // 修复后 emit 侧恒短,但旧会话历史里仍有 encoded form。
+            // tool_call_id_to_name 以 extract_tool_call 解码后的 clean form("call_X")
+            // 为 key。lookup 两次试:先 encoded 后 clean 才不漏 — 否则旧会话
+            // 的 encoded tool_call_id 查不到 → 误判无 prior → BadRequest
             let name = tool_call_id_to_name
                 .get(tool_call_id)
                 .cloned()
                 .or_else(|| {
-                    let (clean, _sig) = decode_tool_call_id_signature(tool_call_id);
-                    tool_call_id_to_name.get(&clean).cloned()
+                    // 只需 clean id 做 map lookup,不需要签名 → 走纯 strip 版,
+                    // 避免对短 id 白查一次 global cache(锁 + entry clone)
+                    let clean = strip_tool_call_id_signature(tool_call_id);
+                    tool_call_id_to_name.get(clean).cloned()
                 })
                 .or_else(|| msg.get("name").and_then(|v| v.as_str()).map(String::from))
                 .ok_or_else(|| {
@@ -1270,16 +1412,38 @@ fn role_of(msg: &Value) -> &str {
     msg.get("role").and_then(|v| v.as_str()).unwrap_or("")
 }
 
-/// 拆 call_id 里的 thoughtSignature(P1-B 修复 — Gemini 3 多轮 thinking roundtrip)。
-/// emit_function_call 用 `~~sig~~` 分隔符编码,这里反向拆。
-/// 返 (clean_call_id_without_signature, Option<signature>)。
+/// 取 call_id 对应的 thoughtSignature(P1-B — Gemini 3 多轮 thinking roundtrip;
+/// MOC-218 改为本地 cache 反查)。返 (clean_call_id, Option<signature>),三级回退:
+///
+/// 1. **旧内联格式兼容**:修复前的会话历史里 call_id 仍是
+///    `call_X~~sig~~Y`(emit 侧已不再产生),按分隔符拆出签名 —— 旧会话
+///    在 gemini 内续聊签名链不断;
+/// 2. **本地 cache(新格式)**:emit_function_call 把签名存进
+///    [`crate::responses::global_tool_call_cache`],按短 call_id 反查;
+/// 3. **裸发**:cache miss(TTL 1h 过期 / LRU 顶出 / 写盘失败后重启 /
+///    多实例 last-writer-wins 覆盖 / 跨机)→ `None`,functionCall 历史不带
+///    thoughtSignature 上发 —— Gemini 上游实测完全容忍(flash + pro 两档
+///    200,MOC-218 容忍度测试),代价仅推理连续性;丢失事件在 cache 的
+///    过期 / 顶出点有 debug 日志锚点。
 pub fn decode_tool_call_id_signature(id: &str) -> (String, Option<String>) {
     if let Some((before, after)) = id.split_once("~~sig~~") {
         if !after.is_empty() {
             return (before.to_owned(), Some(after.to_owned()));
         }
     }
-    (id.to_owned(), None)
+    let cached = crate::responses::global_tool_call_cache()
+        .get(id)
+        .and_then(|entry| entry.thought_signature);
+    (id.to_owned(), cached)
+}
+
+/// 仅剥旧内联格式的签名段取 clean id,**不查 cache**(给只做 map lookup、
+/// 不需要签名的调用点用,省一次全局锁 + entry clone)。
+fn strip_tool_call_id_signature(id: &str) -> &str {
+    match id.split_once("~~sig~~") {
+        Some((before, _)) => before,
+        None => id,
+    }
 }
 
 fn extract_tool_call(tc: &Value) -> Option<(String, String, Value, Option<String>)> {
@@ -1592,6 +1756,8 @@ fn function_object_to_declaration(func: Option<&Value>) -> Option<FunctionDeclar
 /// - anyOf 单一 null branch → 当作 nullable + 提取另一 branch(LiteLLM
 ///   `convert_anyof_null_to_nullable:745`)
 /// - object 类型未指定 properties 时补 `properties:{}`(Gemini 强制要求)
+/// - oneOf / allOf:**刻意不处理、原样透传**(实测当前 Gemini 已识别这两个组合子,
+///   见下方 `sanitize_schema_inplace` 注释 + MOC-205;**勿**加降级)
 pub fn sanitize_schema(mut schema: Value) -> Value {
     // 先抽 $defs 出来作为 lookup table,然后递归展开所有 $ref
     // (P1-C 修复:不再 silent remove $ref → 引用断)
@@ -1761,6 +1927,17 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                 // 其他形态(多 non-null / pure null)— anyOf 字段**保留**不剥,
                 // Gemini 自己 validate(它文档支持 anyOf union type)
             }
+            // oneOf / allOf:**刻意不处理、原样透传**(MOC-205 / codex 0.139 #24118+#27084)。
+            // ai.google.dev 的 Schema 字段表只列 anyOf、未列 oneOf/allOf,LiteLLM
+            // `_build_vertex_schema` 也按 allowlist 把它们剥掉 —— 但二者均已**过时**。
+            // 2026-06-11 真机实测:Google AI Studio(gemini-2.5-flash / 3-flash-preview /
+            // 3.5-flash)+ Antigravity cloudcode-pa(gemini-3-flash-agent / gemini-pro-agent /
+            // gemini-3.1-pro-low)对带 oneOf/allOf 的 tool schema 全部接受(200 /
+            // response.completed),而真正的未知字段(对照组 `zzz_unknown_field`)被 400
+            // `Cannot find field` —— 证明 oneOf/allOf 是当前 Gemini Schema proto **已识别的
+            // 合法字段**,不是被宽容静默吞。故不剥不转:转 anyOf / 展开 allOf 会丢
+            // union/intersection 语义 = 不必要的破坏性降级。branch 内部子 schema 仍由下面的
+            // 递归 `sanitize_schema_inplace` 覆盖(additionalProperties / $ref / 嵌套 type 等照常处理)。
             // object 类型 properties 默认补空对象
             if obj.get("type").and_then(|v| v.as_str()) == Some("object")
                 && !obj.contains_key("properties")
@@ -2049,6 +2226,40 @@ mod tests {
         }
     }
 
+    // [MOC-210 / code-review I-1] image_gen 出图工具只对 antigravity 暴露;gemini-cli /
+    // gemini 直连(无 proxy 履约端)必须剥掉,否则模型调用 → dangling function_call 卡 Codex。
+    #[test]
+    fn image_gen_tool_exposed_only_for_antigravity() {
+        let body = json!({
+            "model": "gemini-3-flash-agent",
+            "input": [{
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "draw a cat"}]
+            }],
+            "tools": [{"type": "image_generation"}],
+            "stream": true,
+        });
+
+        // 非 antigravity(gemini_native 直连)→ 剥掉
+        let non_ag = dummy_provider();
+        let req = responses_body_to_gemini_request_with_session(&body, &non_ag, None).unwrap();
+        let wire = serde_json::to_string(&req.request).unwrap();
+        assert!(
+            !wire.contains("image_gen"),
+            "非 antigravity 必须剥掉 image_gen(无履约端会 dangling),实际 wire 含: {wire}"
+        );
+
+        // antigravity → 保留
+        let mut ag = dummy_provider();
+        ag.api_format = "antigravity_oauth".into();
+        let req = responses_body_to_gemini_request_with_session(&body, &ag, None).unwrap();
+        let wire = serde_json::to_string(&req.request).unwrap();
+        assert!(
+            wire.contains("image_gen"),
+            "antigravity 必须暴露 image_gen 供模型调用 + proxy 履约,实际 wire: {wire}"
+        );
+    }
+
     // ───── upstream URL ─────
 
     #[test]
@@ -2172,8 +2383,9 @@ mod tests {
     }
 
     #[test]
-    fn large_function_call_output_is_bounded_in_gemini_normalized_chat() {
-        let huge_line = "const minified='x';".repeat(3_000);
+    fn large_function_call_output_over_limit_is_bounded_in_gemini_normalized_chat() {
+        // MOC-190: 当前轮 tool 输出默认全文; 但超 100k 上限的单条仍 bound 防撑爆。
+        let huge_line = "const minified='x';".repeat(6_000); // > 100k 字符
         let raw_output = format!(
             "Chunk ID: 44d863\n\
              Wall time: 0.1540 seconds\n\
@@ -2191,7 +2403,10 @@ mod tests {
         });
         let chat = responses_body_to_normalized_chat(&body).unwrap();
         let msgs = chat["messages"].as_array().unwrap();
-        let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+        let tool = msgs
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "tool_large")
+            .unwrap();
         let content = tool["content"].as_str().unwrap();
 
         assert_eq!(tool["tool_call_id"], "tool_large");
@@ -2205,11 +2420,40 @@ mod tests {
         );
     }
 
+    /// [MOC-218] 新格式:签名存本地 cache,decode 按短 call_id 反查注入。
+    #[test]
+    fn decode_signature_falls_back_to_local_cache_for_short_call_id() {
+        use crate::responses::{global_tool_call_cache, ToolCallEntry};
+        let short_id = "call_moc218_cache_hit_001";
+        global_tool_call_cache().save(
+            short_id,
+            ToolCallEntry {
+                name: "search".into(),
+                arguments: "{}".into(),
+                thought_signature: Some("CACHED_SIG".into()),
+            },
+        );
+        let (clean, sig) = decode_tool_call_id_signature(short_id);
+        assert_eq!(clean, short_id);
+        assert_eq!(sig.as_deref(), Some("CACHED_SIG"));
+    }
+
+    /// [MOC-218] cache miss → 裸发(`None`),不报错——上游对缺失
+    /// thoughtSignature 的历史完全容忍(flash + pro 实测,见 Linear)。
+    #[test]
+    fn decode_signature_cache_miss_returns_none_for_short_call_id() {
+        let (clean, sig) = decode_tool_call_id_signature("call_moc218_nonexistent_999");
+        assert_eq!(clean, "call_moc218_nonexistent_999");
+        assert!(sig.is_none());
+    }
+
     /// **Bug 真因回归测试** (2026-05-11):encoded call_id (含 `~~sig~~<sig>`
     /// thoughtSignature roundtrip) 跨 function_call → function_call_output 链路
     /// 时,即使两者在**同一 input 数组里**(不需 session resume),也要能找到
     /// name。原 bug:`extract_tool_call` 解码后 `tool_call_id_to_name` 用 clean_id
-    /// 作 key,tool message 仍用 encoded id lookup → miss → BadRequest
+    /// 作 key,tool message 仍用 encoded id lookup → miss → BadRequest。
+    /// MOC-218 后 emit 已不产生该格式,本测试守的是**旧会话历史兼容**路径
+    /// (decode 第 1 级:内联格式优先拆)。
     #[test]
     fn function_call_output_with_encoded_call_id_resolves_via_pending_chain() {
         // Codex.app 实测会发**encoded call_id**(含 `~~sig~~`)在 function_call
@@ -2270,6 +2514,7 @@ mod tests {
             ToolCallEntry {
                 name: "weather_lookup".into(),
                 arguments: r#"{"city":"上海"}"#.into(),
+                thought_signature: None,
             },
         );
 
@@ -3118,5 +3363,143 @@ mod tests {
             .find_map(|t| t.function_declarations.clone())
             .unwrap();
         assert_eq!(decls[0].name, "calc");
+    }
+
+    // ───── MOC-217: tool_search builtin (gemini/antigravity) ─────
+
+    fn gemini_function_decl_names(req: &RequestBody) -> Vec<String> {
+        req.tools
+            .iter()
+            .flatten()
+            .filter_map(|t| t.function_declarations.clone())
+            .flatten()
+            .map(|d| d.name)
+            .collect()
+    }
+
+    #[test]
+    fn tool_search_lowered_to_function_declaration() {
+        // [MOC-217] Codex 0.130+ `tool_search` builtin 必须降级成 functionDeclaration
+        // (name=tool_search),否则 gemini/antigravity 下所有 defer 的 MCP 工具(含内置
+        // cat-webfetch)对模型不可见 —— 此前 tool_search 落 `other => warn_once_drop_tool`
+        // 被静默 drop。
+        let body = serde_json::json!({
+            "model":"gemini-3.1-pro-preview",
+            "input":[{"type":"message","role":"user","content":"search the web"}],
+            "tools":[
+                {"type":"function","name":"exec_command","parameters":{"type":"object"}},
+                {"type":"tool_search","execution":"client","description":"# Tool discovery\nBM25 over deferred tools"}
+            ]
+        });
+        let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
+        let names = gemini_function_decl_names(&req);
+        assert!(
+            names.contains(&"tool_search".to_owned()),
+            "tool_search 必须降级成 functionDeclaration;实际:{names:?}"
+        );
+        assert!(
+            names.contains(&"exec_command".to_owned()),
+            "普通 function 也保留;实际:{names:?}"
+        );
+        // [MOC-217] Codex 真机省略 tool_search.parameters(本 case 也是)。Gemini 严格按 schema,
+        // 空 properties 会让模型返 {} 而非 BM25 query → 发现不了工具 → 死循环。必须合成显式
+        // `query` schema(chatgpt-codex-connector review 实证)。
+        let ts_params = req
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.function_declarations.as_ref())
+            .flatten()
+            .find(|d| d.name == "tool_search")
+            .and_then(|d| d.parameters.as_ref())
+            .expect("tool_search functionDeclaration 必须有 parameters");
+        let props = ts_params
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("tool_search parameters 必须有 properties");
+        assert!(
+            props.contains_key("query"),
+            "缺 parameters 时必须合成 query property(否则 Gemini 返空 query → 死循环);实际:{ts_params}"
+        );
+        let required = ts_params
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("tool_search parameters 必须有 required");
+        assert!(
+            required.iter().any(|r| r == "query"),
+            "query 必须 required;实际:{ts_params}"
+        );
+    }
+
+    #[test]
+    fn tool_search_with_query_prop_but_no_required_forces_query_required() {
+        // [MOC-217 / chatgpt-codex-connector review] Codex 给的 schema 有 query property 但
+        // required 缺 query(或 =[])→ Gemini 认为 query optional → 可合法返 {} → 空 BM25 →
+        // 暴露不了 defer 工具。透传分支必须强制 query 进 required。
+        let body = serde_json::json!({
+            "model":"gemini-3.1-pro-preview",
+            "input":[{"type":"message","role":"user","content":"x"}],
+            "tools":[{"type":"tool_search","execution":"client","description":"d",
+                "parameters":{"type":"object","properties":{"query":{"type":"string"}}}}]
+        });
+        let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
+        let ts_params = req
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.function_declarations.as_ref())
+            .flatten()
+            .find(|d| d.name == "tool_search")
+            .and_then(|d| d.parameters.as_ref())
+            .expect("tool_search parameters");
+        let required = ts_params
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("tool_search parameters 必须有 required");
+        assert!(
+            required.iter().any(|r| r == "query"),
+            "透传含 query 的 schema 时必须强制 query 进 required;实际:{ts_params}"
+        );
+    }
+
+    #[test]
+    fn tool_search_output_discovered_tools_injected_as_function_declarations() {
+        // [MOC-217] tool_search 发现的具体工具只在 input[] 的 `tool_search_output.tools`
+        // (namespace 包),**不在** body.tools[]。必须注入 functionDeclarations,否则模型调
+        // tool_search 发现 cat-webfetch 后下一轮 tools 里仍没有 web_fetch → 无法调用 → 死循环。
+        let body = serde_json::json!({
+            "model":"gemini-3.1-pro-preview",
+            "input":[
+                {"type":"message","role":"user","content":"fetch a url"},
+                {"type":"function_call","call_id":"c1","name":"tool_search","arguments":"{\"query\":\"web fetch\"}"},
+                {"type":"tool_search_output","call_id":"c1","status":"completed","execution":"client",
+                 "tools":[{"type":"namespace","name":"mcp__cat_webfetch","tools":[
+                     {"type":"function","name":"web_fetch","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},
+                     {"type":"function","name":"read_url_local","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},
+                     {"type":"function","name":"web_search","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}
+                 ]}]}
+            ],
+            "tools":[{"type":"tool_search","execution":"client","description":"discovery"}]
+        });
+        let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
+        let names = gemini_function_decl_names(&req);
+        assert!(
+            names.contains(&"web_fetch".to_owned()),
+            "tool_search_output 发现的 web_fetch 必须注入 functionDeclarations;实际:{names:?}"
+        );
+        assert!(
+            names.contains(&"web_search".to_owned()),
+            "发现的 web_search 必须注入;实际:{names:?}"
+        );
+        assert!(
+            names.contains(&"read_url_local".to_owned()),
+            "发现的 read_url_local 必须注入;实际:{names:?}"
+        );
+        assert!(
+            names.contains(&"tool_search".to_owned()),
+            "tool_search 本身仍保留(模型可继续 query 更多);实际:{names:?}"
+        );
     }
 }
