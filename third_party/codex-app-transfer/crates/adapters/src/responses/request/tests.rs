@@ -1,9 +1,8 @@
-use super::tools::*;
 use super::*;
 use crate::types::AdapterError;
 use codex_app_transfer_registry::Provider;
 use indexmap::IndexMap;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 fn convert(body: Value) -> Value {
     responses_body_to_chat_body(&body).unwrap()
@@ -237,6 +236,8 @@ fn minimax_tool_choice_required_is_downgraded_to_auto() {
         "model": "MiniMax-M2.7",
         "stream": true,
         "input": "hi",
+        // tool_choice 仅在有 tools 时转发(MOC-208),带一个 function 工具以走 M2.x required→auto 降级
+        "tools": [{"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}}],
         "tool_choice": {"type": "required"}
     });
     let p = minimax_provider();
@@ -422,6 +423,40 @@ fn minimax_m3_keeps_system_and_standard_fields() {
         body.get("tool_choice").and_then(|v| v.as_str()),
         Some("required"),
         "M3 应保留 tool_choice=required(实测支持,不降级到 auto)"
+    );
+}
+
+#[test]
+fn minimax_m3_keeps_thinking_disable_wire_but_m2_drops() {
+    // [MOC-241] reasoning 档位选 `none` 时,apply_reasoning_effort 给 M3 写 top-level
+    // `thinking:{type:disabled}`(M3 ∈ BINARY_THINKING_TYPE),且该调用在 sanitize 之前
+    // (request.rs:243 < 313)。M3 的 OpenAI-compat 端点原生接受该字段,sanitize 必须放行,
+    // 否则上游收不到关思考、picker 显 none 却仍思考。M2.x(SINGLE_MAX 单档 max,无 none 档)
+    // 即便误带也应剥掉。
+    let mk = |model: &str| {
+        json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "disabled"}
+        })
+        .as_object()
+        .expect("json object")
+        .clone()
+    };
+    let mut m3 = mk("MiniMax-M3");
+    sanitize_minimax_chat_body(&mut m3);
+    assert_eq!(
+        m3.get("thinking")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("disabled"),
+        "M3 必须保留 thinking:{{type:disabled}}(none 档关思考 wire,上游接受)"
+    );
+    let mut m2 = mk("MiniMax-M2.7");
+    sanitize_minimax_chat_body(&mut m2);
+    assert!(
+        !m2.contains_key("thinking"),
+        "M2.x 应剥 thinking(端点字段集更窄,且 M2.x 无 none 档不应带此 wire)"
     );
 }
 
@@ -1157,12 +1192,16 @@ fn convert_tool_search_to_chat_function() {
     assert_eq!(tools.len(), 1, "tool_search 应转成 1 个 chat function tool");
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["function"]["name"], "tool_search");
+    let description = tools[0]["function"]["description"].as_str().unwrap();
     assert!(
-        tools[0]["function"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("BM25"),
+        description.contains("BM25"),
         "description 应完整透传 BM25 关键词"
+    );
+    // [MOC-296] 上游原文之后必须追加「按名补搜」规则(被点名未注入的连接器工具,
+    // 模型须先 exact-name 补搜再判不可用;Linear get_issue 案)。
+    assert!(
+        description.ends_with(tools::TOOL_SEARCH_BY_NAME_HINT),
+        "description 末尾应追加按名补搜规则"
     );
     let params = &tools[0]["function"]["parameters"];
     assert_eq!(params["type"], "object");
@@ -1182,7 +1221,11 @@ fn convert_tool_search_with_empty_description_does_not_panic() {
     let tools = out["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["function"]["name"], "tool_search");
-    assert_eq!(tools[0]["function"]["description"], "");
+    // [MOC-296] 空 description 也追加按名补搜规则(此时 description = 规则本身)。
+    assert_eq!(
+        tools[0]["function"]["description"],
+        tools::TOOL_SEARCH_BY_NAME_HINT
+    );
     assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
 }
 
@@ -1236,131 +1279,98 @@ fn unknown_tool_type_dropped_via_warn_once_path_does_not_panic() {
     assert_eq!(tools[0]["function"]["name"], "keep_me");
 }
 
-// ── web_search 工具 per-provider 适配 — MiMo 阶段 ─────────────────
-// Codex.app 入站默认每轮发 `{type:"web_search", external_web_access:true,
-// search_content_types:["text","image"]}`(实测 dump),代理把这个统一
-// 形态转成各上游 chat API 真实支持的形态。本批仅 MiMo 实施(1:1 复刻
-// mimo2codex `reqToChat.ts:196-209`),Kimi/DeepSeek/MiniMax 等留 follow-up
-// (逐家文档实证后跟进,见 `docs/web-search-implementation-tracker.md`)。
+// ── web_search 一律 drop(MOC-208)─────────────────────────────────
+// 本项目自研 web_fetch/web_search(MOC-190,Chrome-based)已统一覆盖联网,不再
+// 借任何第三方 provider 的原生 web search。`convert_web_search_tool` 无条件 drop;
+// 历史的 xiaomi/kimi 原生注入 + A/B 层 web_search_enabled 开关 + Kimi
+// thinking-disabled 后处理均已移除。
 
-/// MiMo provider 用于 web_search 测试 — 显式 enable Web Search Plugin。
-/// A 层默认 false,测试需要显式开才会触发转换。
-fn mimo_provider_with_web_search() -> Provider {
-    let mut p = mimo_provider();
-    p.models.insert("default".into(), "mimo-v2.5".into());
-    p.request_options
-        .insert("web_search_enabled".into(), json!(true));
+/// chat 形 provider 简易构造(显式 openai_chat + default model)。
+fn ws_chat_provider(id: &str, name: &str, base: &str, model: &str) -> Provider {
+    let mut p = provider(id, name, base);
+    p.models.insert("default".into(), model.into());
+    p.api_format = "openai_chat".into();
     p
 }
 
 #[test]
-fn mimo_web_search_converted_to_native_schema_with_user_location() {
-    let p = mimo_provider_with_web_search();
-    let req = json!({
-        "model": "mimo-v2.5",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"搜索 X 最新进展"}],
-        "tools": [
-            {
-                "type": "web_search",
-                "external_web_access": true,
-                "search_content_types": ["text", "image"],
-                "user_location": {
-                    "type": "approximate",
-                    "country": "CN",
-                    "city": "Shanghai"
-                },
-                "max_keyword": 5,
-                "force_search": true,
-                "limit": 10
-            }
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 1);
-    let tool = &tools[0];
-    assert_eq!(
-        tool["type"], "web_search",
-        "MiMo chat 端原生 type:web_search"
-    );
-    assert_eq!(tool["user_location"]["country"], "CN");
-    assert_eq!(tool["user_location"]["city"], "Shanghai");
-    assert_eq!(tool["max_keyword"], 5);
-    assert_eq!(tool["force_search"], true);
-    assert_eq!(tool["limit"], 10);
-    // OpenAI 的 external_web_access / search_content_types 在 MiMo 无等价,silent drop
-    assert!(
-        tool.get("external_web_access").is_none(),
-        "external_web_access 在 MiMo 无等价,必须 silent drop"
-    );
-    assert!(
-        tool.get("search_content_types").is_none(),
-        "search_content_types 在 MiMo 无等价,必须 silent drop"
-    );
+fn web_search_dropped_for_all_providers_even_with_flag_enabled() {
+    // 历史上 xiaomi/kimi 在 web_search_enabled=true 时注入原生 search;现在无条件
+    // drop,该 flag 不再有任何效果。逐 provider 验证:web_search 被丢、同 turn 的
+    // 普通 function 工具保留、不再注入 Kimi thinking disabled。
+    for (id, name, base, model) in [
+        (
+            "xiaomimimo",
+            "MiMo",
+            "https://api.xiaomimimo.com/v1",
+            "mimo-v2.5",
+        ),
+        (
+            "kimi-for-coding",
+            "Kimi",
+            "https://api.kimi.com/coding/v1",
+            "kimi-for-coding",
+        ),
+        (
+            "moonshot",
+            "Moonshot",
+            "https://api.moonshot.cn/v1",
+            "kimi-k2.6",
+        ),
+        (
+            "deepseek",
+            "DeepSeek",
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-pro",
+        ),
+    ] {
+        let mut p = ws_chat_provider(id, name, base, model);
+        // 即便用户显式开 web_search_enabled=true 也不再生效
+        p.request_options
+            .insert("web_search_enabled".into(), json!(true));
+        let req = json!({
+            "model": model,
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"web_search","external_web_access":true,"search_content_types":["text"]},
+                {"type":"function","name":"keep_me","parameters":{"type":"object","properties":{}}}
+            ]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "{id}: web_search 必须被 drop,只剩 keep_me");
+        assert_eq!(tools[0]["function"]["name"], "keep_me");
+        assert!(
+            out.get("thinking").is_none(),
+            "{id}: 不该再注入 Kimi thinking disabled"
+        );
+    }
 }
 
 #[test]
-fn mimo_web_search_with_minimal_fields_outputs_minimal_tool() {
-    // 用户没传 user_location / max_keyword 等字段时,只输出 type:"web_search"
-    let p = mimo_provider_with_web_search();
+fn web_search_preview_alias_also_dropped() {
+    let p = ws_chat_provider(
+        "kimi-for-coding",
+        "Kimi",
+        "https://api.kimi.com/coding/v1",
+        "kimi-for-coding",
+    );
     let req = json!({
-        "model": "mimo-v2.5",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search", "external_web_access": true, "search_content_types": ["text"]}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1);
-    let keys: Vec<&String> = tools[0].as_object().unwrap().keys().collect();
-    assert_eq!(keys, vec![&"type".to_string()], "无可选字段时只剩 type");
-    assert_eq!(tools[0]["type"], "web_search");
-}
-
-#[test]
-fn mimo_web_search_preview_alias_handled_same_as_web_search() {
-    // Codex.app 历史上有过 web_search_preview / web_search 两种 type,
-    // mimo2codex `reqToChat.ts:196` 同样处理,我们也照抄。
-    let p = mimo_provider_with_web_search();
-    let req = json!({
-        "model": "mimo-v2.5",
+        "model": "kimi-for-coding",
         "stream": true,
         "input": [{"type":"message","role":"user","content":"hi"}],
         "tools": [{"type":"web_search_preview"}]
     });
     let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    assert_eq!(out["tools"][0]["type"], "web_search");
+    assert!(
+        out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty(),
+        "web_search_preview 同样 drop,无其它工具时 tools 不写入"
+    );
 }
 
 #[test]
-fn non_mimo_provider_web_search_dropped_via_warn_once() {
-    // Kimi / DeepSeek / MiniMax 等 provider 暂未文档实证,走 drop + warn_once。
-    // 用户实际会看到模型走 P5 修通的 namespace MCP 工具(如 Node Repl)绕路
-    // 联网搜索;后续逐家文档实证后再加映射。
-    let mut kimi = provider("kimi", "Kimi", "https://api.moonshot.cn/v1");
-    kimi.models.insert("default".into(), "kimi-k2.6".into());
-    let req = json!({
-        "model": "kimi-k2.6",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search", "external_web_access": true, "search_content_types": ["text"]},
-            {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&kimi)).unwrap();
-    let tools = out["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1, "Kimi 暂未实施,web_search drop 只剩 keep_me");
-    assert_eq!(tools[0]["function"]["name"], "keep_me");
-}
-
-#[test]
-fn web_search_with_no_provider_context_dropped() {
-    // 极端情况:没有 provider 上下文(应该不发生,resolver 必填),
-    // 安全 drop 不 panic
+fn web_search_dropped_with_no_provider_context() {
     let req = json!({
         "model": "any",
         "stream": true,
@@ -1368,326 +1378,64 @@ fn web_search_with_no_provider_context_dropped() {
         "tools": [{"type":"web_search"}]
     });
     let out = convert(req);
-    // 没 provider 时整个 web_search drop,tools 字段不存在(empty 数组不写入)
     assert!(out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty());
 }
 
-// ── A 层(provider 配置开关)──
-// `request_options.web_search_enabled` 默认 false,用户必须显式标 true。
-// 默认关闭原因:很多 provider(如 MiMo Token Plan)没开 plugin 时发
-// web_search 工具会触发上游 400。
-
 #[test]
-fn mimo_provider_without_web_search_enabled_drops_web_search_by_default() {
-    // 默认状态:mimo_provider() 没设 web_search_enabled → 视为 false → drop
-    let mut p = mimo_provider();
-    p.models.insert("default".into(), "mimo-v2.5".into());
-    // 故意不设 web_search_enabled
-    let req = json!({
-        "model": "mimo-v2.5",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search", "external_web_access": true},
-            {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().unwrap();
-    assert_eq!(
-        tools.len(),
-        1,
-        "默认 web_search_enabled=false → web_search 被 A 层 drop"
-    );
-    assert_eq!(tools[0]["function"]["name"], "keep_me");
-}
-
-#[test]
-fn mimo_provider_with_explicit_web_search_enabled_false_drops_web_search() {
-    // 显式标 false 跟没设效果一致 — 都触发 A 层 drop
-    let mut p = mimo_provider();
-    p.models.insert("default".into(), "mimo-v2.5".into());
-    p.request_options
-        .insert("web_search_enabled".into(), json!(false));
-    let req = json!({
-        "model": "mimo-v2.5",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [{"type":"web_search"}]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    assert!(out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty());
-}
-
-// ── B 层(运行时自动 disable cache)──
-// `crate::disable_web_search_for(provider_id)` 后,即使配置 web_search_enabled=true,
-// 同 provider id 后续转换也立即 drop。模拟 forward.rs 4xx fallback 后的行为。
-
-#[test]
-fn b_layer_runtime_disable_blocks_subsequent_web_search_conversion() {
-    let mut p = mimo_provider_with_web_search();
-    p.id = "mimo-runtime-disable-test".into();
-    // 模拟 forward.rs 4xx fallback 调用
-    crate::disable_web_search_for(&p.id);
-
-    let req = json!({
-        "model": "mimo-v2.5",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search"},
-            {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().unwrap();
-    assert_eq!(
-        tools.len(),
-        1,
-        "运行时 disable cache 命中 → web_search 被 B 层 drop,只剩 keep_me"
-    );
-    assert_eq!(tools[0]["function"]["name"], "keep_me");
-    assert!(crate::is_web_search_disabled_for(&p.id));
-}
-
-#[test]
-fn b_layer_runtime_disable_only_affects_targeted_provider_id() {
-    // disable provider A 不影响 provider B(各自 cache 隔离)
-    let mut a = mimo_provider_with_web_search();
-    a.id = "mimo-disable-a".into();
-    let mut b = mimo_provider_with_web_search();
-    b.id = "mimo-untouched-b".into();
-    crate::disable_web_search_for(&a.id);
-
-    let req = json!({
-        "model": "mimo-v2.5",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [{"type":"web_search"}]
-    });
-    let out_b = responses_body_to_chat_body_for_provider(&req, Some(&b)).unwrap();
-    // b 的 web_search_enabled=true 且没被 disable,正常转换
-    assert_eq!(out_b["tools"][0]["type"], "web_search");
-}
-
-// ── Kimi (Moonshot) web_search builtin_function 映射 ──
-// 来源:WebFetch `platform.kimi.ai/docs/guide/use-web-search` 真原文实证。
-// 1:1 复刻官方文档:tools 形态固定 `{type:"builtin_function", function:{name:"$web_search"}}`,
-// 强制配套 `thinking:{type:"disabled"}` 顶级字段(Kimi 文档明确强制)。
-
-fn kimi_provider_with_web_search() -> Provider {
-    let mut p = provider(
+fn forced_tool_choice_dropped_when_web_search_was_only_tool() {
+    // [MOC-208] 某轮只带 web_search + tool_choice=required:web_search 被 drop 后
+    // tools 整体变空,此时绝不能仍透传 tool_choice=required(上游会因「强制用工具但
+    // 无工具」返 400)。tools 缺席时 tool_choice 也必须不发。
+    let p = ws_chat_provider(
         "kimi-for-coding",
-        "Kimi For Coding",
+        "Kimi",
         "https://api.kimi.com/coding/v1",
-    );
-    p.models.insert("default".into(), "kimi-for-coding".into());
-    p.api_format = "openai_chat".into();
-    p.request_options
-        .insert("web_search_enabled".into(), json!(true));
-    p
-}
-
-fn moonshot_provider_with_web_search() -> Provider {
-    let mut p = provider("moonshot", "Moonshot", "https://api.moonshot.cn/v1");
-    p.models.insert("default".into(), "kimi-k2.6".into());
-    p.api_format = "openai_chat".into();
-    p.request_options
-        .insert("web_search_enabled".into(), json!(true));
-    p
-}
-
-#[test]
-fn kimi_web_search_outputs_builtin_function_with_dollar_prefix_name() {
-    let p = kimi_provider_with_web_search();
-    let req = json!({
-        "model": "kimi-for-coding",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"搜索 X"}],
-        "tools": [
-            {
-                "type": "web_search",
-                "external_web_access": true,
-                "search_content_types": ["text", "image"],
-                "user_location": {"country": "CN"},
-                "max_keyword": 5
-            }
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 1);
-    // Kimi 形态:固定 builtin_function + $web_search,**不透传任何子字段**
-    assert_eq!(tools[0]["type"], "builtin_function");
-    assert_eq!(tools[0]["function"]["name"], "$web_search");
-    // OpenAI 字段全部 silent drop(Kimi 文档明确只要 type + function.name)
-    assert!(tools[0].get("user_location").is_none());
-    assert!(tools[0].get("max_keyword").is_none());
-    assert!(tools[0].get("external_web_access").is_none());
-    assert!(tools[0].get("search_content_types").is_none());
-}
-
-#[test]
-fn kimi_web_search_force_injects_thinking_disabled_top_level_field() {
-    let p = kimi_provider_with_web_search();
-    let req = json!({
-        "model": "kimi-for-coding",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [{"type":"web_search"}]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    // Kimi 文档强制:`thinking:{type:"disabled"}` 顶级字段必填
-    assert_eq!(
-        out["thinking"],
-        json!({"type": "disabled"}),
-        "Kimi $web_search 必须配套 thinking disabled(官方文档强制)"
-    );
-}
-
-#[test]
-fn moonshot_provider_uses_same_kimi_web_search_form() {
-    // moonshot.cn / kimi.ai 同公司,provider_looks_like("moonshot") 同样命中
-    let p = moonshot_provider_with_web_search();
-    let req = json!({
-        "model": "kimi-k2.6",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [{"type":"web_search"}]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    assert_eq!(out["tools"][0]["type"], "builtin_function");
-    assert_eq!(out["tools"][0]["function"]["name"], "$web_search");
-    assert_eq!(out["thinking"], json!({"type": "disabled"}));
-}
-
-#[test]
-fn kimi_without_web_search_enabled_does_not_inject_thinking() {
-    // 未启用 web_search 时不该强制 disable thinking(用户原 thinking 配置不变)
-    let mut p = provider(
         "kimi-for-coding",
-        "Kimi For Coding",
-        "https://api.kimi.com/coding/v1",
     );
-    p.models.insert("default".into(), "kimi-for-coding".into());
-    // 故意不设 web_search_enabled
     let req = json!({
         "model": "kimi-for-coding",
         "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search"},
-            {"type":"function", "name":"shell", "parameters":{"type":"object","properties":{}}}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    // web_search 被 A 层 drop(默认关),不该注入 thinking disabled
-    assert!(
-        out.get("thinking").is_none(),
-        "未启用 web_search 时不该注入 thinking disabled,实际: {:?}",
-        out.get("thinking")
-    );
-    // shell function 仍然保留
-    assert_eq!(out["tools"][0]["function"]["name"], "shell");
-}
-
-#[test]
-fn kimi_web_search_b_layer_runtime_disable_skips_thinking_injection() {
-    // B 层 cache 命中(运行时已 disable)→ web_search drop → 不该注入 thinking
-    let mut p = kimi_provider_with_web_search();
-    p.id = "kimi-runtime-disabled".into();
-    crate::disable_web_search_for(&p.id);
-    let req = json!({
-        "model": "kimi-for-coding",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [{"type":"web_search"}]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    assert!(
-        out.get("thinking").is_none(),
-        "B 层 cache disable 后 web_search drop,thinking 不该注入"
-    );
-}
-
-// ── DeepSeek web_search drop(文档实证不支持)──
-// 来源:WebFetch `api-docs.deepseek.com/api/create-chat-completion` 真原文
-// (2026-05-09):"Currently, only `function` is supported." DeepSeek chat
-// completions tools 数组只接受 type:"function",无任何 server-side web 搜索。
-
-#[test]
-fn deepseek_web_search_dropped_with_explicit_warn_key() {
-    // DeepSeek 即使 web_search_enabled=true 也 drop(API 不支持)
-    let mut p = deepseek_provider();
-    p.request_options
-        .insert("web_search_enabled".into(), json!(true));
-    let req = json!({
-        "model": "deepseek-v4-pro",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search"},
-            {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().unwrap();
-    assert_eq!(
-        tools.len(),
-        1,
-        "DeepSeek API 不支持 web_search,只剩 keep_me function"
-    );
-    assert_eq!(tools[0]["function"]["name"], "keep_me");
-    // DeepSeek 不应触发 Kimi thinking 注入(它跟 thinking-disabled 路径无关)
-    assert!(out.get("thinking").is_none());
-}
-
-// ── MiniMax web_search drop(文档实证不支持)──
-// 来源:WebFetch `platform.minimaxi.com/docs/api-reference/` + liteLLM
-// MiniMax provider 文档(2026-05-09):MiniMax chat completions tools 只接受
-// type:"function",无内置 web_search;web_search 仅作 Token Plan MCP 工具存在。
-
-#[test]
-fn minimax_web_search_dropped_with_explicit_warn_key() {
-    let mut p = minimax_provider();
-    p.request_options
-        .insert("web_search_enabled".into(), json!(true));
-    let req = json!({
-        "model": "MiniMax-M2.7",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search"},
-            {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().unwrap();
-    assert_eq!(
-        tools.len(),
-        1,
-        "MiniMax chat API 不支持 web_search,只剩 keep_me function"
-    );
-    assert_eq!(tools[0]["function"]["name"], "keep_me");
-    // MiniMax 不应触发 Kimi thinking 注入(它跟 thinking-disabled 路径无关)
-    assert!(out.get("thinking").is_none());
-}
-
-#[test]
-fn deepseek_web_search_drop_independent_of_web_search_enabled_flag() {
-    // 即使用户显式标 web_search_enabled=false / 不标,DeepSeek 都 drop
-    // (其实只是 DeepSeek 不支持的硬实事,跟 A 层无关)
-    let p = deepseek_provider(); // 默认未标 web_search_enabled
-    let req = json!({
-        "model": "deepseek-v4-pro",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [{"type":"web_search"}]
+        "input": [{"type":"message","role":"user","content":"搜一下"}],
+        "tools": [{"type":"web_search"}],
+        "tool_choice": "required"
     });
     let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
     assert!(
         out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty(),
-        "DeepSeek 默认未启用 web_search 时,A 层先 drop(走 disabled-by-config 路径)"
+        "web_search 应被 drop,tools 为空"
+    );
+    assert!(
+        out.get("tool_choice").is_none(),
+        "tools 为空时不应转发 tool_choice(避免畸形 required+无工具);实际:{:?}",
+        out.get("tool_choice")
+    );
+}
+
+#[test]
+fn tool_choice_still_forwarded_when_real_tools_remain() {
+    // 回归保护:web_search 被 drop 但仍有普通 function 工具时,tool_choice 正常转发。
+    let p = ws_chat_provider(
+        "kimi-for-coding",
+        "Kimi",
+        "https://api.kimi.com/coding/v1",
+        "kimi-for-coding",
+    );
+    let req = json!({
+        "model": "kimi-for-coding",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [
+            {"type":"web_search"},
+            {"type":"function","name":"shell","parameters":{"type":"object","properties":{}}}
+        ],
+        "tool_choice": "auto"
+    });
+    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+    assert_eq!(out["tools"].as_array().unwrap().len(), 1, "只剩 shell");
+    assert_eq!(
+        out["tool_choice"],
+        json!("auto"),
+        "有 tools 时 tool_choice 正常转发"
     );
 }
 
@@ -2296,6 +2044,44 @@ fn context_compaction_alias_renders_same_as_compaction() {
 }
 
 #[test]
+fn compaction_summary_prefix_localized_to_chinese_for_zh_user() {
+    // [#262 followup] 续轮 compaction item 渲染成上游 user message 时,中文用户下
+    // 把英文 COMPACT_SUMMARY_PREFIX 换成中文等价(保留正文),消除 compact 后语言
+    // 漂移;英文用户保留英文前缀(Codex 原生)。
+    use crate::responses::compact::{COMPACT_SUMMARY_PREFIX, COMPACT_SUMMARY_PREFIX_ZH};
+    let body = json!({
+        "input": [{
+            "type": "compaction",
+            "encrypted_content": format!("{COMPACT_SUMMARY_PREFIX}\n### 进度\n用户要做X,已完成Y。")
+        }]
+    });
+    with_user_language("zh-CN", || {
+        let out = convert(body.clone());
+        let content = out["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            content.starts_with(COMPACT_SUMMARY_PREFIX_ZH),
+            "zh:英文前缀应换成中文前缀"
+        );
+        assert!(
+            content.contains("### 进度\n用户要做X,已完成Y。"),
+            "摘要正文必须保留"
+        );
+        assert!(
+            !content.contains("Another language model started"),
+            "zh:不应残留英文前缀"
+        );
+    });
+    with_user_language("en", || {
+        let out = convert(body.clone());
+        let content = out["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            content.starts_with(COMPACT_SUMMARY_PREFIX),
+            "en:保留英文前缀(Codex 原生行为)"
+        );
+    });
+}
+
+#[test]
 fn compaction_item_with_empty_encrypted_content_is_dropped() {
     // 防御:空 summary 不应往上游塞空 user message(会触发某些 provider
     // "user message must not be empty" 400)
@@ -2449,10 +2235,16 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
             !guidance.contains("EMPTY LINE as the `@@` anchor"),
             "旧版 EMPTY LINE anchor 误导已删除:{guidance}"
         );
-        // (2) Add File 全 `+` 前缀(对抗 `def main():` 当 invalid hunk header)
+        // (2) Add File 内容行全 `+` 前缀(对抗 `def main():` 当 invalid hunk header)
         assert!(
-            guidance.contains("prefix EVERY line") && guidance.contains("`+`"),
-            "guidance 必须强调 Add File 全 `+` 前缀:{guidance}"
+            guidance.contains("prefix every line of the new file's CONTENT")
+                && guidance.contains("`+`"),
+            "guidance 必须强调 Add File 内容行全 `+` 前缀:{guidance}"
+        );
+        // (2a) [MOC-268] 信封终止符不加 `+`(防 `+*** End Patch` 残留进新建文件)
+        assert!(
+            guidance.contains("do NOT prefix the terminator"),
+            "guidance 必须强调终止符不加 `+`(防残留):{guidance}"
         );
         // (3) byte-exact matching
         assert!(
@@ -3904,6 +3696,8 @@ fn text_format_reasoning_and_special_fields_follow_legacy_conversion() {
         "service_tier": "priority",
         "modalities": ["text", "audio", "bad"],
         "audio": {"voice": "alloy", "format": "mp3"},
+        // tool_choice 仅在有 tools 时转发(MOC-208),故带一个 function 工具以覆盖 any→required 归一
+        "tools": [{"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}}],
         "tool_choice": {"type": "any"}
     }));
     assert_eq!(out["response_format"]["type"], "json_schema");
@@ -4322,12 +4116,12 @@ fn apply_patch_guidance_injected_in_chinese_when_language_zh() {
 }
 
 #[test]
-fn apply_patch_guidance_zh_covers_all_nine_rules() {
+fn apply_patch_guidance_zh_covers_all_ten_rules() {
     with_user_language("zh", || {
         let out = convert(first_turn_request_with_apply_patch());
         let guidance = out["messages"][1]["content"].as_str().unwrap();
-        // 9 条规则编号都必须出现(防漏译)
-        for n in 1..=9 {
+        // 10 条规则编号都必须出现(防漏译;rule 10 = MOC-268 memory 专属引导)
+        for n in 1..=10 {
             let marker = format!("{n}.");
             assert!(
                 guidance.contains(&marker),
@@ -4340,6 +4134,11 @@ fn apply_patch_guidance_zh_covers_all_nine_rules() {
             "missing **ALWAYS** equivalent"
         );
         assert!(guidance.contains("绝不"), "missing **NEVER** equivalent");
+        // [MOC-268] rule 10:memory 专属引导(并发重写 + cat 重读 + 当前文件存在的 `-` 行)
+        assert!(
+            guidance.contains("memory 文件") && guidance.contains("MEMORY.md"),
+            "ZH guidance 必须含 memory 专属引导(rule 10):{guidance}"
+        );
     });
 }
 
@@ -4478,4 +4277,432 @@ fn moc193_wire_deduped_but_session_plan_keeps_full_history() {
         3,
         "session plan(回写 cache)必须保全量 — wire-level only,不碰 session 重建敏感区"
     );
+}
+
+// ───────── [MOC-250] computer-use 截图(function_call_output 多模态 output)─────────
+
+fn vision_chat_provider() -> Provider {
+    // 非 TEXT_ONLY_MODELS、非 None → provider_supports_vision == true(默认支持)
+    let mut p = provider("kimi", "Kimi", "https://api.moonshot.cn/v1");
+    p.models.insert("default".into(), "kimi-k2.6".into());
+    p.api_format = "openai_chat".into();
+    p
+}
+
+#[test]
+fn split_tool_output_text_and_images_splits_multimodal_array() {
+    let output = json!([
+        {"type":"input_text","text":"Wall time: 0.2s"},
+        {"type":"input_text","text":"app_state..."},
+        {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/AAAA","detail":"high"}
+    ]);
+    let (text, images) = split_tool_output_text_and_images(output);
+    assert_eq!(text, Value::String("Wall time: 0.2s\napp_state...".into()));
+    assert_eq!(images.len(), 1);
+    let s = serde_json::to_string(&images[0]).unwrap();
+    assert!(s.contains("image_url"), "图片块应转成 chat image_url: {s}");
+    assert!(s.contains("/9j/AAAA"), "图片数据应保留: {s}");
+}
+
+#[test]
+fn split_tool_output_text_and_images_passthrough_when_no_image() {
+    // 纯文本数组 → 原样返回 + 空图片列表(折叠行为不变)
+    let arr = json!([{"type":"input_text","text":"hello"}]);
+    let (v, imgs) = split_tool_output_text_and_images(arr.clone());
+    assert_eq!(v, arr);
+    assert!(imgs.is_empty());
+    // 字符串 → 原样
+    let s = json!("plain string output");
+    let (v2, imgs2) = split_tool_output_text_and_images(s.clone());
+    assert_eq!(v2, s);
+    assert!(imgs2.is_empty());
+}
+
+#[test]
+fn lift_tool_screenshot_images_lifts_all_sidefield_and_clears_field() {
+    // [chatgpt-codex P2 修] 按侧信道字段存在判定当前轮(非 trailing-tool 位置):凡带字段的
+    // tool message 都提升,字段一律清除。带字段的恒是当前 input 的 tool(cache 已剥字段),
+    // 跨轮累积由 cache 剥字段独立防住,不在本函数 drop。
+    let mut messages = vec![
+        json!({"role":"tool","tool_call_id":"a","content":"text a",
+               "__cas_tool_images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}),
+        json!({"role":"assistant","content":"between"}),
+        json!({"role":"tool","tool_call_id":"b","content":"text b",
+               "__cas_tool_images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,BBB"}}]}),
+    ];
+    lift_tool_screenshot_images(&mut messages);
+    let all = serde_json::to_string(&messages).unwrap();
+    assert!(
+        !all.contains("__cas_tool_images"),
+        "侧信道字段必须被清除: {all}"
+    );
+    // 两条 tool 各自后面都跟一条 user image message
+    for (tid, data) in [("a", "AAA"), ("b", "BBB")] {
+        let idx = messages
+            .iter()
+            .position(|m| m["tool_call_id"] == tid)
+            .unwrap();
+        assert_eq!(
+            messages[idx + 1]["role"],
+            "user",
+            "{tid} tool 后应紧跟 user image message"
+        );
+        assert!(
+            serde_json::to_string(&messages[idx + 1])
+                .unwrap()
+                .contains(data),
+            "{tid} 图片应保留"
+        );
+    }
+}
+
+#[test]
+fn screenshot_lifted_even_when_user_message_follows_tool_output() {
+    // [chatgpt-codex P2 回归] Codex 完整循环形态:function_call_output(截图) 后紧跟新 user 输入。
+    // 此时 current_tool_count(trailing tool)==0,旧 keep_count 逻辑会丢图。现在必须仍提升。
+    let req = json!({
+        "model": "kimi-k2.6",
+        "stream": true,
+        "input": [
+            {"type":"function_call","call_id":"call_s","name":"screenshot","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_s","output":[
+                {"type":"input_text","text":"state"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/TRAILINGUSER"}
+            ]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"now click the button"}]}
+        ]
+    });
+    let out =
+        responses_body_to_chat_body_for_provider(&req, Some(&vision_chat_provider())).unwrap();
+    let all = serde_json::to_string(&out["messages"]).unwrap();
+    assert!(
+        all.contains("/9j/TRAILINGUSER"),
+        "尾随 user 消息时当前轮截图仍须提升(不丢): {all}"
+    );
+    assert!(
+        all.contains("now click the button"),
+        "尾随 user 消息也应保留"
+    );
+    assert!(!all.contains("__cas_tool_images"));
+}
+
+#[test]
+fn lift_keeps_parallel_tool_results_contiguous() {
+    // [chatgpt-codex P2 回归] 并行 tool call:assistant.tool_calls=[a,b,c],tool(b) 返图。
+    // 图片必须落在整段 tool-result 块**之后**,不能插在 tool(b) 与 tool(c) 之间
+    //(否则 tool(c) 与 assistant.tool_calls 失配 → strict OpenAI 校验 400)。
+    let mut messages = vec![
+        json!({"role":"assistant","content":"","tool_calls":[
+            {"id":"a","type":"function","function":{"name":"f","arguments":"{}"}},
+            {"id":"b","type":"function","function":{"name":"g","arguments":"{}"}},
+            {"id":"c","type":"function","function":{"name":"h","arguments":"{}"}}]}),
+        json!({"role":"tool","tool_call_id":"a","content":"ra"}),
+        json!({"role":"tool","tool_call_id":"b","content":"rb",
+               "__cas_tool_images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,SHOT"}}]}),
+        json!({"role":"tool","tool_call_id":"c","content":"rc"}),
+    ];
+    lift_tool_screenshot_images(&mut messages);
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["assistant", "tool", "tool", "tool", "user"],
+        "tool-result 块须保持连续,图片落在块尾之后: {roles:?}"
+    );
+    assert!(
+        serde_json::to_string(messages.last().unwrap())
+            .unwrap()
+            .contains("SHOT"),
+        "图片须在末尾 user message 里保留"
+    );
+    assert!(!serde_json::to_string(&messages)
+        .unwrap()
+        .contains("__cas_tool_images"));
+}
+
+#[test]
+fn computer_use_screenshot_lifts_to_user_image_for_vision_provider() {
+    let req = json!({
+        "model": "kimi-k2.6",
+        "stream": true,
+        "input": [
+            {"type":"function_call","call_id":"call_1","name":"screenshot","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":[
+                {"type":"input_text","text":"Wall time: 0.2s"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/SCREENSHOT","detail":"high"}
+            ]}
+        ]
+    });
+    let out =
+        responses_body_to_chat_body_for_provider(&req, Some(&vision_chat_provider())).unwrap();
+    let messages = out["messages"].as_array().unwrap();
+    // tool message: 含文本, 不含图片 base64
+    let tool_idx = messages.iter().position(|m| m["role"] == "tool").unwrap();
+    let tool_content = messages[tool_idx]["content"].as_str().unwrap();
+    assert!(
+        tool_content.contains("Wall time"),
+        "tool 文本应保留: {tool_content}"
+    );
+    assert!(
+        !tool_content.contains("/9j/SCREENSHOT"),
+        "tool 文本不得含图片 base64: {tool_content}"
+    );
+    // 紧随其后一条 user image message,图片作为真图(image_url)保留
+    let next = &messages[tool_idx + 1];
+    assert_eq!(next["role"], "user");
+    let next_s = serde_json::to_string(next).unwrap();
+    assert!(
+        next_s.contains("image_url"),
+        "提升的 user message 应含 image_url: {next_s}"
+    );
+    assert!(
+        next_s.contains("/9j/SCREENSHOT"),
+        "图片应作为真图保留: {next_s}"
+    );
+    // 侧信道字段不得出现在 wire
+    let all = serde_json::to_string(messages).unwrap();
+    assert!(!all.contains("__cas_tool_images"), "wire 不得含侧信道字段");
+}
+
+#[test]
+fn computer_use_screenshot_stripped_for_non_vision_provider() {
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [
+            {"type":"function_call","call_id":"call_1","name":"screenshot","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":[
+                {"type":"input_text","text":"Wall time: 0.2s"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/SCREENSHOT","detail":"high"}
+            ]}
+        ]
+    });
+    let out = responses_body_to_chat_body_for_provider(&req, Some(&deepseek_provider())).unwrap();
+    let all = serde_json::to_string(&out["messages"]).unwrap();
+    // 非视觉上游:图片 base64 既不能进 tool 文本,也不能作为 image_url 透传
+    assert!(
+        !all.contains("/9j/SCREENSHOT"),
+        "非视觉上游不得透传图片数据: {all}"
+    );
+    assert!(
+        !all.contains("\"image_url\""),
+        "非视觉上游不得含 image_url variant: {all}"
+    );
+    assert!(all.contains("omitted"), "应降级为占位文本: {all}");
+    assert!(!all.contains("__cas_tool_images"));
+}
+
+#[test]
+fn computer_use_screenshot_not_persisted_in_session_cache() {
+    let req = json!({
+        "model": "kimi-k2.6",
+        "stream": true,
+        "input": [
+            {"type":"function_call","call_id":"call_1","name":"screenshot","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":[
+                {"type":"input_text","text":"Wall time: 0.2s"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/SCREENSHOT","detail":"high"}
+            ]}
+        ]
+    });
+    let conv = responses_body_to_chat_body_for_provider_with_session(
+        &req,
+        Some(&vision_chat_provider()),
+        None,
+    )
+    .unwrap();
+    // wire body 含真图
+    let wire = serde_json::to_string(&conv.body["messages"]).unwrap();
+    assert!(wire.contains("/9j/SCREENSHOT"), "wire 应含真图");
+    // session cache(回写历史)不得含全分辨率截图,也不得含侧信道字段或提升出的 user 图片消息
+    let cached = serde_json::to_string(&conv.response_session.messages).unwrap();
+    assert!(
+        !cached.contains("/9j/SCREENSHOT"),
+        "cache 不得缓存全分辨率截图: {cached}"
+    );
+    assert!(
+        !cached.contains("__cas_tool_images"),
+        "cache 不得含侧信道字段"
+    );
+    // cache 仍保留 tool 文本(供后续轮历史)
+    assert!(cached.contains("Wall time"), "cache 应保留 tool 文本");
+}
+
+#[test]
+fn split_tool_output_preserves_unknown_blocks_when_image_present() {
+    // [silent-failure I1] 含图的多模态数组里,非文本非图片块(input_file 等)不得静默丢:
+    // 保留其 JSON 进文本(对齐改前整数组 to_string 的非破坏语义)。
+    let output = json!([
+        {"type":"input_text","text":"head"},
+        {"type":"input_file","filename":"a.pdf","file_id":"f_1"},
+        {"type":"input_image","image_url":"data:image/png;base64,IMG"}
+    ]);
+    let (text, images) = split_tool_output_text_and_images(output);
+    let text_s = text.as_str().unwrap();
+    assert!(text_s.contains("head"), "文本块保留: {text_s}");
+    assert!(
+        text_s.contains("input_file"),
+        "未知块 JSON 必须保留不丢: {text_s}"
+    );
+    assert!(text_s.contains("a.pdf"), "未知块内容必须保留: {text_s}");
+    assert_eq!(images.len(), 1, "图片块照常提取");
+}
+
+#[test]
+fn custom_tool_call_output_with_image_lifts_to_user_message() {
+    // [silent-failure B1] custom_tool_call_output 与 function_call_output 同 payload 编码,
+    // 含图时也走拆图提升,而不是把 base64 当文本折叠。
+    let req = json!({
+        "model": "kimi-k2.6",
+        "stream": true,
+        "input": [
+            {"type":"function_call","call_id":"call_c","name":"custom_tool","arguments":"{}"},
+            {"type":"custom_tool_call_output","call_id":"call_c","output":[
+                {"type":"input_text","text":"done"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/CUSTOMSHOT"}
+            ]}
+        ]
+    });
+    let out =
+        responses_body_to_chat_body_for_provider(&req, Some(&vision_chat_provider())).unwrap();
+    let messages = out["messages"].as_array().unwrap();
+    let tool_idx = messages.iter().position(|m| m["role"] == "tool").unwrap();
+    let tool_content = messages[tool_idx]["content"].as_str().unwrap();
+    assert!(
+        !tool_content.contains("/9j/CUSTOMSHOT"),
+        "custom tool 文本不得含图片 base64: {tool_content}"
+    );
+    let next = &messages[tool_idx + 1];
+    assert_eq!(
+        next["role"], "user",
+        "custom tool 截图应提升为 user image message"
+    );
+    let next_s = serde_json::to_string(next).unwrap();
+    assert!(
+        next_s.contains("/9j/CUSTOMSHOT"),
+        "图片应作为真图保留: {next_s}"
+    );
+    let all = serde_json::to_string(messages).unwrap();
+    assert!(!all.contains("__cas_tool_images"), "wire 不得含侧信道字段");
+}
+
+// ── GLM 文本款视觉判定(glm-5.2 漏判修复)──
+
+fn glm_provider(model: &str) -> Provider {
+    let mut p = provider(
+        "zhipu",
+        "GLM",
+        "https://open.bigmodel.cn/api/coding/paas/v4",
+    );
+    p.models.insert("default".into(), model.into());
+    p.api_format = "openai_chat".into();
+    p
+}
+
+#[test]
+fn is_glm_text_only_model_classifies_text_vs_vision() {
+    // 文本款(含漏判的 glm-5.2)→ true
+    for m in [
+        "glm-5.2",
+        "glm-5",
+        "glm-5-turbo",
+        "glm-5.1",
+        "glm-4.7",
+        "glm-4.6",
+        "glm-4.5",
+        "glm-4",
+        "glm-4-plus",
+        "glm-air",
+        "glm-4.5-air",
+        "GLM-5.2",
+    ] {
+        assert!(is_glm_text_only_model(m), "{m} 应判纯文本");
+    }
+    // 视觉款(版本号后紧跟 v)→ false(不当纯文本,保留图)
+    for m in [
+        "glm-5v",
+        "glm-5v-turbo",
+        "glm-4.5v",
+        "glm-4.6v",
+        "glm-4v",
+        "glm-4.1v-thinking",
+    ] {
+        assert!(!is_glm_text_only_model(m), "{m} 是视觉款,不应判纯文本");
+    }
+    // 非 GLM → false
+    for m in ["deepseek-v4-pro", "gpt-5.5", "", "vglm-5"] {
+        assert!(!is_glm_text_only_model(m), "{m} 非 GLM,不应判纯文本");
+    }
+}
+
+#[test]
+fn glm_5_2_strips_image_url_no_longer_treated_as_vision() {
+    // 回归:glm-5.2 含图请求必须剥掉 image_url(否则发往 bigmodel 文本端点 → 拒/断流、会话毒化)。
+    let req = vision_request_for("glm-5.2");
+    assert!(
+        !image_url_kept(&req, &glm_provider("glm-5.2")),
+        "glm-5.2 是文本旗舰,必须 strip image_url"
+    );
+    // glm-5 / glm-5-turbo 同样
+    for m in ["glm-5", "glm-5-turbo", "glm-5.1"] {
+        let req = vision_request_for(m);
+        assert!(
+            !image_url_kept(&req, &glm_provider(m)),
+            "{m} 必须 strip image_url"
+        );
+    }
+}
+
+#[test]
+fn glm_vision_variant_keeps_image_url() {
+    // glm-5v(视觉款)→ 保留 image_url(不误伤,视觉能力正常)。
+    let req = vision_request_for("glm-5v");
+    assert!(
+        image_url_kept(&req, &glm_provider("glm-5v")),
+        "glm-5v 是视觉款,应保留 image_url"
+    );
+}
+
+#[test]
+fn moc233_folded_tool_output_is_byte_stable_across_turns() {
+    // MOC-233 核心不变式:同一 (call_id, 内容) 的大 tool 输出,每轮被折叠成的历史消息必须**字节完全一致**。
+    // 否则 GLM / WorkBuddy 等按 Chat Completions messages 前缀做 prompt cache 的上游会从首条折叠消息起永久
+    // miss —— 旧实现每轮 new_artifact_id()(纳秒+计数)使 `Artifact ID:` 行每轮变,命中率从 ~95% 塌到 ~33%。
+    let store = crate::responses::artifact_store::ToolArtifactStore::new(
+        16,
+        std::time::Duration::from_secs(60),
+    );
+    // 超过 TOOL_OUTPUT_INLINE_MAX_CHARS(4000)才会触发折叠。
+    let raw = format!(
+        "Chunk ID: edd94a\nWall time: 0.0s\nOutput:\n{}",
+        "X".repeat(8000)
+    );
+
+    let turn_a = normalize_tool_output_for_context_with_store(
+        Some("call_5bc14df1"),
+        Value::String(raw.clone()),
+        Some(&store),
+    );
+    let turn_b = normalize_tool_output_for_context_with_store(
+        Some("call_5bc14df1"),
+        Value::String(raw.clone()),
+        Some(&store),
+    );
+
+    assert!(
+        turn_a.contains("[Tool output stored outside model context]"),
+        "超阈值大输出应被折叠"
+    );
+    assert_eq!(
+        turn_a, turn_b,
+        "同一折叠消息跨轮必须字节一致(MOC-233 前缀缓存前提)"
+    );
+    // 折叠文本里只应有一个稳定的 Artifact ID。
+    let ids: std::collections::HashSet<&str> = turn_a
+        .lines()
+        .filter_map(|line| line.strip_prefix("Artifact ID: "))
+        .collect();
+    assert_eq!(ids.len(), 1, "只应有一个稳定 artifact id");
 }

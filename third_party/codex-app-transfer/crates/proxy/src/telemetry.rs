@@ -221,6 +221,10 @@ impl Default for ProxyTelemetry {
     }
 }
 
+// [MOC-232] 上下文 by-source 明细的持久 store(dir / is_safe_conversation_id / persist /
+// load / gc)已迁到 `adapters::responses::context_breakdown` —— 计算改 adapter 内
+// spawn_blocking 后台跑,compute 与 persist 同处 adapters、数据流最短(proxy 不再触碰)。
+
 static TELEMETRY: OnceLock<ProxyTelemetry> = OnceLock::new();
 
 pub fn proxy_telemetry() -> &'static ProxyTelemetry {
@@ -234,6 +238,9 @@ pub fn proxy_log_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // [MOC-232] uuid 校验测试随 store 一起迁到
+    // `adapters::responses::context_breakdown`(is_safe_conversation_id_rejects_path_traversal_and_bad_shape)。
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

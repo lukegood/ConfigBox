@@ -34,23 +34,48 @@ mod tests {
 
     #[test]
     fn presets_count_matches_python() {
-        // 当前 14 条 builtin presets:
+        // 当前 16 条 builtin presets:
         // deepseek / kimi / kimi-code / xiaomi-mimo-payg / xiaomi-mimo-token-plan
-        // / zhipu / zhipu-coding / bailian / bailian-token-plan / minimax / grok-web
-        // / google-ai-studio / gemini-cli-oauth / antigravity-oauth
+        // / zhipu / zhipu-coding / zai-login / bigmodel-login / bailian /
+        // bailian-token-plan / minimax / grok-web / google-ai-studio /
+        // gemini-cli-oauth / antigravity-oauth
         // (2026-05-10 加 Google AI Studio Gemini preset)
         // (2026-05-11 加 Gemini CLI OAuth login preset)
         // (2026-05-11 加 Antigravity OAuth preset)
         // (2026-05-12 加 Grok Web 反代 preset,见 R1 Plan A)
         // (2026-06-13 加智谱 GLM Coding preset:Coding Plan 端点 + Claude Code UA 伪装)
-        assert_eq!(builtin_presets().len(), 14);
+        // (2026-06-16 加 zai-login / bigmodel-login OAuth preset:GLM Coding Plan 账号登录,MOC-252)
+        // (2026-06-22 加 OpenCode Go preset:opencode.ai/zen/go 编程模型订阅,openai_chat)
+        // (2026-06-22 加 Trae（国内版）OAuth preset:字节 TRAE SOLO CN 账号登录 + 额度,CAT-257;
+        //  Phase 1 仅 login+quota,模型路由 Phase 2)
+        // (2026-06-30 加 WorkBuddy（腾讯 CodeBuddy）preset:复用桌面端登录 token 直连
+        //  copilot.tencent.com/v2 模型网关,openai_chat;纯 bearer,实测 deepseek-v4/glm-5.x/
+        //  minimax-m3/kimi-k2.x/hy3 等可用,详见逆向记录)
+        // (2026-06-30 加 workbuddy-login:WorkBuddy 账号登录 OAuth 路,authScheme
+        //  workbuddy_oauth;外链轮询登录 + 自动 refresh,与 API-key 路 workbuddy 并存)
+        // (2026-07-03 加 qoder-login:QoderWork CN 账号登录 OAuth 路,authScheme
+        //  qoder_oauth;纯客户端 PKCE device flow 轮询登录 + 自动 refresh。阶段一仅
+        //  login+save,模型路由 jobToken 交换注入在阶段二实测后接入)
+        // (2026-07-06 加 grok-build:xAI grok CLI 编码后端,authScheme grok_build_oauth;
+        //  responses passthrough,OAuth2 device flow 自建登录 + 自动 refresh,上游
+        //  cli-chat-proxy.grok.com/v1;models.default=grok-build 防 Codex gpt-5.x 名透传上游)
+        assert_eq!(builtin_presets().len(), 22);
     }
 
     #[test]
-    fn zhipu_coding_preset_uses_coding_endpoint_and_claude_code_ua() {
-        // GLM Coding Plan(订阅套餐)走专属 coding 端点,非开放平台按量端点;
-        // 智谱条款禁止「非官方工具」接入,UA 伪装成 Claude Code(官方授权的
-        // 编程工具,对齐 Kimi Code 用 KimiCLI UA 的做法)。
+    fn zhipu_coding_preset_uses_coding_endpoint_with_empty_headers() {
+        // GLM Coding Plan(订阅套餐)走专属 coding 端点,非开放平台按量端点。
+        // ZCode 指纹头(User-Agent/HTTP-Referer/X-Title/X-ZCode-App-Version/
+        // X-Platform)不在 preset extraHeaders 里配置,而是在 forward.rs 代码层
+        // 按 base_url 含 coding/paas/v4 判定后注入完整的 zcode_source_headers()
+        // (含运行时动态 X-Platform),与 OAuth 路径完全对齐。
+        //
+        // **extraHeaders 必须是空对象 `{}` 而不是缺失字段**:旧版 preset 曾带
+        // `User-Agent: claude-cli/...`,存量用户 config.json 里已快照了这条。
+        // healing(ENFORCED_BUILTIN_FIELDS 含 extraHeaders)只在 preset **声明**了
+        // 该字段(preset_specifies==true)时才覆盖用户值;若字段缺失则跳过、残留
+        // 不清。空对象 `{}` 让 healing 把存量残留的 claude-cli UA 覆盖成 `{}`,
+        // 避免它与代码层注入的 ZCode UA 在出站时 append 成双 User-Agent。
         let p = builtin_presets()
             .iter()
             .find(|p| p["id"] == "zhipu-coding")
@@ -61,8 +86,9 @@ mod tests {
         );
         assert_eq!(p["apiFormat"], "openai_chat");
         assert_eq!(
-            p["extraHeaders"]["User-Agent"], "claude-cli/2.1.175 (external, cli)",
-            "UA 伪装成 Claude Code 真实 UA(本机 bundle 实证 getUserAgent 形态)"
+            p["extraHeaders"],
+            serde_json::json!({}),
+            "extraHeaders 必须是空对象(非缺失),否则 healing 清不掉存量用户残留的 claude-cli UA,会与代码层注入的 ZCode UA 重复"
         );
         // default model 必须在 modelCapabilities 配 context_window(issue #356)
         let default_model = p["models"]["default"].as_str().unwrap_or("");

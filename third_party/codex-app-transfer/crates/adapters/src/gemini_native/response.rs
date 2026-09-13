@@ -24,11 +24,9 @@
 //!     response.content_part.done
 //!   [if reasoning:]
 //!     response.reasoning_summary_part.added  ← summary_index=0
-//!     response.reasoning_summary_text.delta  ← 增量(summary 通道,旧版兼容)
-//!     response.reasoning_text.delta          ← 增量(content 通道,v26.608+ 渲染)
+//!     response.reasoning_summary_text.delta  ← 增量(summary 通道,官方 v26.623 实测唯一渲染通道)
 //!     response.reasoning_summary_text.done
 //!     response.reasoning_summary_part.done
-//!     response.reasoning_text.done           ← content 通道完毕
 //!   [if function_call:]
 //!     response.function_call_arguments.delta  ← 一次性 emit 完整 args(Gemini 不增量)
 //!     response.function_call_arguments.done
@@ -39,8 +37,9 @@
 //!
 //! Gemini → Responses 字段映射:
 //! - `candidates[].content.parts[].text` (thought≠true) → output_text.delta
-//! - `candidates[].content.parts[].text` (thought=true) → reasoning_summary_text.delta(summary 通道)
-//!   + reasoning_text.delta(content 通道,v26.608+ 渲染);双发兼容新旧版 Codex
+//! - `candidates[].content.parts[].text` (thought=true) → reasoning_summary_text.delta
+//!   (单发 summary 通道;官方 v26.623 实测 summary-only 正常显示,双发 content 通道
+//!   会致同一思考块重复更新闪烁,已移除)
 //! - `candidates[].content.parts[].functionCall {name, args}` → function_call output_item
 //!   (args 序列化成 JSON string 灌进 function_call_arguments.delta)
 //! - `candidates[].groundingMetadata` → output_text.annotation.added(在 message 内)
@@ -54,7 +53,9 @@ use futures_core::Stream;
 use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
 
-use crate::core::events::{build_tool_namespace_map, emit_sse_event as emit_event};
+use crate::core::events::{
+    build_custom_tool_name_set, build_tool_namespace_map, emit_sse_event as emit_event,
+};
 use crate::responses::global_response_session_cache;
 use crate::responses::request::tools::{APPLY_PATCH_TOOL_NAME, TOOL_SEARCH_TOOL_NAME};
 use crate::types::{ByteStream, ResponseSessionPlan};
@@ -145,15 +146,18 @@ struct ClosedFunctionCall {
     /// `Some("mcp__<server>__")` 当 function.name 来自 namespace 包装。
     /// envelope output[] emit 时回灌成 item.namespace 字段。
     namespace: Option<String>,
-    /// [MOC-75] `Some(patch)` 当 name==apply_patch:envelope output[] 要 emit 成
-    /// `custom_tool_call` item(`input`=patch),而非 function_call —— Codex CLI
-    /// router 对 apply_patch 硬要求 `ToolPayload::Custom{input}`,收 Function
-    /// payload 直接 abort(见 responses/converter.rs::close_tool_call 注释)。
-    apply_patch_input: Option<String>,
+    /// [MOC-75/MOC-88] `Some(input)` 当该 functionCall 当初注册为 custom freeform
+    /// 工具(apply_patch 或其他):envelope output[] 要 emit 成 `custom_tool_call`
+    /// item(`input`=裸文本),而非 function_call —— Codex CLI router 对 custom 工具
+    /// 硬要求 `ToolPayload::Custom{input}`,收 Function payload 直接 abort(见
+    /// responses/converter.rs::close_tool_call 注释)。apply_patch 的 input 是经中间层
+    /// 修复的 V4A patch;其他 custom 工具是裸 `input` 文本。
+    custom_tool_input: Option<String>,
     /// [MOC-75] V4A 后验校验失败(完整但畸形的 patch)→ envelope custom_tool_call 也
     /// emit `status="incomplete"`,让严格读 envelope 终态的客户端不把畸形 patch 当完整
-    /// 执行(破坏性半应用防护,对齐 #322)。仅 apply_patch 分支可能置 true。
-    apply_patch_incomplete: bool,
+    /// 执行(破坏性半应用防护,对齐 #322)。**仅 apply_patch** 可能置 true;其他 custom
+    /// 工具的 input 是任意文本、无 V4A 破坏性半应用风险,恒 false(completed)。
+    custom_tool_incomplete: bool,
     /// [MOC-217] `Some(args)` 当 name==tool_search:envelope output[] + 流式 wire 都
     /// emit 成 `tool_search_call`(`arguments` 是 JSON object、`execution:"client"`),而非
     /// function_call —— Codex router 对 tool_search 期待 `ToolPayload::ToolSearch`,收
@@ -204,6 +208,10 @@ pub struct GeminiToResponsesConverter {
     /// P0-E:已 close 的非 message/reasoning/function_call 类 items
     /// (image_generation_call / 等扩展 type),emit_completed 也按 output_index 排序
     closed_other_items: Vec<(u32, Value)>,
+    /// close_message 时暂存的 message done 事件(per-block close 时 `has_seen_tool_calls`
+    /// 可能还没到终态 —— functionCall part 可能在 text part 之后才出现)。
+    /// 收尾侧 `emit_completed` flush 时按 [`message_phase`] 定终态 phase 再 emit。
+    pending_message_done: Vec<(u32, Value)>,
     /// [MOC-210] proxy 出图履约从合成 `_casRevisedPrompt` part 暂存的 prompt,
     /// 紧随其后的 inlineData → emit_inline_data 取用填 revised_prompt 后清空。
     pending_image_prompt: Option<String>,
@@ -249,6 +257,13 @@ pub struct GeminiToResponsesConverter {
     /// 跟 [`crate::responses::converter::ResponsesConverter::tool_namespace_map`]
     /// 同款 — 1:1 移植(2026-05-11 实测 Codex.app + Gemini 路径 MCP 调用)
     tool_namespace_map: std::collections::HashMap<String, String>,
+
+    /// [MOC-88] 本轮 `original_request` 里注册为 `type:"custom"` 的工具名集合。
+    /// 响应侧据此判定 Gemini functionCall 要不要重打包成 `custom_tool_call` wire
+    /// (替代 name-only 的 `name == APPLY_PATCH_TOOL_NAME` 硬比)。`original_request`
+    /// 缺失(单测 / 非 live 路径)时为空,检测回落 name-only。见
+    /// [`build_custom_tool_name_set`]。
+    custom_tool_names: std::collections::HashSet<String>,
 }
 
 impl GeminiToResponsesConverter {
@@ -263,6 +278,8 @@ impl GeminiToResponsesConverter {
         // **build namespace map 必须先于 move**(struct field 顺序里
         // original_request 在前会先 move 走,后面 tool_namespace_map 拿不到 ref)
         let tool_namespace_map = build_tool_namespace_map(original_request.as_ref());
+        // [MOC-88] 本轮注册为 type:custom 的 freeform 工具名集合(响应侧重打包判定用)。
+        let custom_tool_names = build_custom_tool_name_set(original_request.as_ref());
         // [MOC-194] 每请求记忆 cwd(同 chat 的 with_original_request):带 cwd 的 turn-start 请求
         // 不产生 apply_patch,只在此记忆才能供后续不带 cwd 的 apply_patch 请求回退。
         crate::responses::apply_patch_preflight::remember_cwd_from_request(
@@ -286,6 +303,7 @@ impl GeminiToResponsesConverter {
             closed_messages: Vec::new(),
             closed_reasonings: Vec::new(),
             closed_other_items: Vec::new(),
+            pending_message_done: Vec::new(),
             pending_image_prompt: None,
             has_seen_tool_calls: false,
             final_finish_reason: None,
@@ -301,6 +319,7 @@ impl GeminiToResponsesConverter {
             prompt_block_reason: None,
             prompt_feedback_safety: Vec::new(),
             tool_namespace_map,
+            custom_tool_names,
         }
     }
 
@@ -1036,6 +1055,7 @@ impl GeminiToResponsesConverter {
         // 旧实现假设 reasoning < message < function_calls 顺序固定,但 Gemini 多轮
         // text→fc→text 序列会破这条假设。
         let mut all_items: Vec<(u32, Value)> = Vec::new();
+        self.flush_pending_message_done(out);
         all_items.extend(self.closed_messages.drain(..));
         all_items.extend(self.closed_reasonings.drain(..));
         all_items.extend(self.closed_other_items.drain(..));
@@ -1056,7 +1076,7 @@ impl GeminiToResponsesConverter {
                     "status": "completed",
                 })
             } else {
-                match &fc.apply_patch_input {
+                match &fc.custom_tool_input {
                     Some(input) => json!({
                         "type": "custom_tool_call",
                         "id": fc.item_id.clone(),
@@ -1064,7 +1084,7 @@ impl GeminiToResponsesConverter {
                         "name": fc.name.clone(),
                         "input": input,
                         // [MOC-75] 畸形 patch envelope 终态也 incomplete(对齐流式 + 破坏性防护)
-                        "status": if fc.apply_patch_incomplete { "incomplete" } else { "completed" },
+                        "status": if fc.custom_tool_incomplete { "incomplete" } else { "completed" },
                     }),
                     None => json!({
                         "type": "function_call",
@@ -1161,6 +1181,10 @@ impl GeminiToResponsesConverter {
         let item_id = format!("msg_{}", synthesize_id());
         let output_index = self.next_output_index;
         self.next_output_index += 1;
+        // [MOC-295] open 时一律发 `commentary`(临时):此刻本响应的工具调用可能还没
+        // 出现(Gemini 流里 text→functionCall 交错),若发 final_answer 会在工具轮的
+        // 文本开始时提前折叠。权威 phase 由收尾侧 `emit_completed` flush pending done
+        // 时按 `has_seen_tool_calls` 给出。
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1170,6 +1194,7 @@ impl GeminiToResponsesConverter {
                 "output_index": output_index,
                 "item": {
                     "type": "message",
+                    "phase": "commentary",
                     "id": item_id,
                     "status": "in_progress",
                     "role": "assistant",
@@ -1272,6 +1297,9 @@ impl GeminiToResponsesConverter {
                 },
             }),
         );
+        // [MOC-295] 不在此 emit `output_item.done`:close_message 时 functionCall
+        // part 可能在后续才出现,`has_seen_tool_calls` 此刻不一定终态。暂存 item,
+        // 等收尾侧 `emit_completed` flush 时按 `message_phase()` 给权威 phase 再 emit。
         let item = json!({
             "type": "message",
             "id": msg.item_id,
@@ -1283,17 +1311,42 @@ impl GeminiToResponsesConverter {
                 "annotations": msg.annotations_acc,
             }],
         });
-        emit_event(
-            out,
-            &mut self.sequence_number,
-            "response.output_item.done",
-            json!({
-                "type": "response.output_item.done",
-                "output_index": msg.output_index,
-                "item": item.clone(),
-            }),
-        );
-        self.closed_messages.push((msg.output_index, item));
+        self.pending_message_done.push((msg.output_index, item));
+    }
+
+    /// assistant message item 的 `phase`(harmony 通道语义):本响应含工具调用
+    /// → `commentary`(铺垫/中间叙述,Codex 折叠进 "Working");否则 `final_answer`
+    /// (最终答复,展开留下)。仅在收尾侧(`emit_completed` flush pending done)调用 ——
+    /// `has_seen_tool_calls` 此时已终态。注意不能用 `final_finish_reason`——
+    /// Gemini finishReason 恒为 STOP,不区分工具轮。
+    fn message_phase(&self) -> &'static str {
+        if self.has_seen_tool_calls {
+            "commentary"
+        } else {
+            "final_answer"
+        }
+    }
+
+    /// 收尾侧 flush pending message done:遍历 `pending_message_done`,给每条
+    /// message item 注入权威 `phase`(`message_phase()`),emit `output_item.done`,
+    /// 然后移入 `closed_messages` 供 envelope `output[]` 使用。
+    fn flush_pending_message_done(&mut self, out: &mut Vec<u8>) {
+        let phase = self.message_phase();
+        let pending = std::mem::take(&mut self.pending_message_done);
+        for (output_index, mut item) in pending {
+            item["phase"] = json!(phase);
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item.clone(),
+                }),
+            );
+            self.closed_messages.push((output_index, item));
+        }
     }
 
     // ───── reasoning item ─────
@@ -1344,7 +1397,11 @@ impl GeminiToResponsesConverter {
             }
             None => return,
         };
-        // summary 通道(保留,兼容旧版渲染)
+        // [单发 summary 通道] 实测官方 gpt-5.5(v26.623)reasoning 只发
+        // `reasoning_summary_text.delta`(不发 content 通道 `reasoning_text.delta`),
+        // 思考照常显示——当前 Codex 靠 summary 通道渲染。原双发(额外 content 通道)
+        // 会让 Codex 对同一思考块重复更新 → 整段闪烁重渲染,与 chat converter 同步
+        // 去掉 content 通道(见 responses/converter.rs emit_reasoning_delta 注释)。
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1354,22 +1411,6 @@ impl GeminiToResponsesConverter {
                 "item_id": item_id,
                 "output_index": output_index,
                 "summary_index": 0,
-                "delta": delta,
-            }),
-        );
-        // [verify content 通道] 新版 Codex(v26.608+)渲染思考块认 reasoning_text
-        // (content_index),GPT 直连走此通道(本地 session 实证:GPT reasoning
-        // summary:[] 却正常显示);transfer 此前只发 summary→被新版废弃不渲染。
-        // 双发 content 对齐 GPT,summary 留作旧版兼容。
-        emit_event(
-            out,
-            &mut self.sequence_number,
-            "response.reasoning_text.delta",
-            json!({
-                "type": "response.reasoning_text.delta",
-                "item_id": item_id,
-                "output_index": output_index,
-                "content_index": 0,
                 "delta": delta,
             }),
         );
@@ -1406,28 +1447,16 @@ impl GeminiToResponsesConverter {
                 },
             }),
         );
-        // [verify content 通道] 对齐 GPT:补发 reasoning_text.done(content_index)
-        emit_event(
-            out,
-            &mut self.sequence_number,
-            "response.reasoning_text.done",
-            json!({
-                "type": "response.reasoning_text.done",
-                "item_id": rs.item_id,
-                "output_index": rs.output_index,
-                "content_index": 0,
-                "text": rs.text_acc,
-            }),
-        );
+        // [单发 summary 通道] 不再补发 content 通道 `reasoning_text.done`
+        // (对齐官方、消除重渲染,见 emit_reasoning_delta 处注释)。
         // [MOC-218 第三关] reasoning **item** 不带 `content` / `encrypted_content`:
         // OpenAI Responses 后端对 input 里 reasoning item 硬校验 `content` 数组
         // 长度必须 0(`array_above_max_length`,真 GPT 自家 rollout item 形态即
         // `{type, summary, encrypted_content}` 无 content)、`encrypted_content`
         // 假值有 MOC-13 invalid_encrypted_content 前科(null 行为未定义,缺失
         // 最安全)。item 会被 Codex 持久化进会话历史,切真 GPT 时原样上发 ——
-        // 必须出生即合规。当轮渲染不受影响:新版(v26.608+)读 SSE
-        // `reasoning_text.delta` content 通道事件(上方保留双发,MOC-203),
-        // 实证 GPT 直连 summary:[] 仍正常显示 = 渲染靠事件流不靠 item 字段。
+        // 必须出生即合规。当轮渲染靠 summary 通道 SSE 事件,不靠 item 字段
+        // (实证官方 v26.623 summary-only 正常显示)。
         let item = json!({
             "type": "reasoning",
             "status": "completed",
@@ -1445,6 +1474,120 @@ impl GeminiToResponsesConverter {
             }),
         );
         self.closed_reasonings.push((rs.output_index, item));
+    }
+
+    /// [MOC-75/MOC-88] 把一个 custom freeform 工具调用 emit 成 `custom_tool_call` wire:
+    /// `output_item.added`(in_progress)→(completed 时)`custom_tool_call_input.delta` +
+    /// `.done` → `output_item.done`,并记入 `closed_function_calls`(envelope output[] 用)。
+    /// apply_patch 与其他 custom 工具共用此 wire 形态;区别只在 input 怎么来 + 是否 incomplete。
+    ///
+    /// `incomplete=true`(仅 apply_patch 畸形 / 响应级截断)时跳过 input.delta/done + cache
+    /// write —— 不发"输入就绪"信号,防 Codex 把畸形 patch 当 ready 执行(破坏性半应用防护,
+    /// 对齐 #322 chat 路径);envelope 终态也带 incomplete(见 [`ClosedFunctionCall`])。
+    #[allow(clippy::too_many_arguments)]
+    fn emit_custom_tool_call(
+        &mut self,
+        out: &mut Vec<u8>,
+        output_index: u32,
+        item_id: String,
+        call_id: String,
+        name: &str,
+        input: String,
+        incomplete: bool,
+        cached_signature: Option<String>,
+        args_json_str: String,
+    ) {
+        let status = if incomplete {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": item_id.clone(),
+                    "call_id": call_id.clone(),
+                    "name": name,
+                    "input": "",
+                    "status": "in_progress",
+                },
+            }),
+        );
+        // incomplete 时跳过 input.delta + input.done —— 不发"输入已就绪"信号,
+        // 对齐 chat 路径(防 Codex 把畸形 patch 当 ready 去执行)。
+        if !incomplete {
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.custom_tool_call_input.delta",
+                json!({
+                    "type": "response.custom_tool_call_input.delta",
+                    "item_id": item_id.clone(),
+                    "output_index": output_index,
+                    "call_id": call_id.clone(),
+                    "delta": input.clone(),
+                }),
+            );
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.custom_tool_call_input.done",
+                json!({
+                    "type": "response.custom_tool_call_input.done",
+                    "item_id": item_id.clone(),
+                    "output_index": output_index,
+                    "call_id": call_id.clone(),
+                    "input": input.clone(),
+                }),
+            );
+        }
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": item_id.clone(),
+                    "call_id": call_id.clone(),
+                    "name": name,
+                    "input": input.clone(),
+                    "status": status,
+                },
+            }),
+        );
+        // incomplete 不写 cache —— 下一轮引用此 call_id 会拿到 incomplete 上下文反而
+        // 误导;让 orphan repair 路径补占位(对齐 chat 路径)。incomplete 时
+        // thoughtSignature 同样不存(签名属于完整调用,上游容忍缺失)。
+        if !incomplete {
+            crate::responses::global_tool_call_cache().save(
+                &call_id,
+                crate::responses::ToolCallEntry {
+                    name: name.to_owned(),
+                    arguments: args_json_str.clone(),
+                    thought_signature: cached_signature,
+                },
+            );
+        }
+        self.closed_function_calls.push(ClosedFunctionCall {
+            item_id,
+            output_index,
+            call_id,
+            name: name.to_owned(),
+            arguments_json_str: args_json_str,
+            namespace: None,
+            custom_tool_input: Some(input),
+            custom_tool_incomplete: incomplete,
+            tool_search_arguments: None,
+        });
     }
 
     // ───── function_call item ─────
@@ -1487,13 +1630,33 @@ impl GeminiToResponsesConverter {
             }
         };
 
+        // [MOC-263 P3] exec_command 类工具用 shell 直接改文件(sed -i / cat> / python write /
+        // `apply_patch <<EOF` 等)绕过结构化 apply_patch(既不过 preflight 兜底、也不进 apply_patch 埋点)
+        // → emit `shell_edit` 诊断。**与 chat 路径(converter.rs::close_tool_call)对称** —— Antigravity /
+        // gemini_native 会话用 exec_command 写盘也要被看见(chatgpt-codex-connector review;纯观测,gate 关时零开销)。
+        if crate::core::apply_patch_trace::is_shell_exec_tool(name) {
+            crate::core::apply_patch_trace::emit_shell_edit(
+                "gemini_native",
+                &self.model,
+                &call_id,
+                &item_id,
+                name,
+                &args_json_str,
+            );
+        }
+
         // [MOC-75] apply_patch:Codex freeform custom tool,Codex CLI router 硬要求
         // `custom_tool_call` wire(ToolPayload::Custom{input}),收 function_call 的
         // Function payload 直接 abort。请求侧已把它降级成带 `input` 的 function,
         // Gemini 回来的 args 形如 {"input":"*** Begin Patch..."}。这里解出 input、
         // 一次性重打包成 custom_tool_call wire(对齐 chat responses/converter.rs::
         // close_tool_call;Gemini 不增量,无 interrupted 半截风险,故不走 incomplete)。
-        if name == APPLY_PATCH_TOOL_NAME {
+        // [MOC-88] 碰撞防护:碰巧叫 apply_patch 但请求侧登记为普通 function / MCP 工具
+        // (不在 custom_tool_names)的调用**不**进此分支 —— 落到下面 function_call 处理,
+        // 保留其 args / namespace。original_request 缺失(单测 / 非 live)时回落 name-only。
+        if name == APPLY_PATCH_TOOL_NAME
+            && (self.original_request.is_none() || self.custom_tool_names.contains(name))
+        {
             let input = crate::responses::extract_apply_patch_input(&args_json_str);
             // [apply_patch 中间层] 同 chat 路径:白名单逐条恢复已知格式错误(双边 @@ / 上下文失配 /
             // 空 Update+Move / 缺信封)。gemini args 一次性完整,无流式截断顾虑 → json_complete=true。
@@ -1615,92 +1778,44 @@ impl GeminiToResponsesConverter {
                     repairs: (!preflight_repairs.is_empty()).then_some(&preflight_repairs_val),
                 },
             );
-            emit_event(
+            self.emit_custom_tool_call(
                 out,
-                &mut self.sequence_number,
-                "response.output_item.added",
-                json!({
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {
-                        "type": "custom_tool_call",
-                        "id": item_id.clone(),
-                        "call_id": call_id.clone(),
-                        "name": name,
-                        "input": "",
-                        "status": "in_progress",
-                    },
-                }),
-            );
-            // incomplete 时跳过 input.delta + input.done —— 不发"输入已就绪"信号,
-            // 对齐 chat 路径(防 Codex 把畸形 patch 当 ready 去执行)。
-            if !incomplete {
-                emit_event(
-                    out,
-                    &mut self.sequence_number,
-                    "response.custom_tool_call_input.delta",
-                    json!({
-                        "type": "response.custom_tool_call_input.delta",
-                        "item_id": item_id.clone(),
-                        "output_index": output_index,
-                        "call_id": call_id.clone(),
-                        "delta": input.clone(),
-                    }),
-                );
-                emit_event(
-                    out,
-                    &mut self.sequence_number,
-                    "response.custom_tool_call_input.done",
-                    json!({
-                        "type": "response.custom_tool_call_input.done",
-                        "item_id": item_id.clone(),
-                        "output_index": output_index,
-                        "call_id": call_id.clone(),
-                        "input": input.clone(),
-                    }),
-                );
-            }
-            emit_event(
-                out,
-                &mut self.sequence_number,
-                "response.output_item.done",
-                json!({
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": {
-                        "type": "custom_tool_call",
-                        "id": item_id.clone(),
-                        "call_id": call_id.clone(),
-                        "name": name,
-                        "input": input.clone(),
-                        "status": status,
-                    },
-                }),
-            );
-            // incomplete 不写 cache —— 下一轮引用此 call_id 会拿到 incomplete 上下文反而
-            // 误导;让 orphan repair 路径补占位(对齐 chat 路径)。incomplete 时
-            // thoughtSignature 同样不存(签名属于完整调用,上游容忍缺失)。
-            if !incomplete {
-                crate::responses::global_tool_call_cache().save(
-                    &call_id,
-                    crate::responses::ToolCallEntry {
-                        name: name.to_owned(),
-                        arguments: args_json_str.clone(),
-                        thought_signature: cached_signature.clone(),
-                    },
-                );
-            }
-            self.closed_function_calls.push(ClosedFunctionCall {
-                item_id,
                 output_index,
+                item_id,
                 call_id,
-                name: name.to_owned(),
-                arguments_json_str: args_json_str,
-                namespace: None,
-                apply_patch_input: Some(input),
-                apply_patch_incomplete: incomplete,
-                tool_search_arguments: None,
-            });
+                &name,
+                input,
+                incomplete,
+                cached_signature,
+                args_json_str,
+            );
+            return;
+        }
+
+        // [MOC-88] 非 apply_patch 的 custom freeform 工具:请求侧注册为 type:custom
+        // (custom_tool_names 命中)→ 响应侧同样重打包成 custom_tool_call wire,与
+        // apply_patch 对称(请求侧 request.rs `"custom"` arm 本就对所有 custom 工具降级,
+        // 响应侧旧实现只认 apply_patch 造成不对称 —— 见 MOC-88)。但**不**走 apply_patch
+        // 的 V4A 中间层(格式恢复 / 后验校验 / 破坏性半应用防护)—— 那是 V4A patch 特有
+        // 语义;其他 custom 工具 input 是任意文本,取裸 input 原样透传、恒 completed。
+        // 此处 name != apply_patch(它已在上面分支处理);tool_search 是 type:tool_search、
+        // 不在 custom_tool_names,落下面分支。original_request 缺失时集合为空 → 不进此分支。
+        // 范围注:本判定仅 gemini_native 响应侧;chat 路径 `responses/converter.rs::
+        // close_tool_call` 对非 apply_patch 的 custom 工具仍 emit function_call(同款 latent
+        // 不对称,Codex 现无 apply_patch 之外的 custom freeform 工具,见 MOC-88 评论)。
+        if name != APPLY_PATCH_TOOL_NAME && self.custom_tool_names.contains(name) {
+            let input = crate::responses::extract_custom_tool_input(&args_json_str);
+            self.emit_custom_tool_call(
+                out,
+                output_index,
+                item_id,
+                call_id,
+                &name,
+                input,
+                /* incomplete = */ false,
+                cached_signature,
+                args_json_str,
+            );
             return;
         }
 
@@ -1791,8 +1906,8 @@ impl GeminiToResponsesConverter {
                 name: name.to_owned(),
                 arguments_json_str: args_json_str,
                 namespace: None,
-                apply_patch_input: None,
-                apply_patch_incomplete: false,
+                custom_tool_input: None,
+                custom_tool_incomplete: false,
                 tool_search_arguments: Some(arguments_value),
             });
             return;
@@ -1882,8 +1997,8 @@ impl GeminiToResponsesConverter {
             name: name.to_owned(),
             arguments_json_str: args_json_str,
             namespace: namespace_for,
-            apply_patch_input: None,
-            apply_patch_incomplete: false,
+            custom_tool_input: None,
+            custom_tool_incomplete: false,
             tool_search_arguments: None,
         });
     }
@@ -2786,21 +2901,16 @@ mod tests {
         let r = output.iter().find(|i| i["type"] == "reasoning").unwrap();
         assert_eq!(r["summary"][0]["text"], "thinking step");
 
-        // [MOC-203] content 通道双发(v26.608+ 渲染):delta/done + envelope content
-        assert!(names.contains(&"response.reasoning_text.delta".into()));
-        assert!(names.contains(&"response.reasoning_text.done".into()));
-        let text_done = events
-            .iter()
-            .map(|s| parse_event(s.as_str()))
-            .find(|(n, _)| n == "response.reasoning_text.done")
-            .unwrap();
-        assert_eq!(text_done.1["content_index"], 0);
-        // gemini 不注入 **Thinking** header,content 通道 = 原始思考文本
-        assert_eq!(text_done.1["text"], "thinking step");
+        // [单发 summary 通道] content 通道 reasoning_text.* 已移除(实测官方
+        // v26.623 summary-only 正常显示;双发致同一思考块重复更新闪烁)
+        assert!(
+            !names.contains(&"response.reasoning_text.delta".into())
+                && !names.contains(&"response.reasoning_text.done".into()),
+            "content 通道 reasoning_text 事件应已移除"
+        );
         // [MOC-218 第三关] item 不带 content / encrypted_content:OpenAI 后端
         // 对 input reasoning item 硬校验 content 数组长度 0,假 encrypted 有
-        // MOC-13 前科;content 通道只走 SSE 事件(上方断言),item 持久化形态
-        // 必须出生即合规(切真 GPT 历史原样上发)。
+        // MOC-13 前科;item 持久化形态必须出生即合规(切真 GPT 历史原样上发)。
         assert!(r.get("content").is_none(), "reasoning item 不得带 content");
         assert!(
             r.get("encrypted_content").is_none(),
@@ -3506,6 +3616,175 @@ mod tests {
             "顶级 function 不该带 namespace 字段,实际 {:?}",
             added.1["item"].get("namespace")
         );
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // [MOC-88] 响应侧 custom_tool_call 重打包判定:从 name-only(name=="apply_patch")
+    // 改成「请求侧注册为 type:custom」。下面四条端到端守住两类 latent 精度问题:
+    //   ① 碰撞:碰巧叫 apply_patch 的普通 function / MCP 工具不被误 repack(T1/T2)
+    //   ② 不对称:非 apply_patch 的 custom freeform 工具也被 repack(T3/T4)
+    // (现有 `new(None, None)` 的 apply_patch 测试群覆盖 original_request 缺失时
+    //  回落 name-only 的行为,故不重复。)
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// [MOC-88 碰撞] 请求侧把 `apply_patch` 登记为**普通 function**(非 type:custom)时,
+    /// Gemini 回的 functionCall 必须走 `function_call` wire(保留 args),**不**被误
+    /// repack 成 custom_tool_call(那会丢 args + 让 Codex 当 freeform patch 执行)。
+    #[test]
+    fn apply_patch_registered_as_function_not_repacked_to_custom() {
+        let original_request = json!({
+            "model": "gemini-3-flash",
+            "tools": [{"type": "function", "name": "apply_patch", "parameters": {
+                "type": "object", "properties": {"path": {"type": "string"}}
+            }}]
+        });
+        let mut conv = GeminiToResponsesConverter::new(Some(original_request), None);
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"path":"x"}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
+        assert!(
+            !names.contains(&"response.custom_tool_call_input.done".into()),
+            "登记为 function 的 apply_patch 不该 repack 成 custom_tool_call,events: {names:?}"
+        );
+        let added = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.output_item.added")
+            .unwrap();
+        assert_eq!(added.1["item"]["type"], "function_call");
+        let completed = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let item = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "apply_patch")
+            .unwrap();
+        assert_eq!(item["type"], "function_call");
+        let args: Value = serde_json::from_str(item["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args["path"], "x",
+            "function args 必须保留(不被 custom 打包丢弃)"
+        );
+    }
+
+    /// [MOC-88 碰撞-MCP 防御性] 名为 apply_patch 但来自 MCP namespace 包(type:function)
+    /// 的工具同样不被误 repack,且保留 namespace 路由字段。MOC-217 后 MCP 工具多 defer 到
+    /// tool_search、首轮 tools 不直接暴露,故现实少见;此测试守住历史回放等仍带 namespace 包
+    /// 的路径。
+    #[test]
+    fn apply_patch_in_mcp_namespace_not_repacked_to_custom() {
+        let original_request = json!({
+            "model": "gemini-3-flash",
+            "tools": [{"type": "namespace", "name": "mcp__foo__", "tools": [
+                {"type": "function", "name": "apply_patch"},
+            ]}]
+        });
+        let mut conv = GeminiToResponsesConverter::new(Some(original_request), None);
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
+        assert!(
+            !names.contains(&"response.custom_tool_call_input.done".into()),
+            "MCP namespace 的 apply_patch 不该 repack 成 custom_tool_call,events: {names:?}"
+        );
+        let added = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.output_item.added")
+            .unwrap();
+        assert_eq!(added.1["item"]["type"], "function_call");
+        assert_eq!(
+            added.1["item"]["namespace"], "mcp__foo__",
+            "namespace 路由字段必须保留"
+        );
+    }
+
+    /// [MOC-88 不对称] 非 apply_patch 的 custom freeform 工具(请求侧 type:custom 降级)
+    /// 回来也必须 repack 成 custom_tool_call wire —— 旧实现只认 apply_patch,其他 custom
+    /// 工具回成 function_call → Codex router 形态不符。input 取裸 `input` 文本。
+    #[test]
+    fn non_apply_patch_custom_tool_repacked_to_custom_tool_call() {
+        let original_request = json!({
+            "model": "gemini-3-flash",
+            "tools": [{"type": "custom", "name": "free_text_tool"}]
+        });
+        let mut conv = GeminiToResponsesConverter::new(Some(original_request), None);
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"free_text_tool","args":{"input":"hello world"}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
+        assert!(
+            names.contains(&"response.custom_tool_call_input.done".into()),
+            "非 apply_patch 的 custom 工具必须走 custom_tool_call wire,events: {names:?}"
+        );
+        assert!(
+            !names.contains(&"response.function_call_arguments.done".into()),
+            "不该走 function_call wire"
+        );
+        let added = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.output_item.added")
+            .unwrap();
+        assert_eq!(added.1["item"]["type"], "custom_tool_call");
+        let completed = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let item = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "free_text_tool")
+            .unwrap();
+        assert_eq!(item["type"], "custom_tool_call");
+        assert_eq!(item["input"], "hello world");
+        assert_eq!(item["status"], "completed");
+    }
+
+    /// [MOC-88 不对称-边界] 非 apply_patch custom 工具的 args 缺 `input` key 时整段原样
+    /// 透传(不 panic、不静默吞),仍走 custom_tool_call wire + completed(无 V4A 破坏性
+    /// 半应用风险,不 gate)。
+    #[test]
+    fn non_apply_patch_custom_tool_missing_input_passthrough() {
+        let original_request = json!({
+            "model": "gemini-3-flash",
+            "tools": [{"type": "custom", "name": "free_text_tool"}]
+        });
+        let mut conv = GeminiToResponsesConverter::new(Some(original_request), None);
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"free_text_tool","args":{}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
+        assert!(
+            names.contains(&"response.custom_tool_call_input.done".into()),
+            "缺 input 仍走 custom_tool_call wire,events: {names:?}"
+        );
+        let completed = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let item = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "free_text_tool")
+            .unwrap();
+        assert_eq!(item["type"], "custom_tool_call");
+        assert_eq!(item["input"], "{}", "缺 input 时整段 args 原样透传");
+        assert_eq!(item["status"], "completed");
     }
 
     /// [MOC-75 devin BUG 回归] `build_assistant_message_for_session` 必须把

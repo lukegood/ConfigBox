@@ -18,8 +18,8 @@
 //! - ✅ Gemini 3+ 用 v1alpha endpoint(LiteLLM `common_utils.py:412`)
 //! - ✅ Gemini 3+ 默认 temperature=1.0(LiteLLM 实证 < 1 触发 infinite loop)
 //! - ✅ thinkingConfig:Gemini 3+ 用 thinkingLevel,Gemini 2.x 用 thinkingBudget
-//! - ✅ schema sanitize 增强(enum 空字符串 → null / anyOf null → nullable /
-//!   object type 默认 / additionalProperties+strict+$schema+$id 剥)
+//! - ✅ schema sanitize 增强(enum 空字符串 → null / 非 string 类型 enum 删除 /
+//!   anyOf null → nullable / object type 默认 / additionalProperties+strict+$schema+$id 剥)
 //!
 //! Should 范围(Codex.app 当前不发,**留 TODO follow-up**):
 //! - 🔵 audio/speechConfig / computer_use / google_maps / url_context /
@@ -35,7 +35,7 @@ use serde_json::{json, Map, Value};
 use crate::core::input::response_id_for_session;
 use crate::responses::request::tools::{
     APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT, APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT,
-    APPLY_PATCH_TOOL_NAME,
+    APPLY_PATCH_TOOL_NAME, TOOL_SEARCH_BY_NAME_HINT,
 };
 use crate::responses::ResponseSessionCache;
 use crate::types::{AdapterError, ResponseSessionPlan};
@@ -102,6 +102,8 @@ pub fn responses_body_to_gemini_request_with_session(
             None,
             session_cache,
         )?;
+    // [MOC-232] context_breakdown 已在 with_session 内部起 spawn_blocking 后台算 + 落盘,
+    // 此处不再读取/透传(搬离转发关键路径)。
     let merged_messages = responses_conversion.response_session.messages;
     let normalized_messages = responses_conversion
         .body
@@ -545,6 +547,10 @@ fn responses_input_to_chat_messages(
                     .unwrap_or("")
                     .trim()
                     .to_owned();
+                // [#262 followup] 中文用户下把英文 summary 前缀换成中文,消除 compact
+                // 后上游(gemini contents)里的英文 framing(语言漂移真因)。
+                let summary =
+                    crate::responses::compact::localize_compaction_summary_prefix(&summary);
                 if !summary.is_empty() {
                     // flush pending assistant 再灌 user summary,保证顺序
                     flush_assistant(
@@ -712,6 +718,9 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                     .get("description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                // [MOC-296] 上游 description 末尾追加「按名补搜」规则(共享常量,
+                // 与 chat 路径同一注入;见 tools.rs::TOOL_SEARCH_BY_NAME_HINT doc)。
+                let description = format!("{description}{TOOL_SEARCH_BY_NAME_HINT}");
                 // **Gemini-specific(与 chat 路径有意分歧)**:Codex 真机的 `tool_search` 工具
                 // **省略 `parameters`**(trace 实证:只有 type/execution/description)。chat 路径
                 // fallback 空 object schema 仍 work —— chat 模型能从 description 推断要传 BM25
@@ -759,7 +768,7 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                 }
                 let mut func = Map::new();
                 func.insert("name".into(), Value::String("tool_search".into()));
-                func.insert("description".into(), Value::String(description.to_owned()));
+                func.insert("description".into(), Value::String(description));
                 func.insert("parameters".into(), parameters);
                 let mut wrapper = Map::new();
                 wrapper.insert("type".into(), Value::String("function".into()));
@@ -1028,16 +1037,17 @@ pub fn chat_normalized_to_gemini_request(
     // 返 "Built-in tools ({google_search}) and Function Calling cannot be combined
     // in the same request."
     //
-    // 处理(2026-05-11 对齐 cliproxy):**所有 Gemini 版本统一 drop `googleSearch`**,
-    // 不再注入 systemInstruction 软约束。Gemini 3+ 之前用
-    // `toolConfig.includeServerSideToolInvocations=true` 让两者共存,但用户实测发现
-    // 该参数 + 自动联网会让模型语义偏移,且 cliproxy 不实现 web_search → 维持同一行为
-    // 更可预测。模型若需要联网信息,可用 function-calling 工具(如 `exec_command + curl`)
-    // 自适应替代。
+    // 处理([MOC-208] 2026-06-15 起**无条件**;2026-05-11 起对齐 cliproxy):**所有
+    // Gemini 版本一律 drop `googleSearch`**,不再注入 systemInstruction 软约束。
+    // 原本仅在与 functionDeclarations 共存时 drop(Gemini 拒共存、返 400),但本项目
+    // 已决定关闭所有 provider 的原生 web search(改走自研 web_fetch/web_search,MOC-190),
+    // 故即便单独出现 googleSearch(无 function 工具的边界请求)也一并丢弃,不再依赖
+    // 共存条件。Gemini 3+ 之前 `toolConfig.includeServerSideToolInvocations=true` 共存
+    // 路径已弃(用户实测会让模型语义偏移)。模型需联网走自研 web_search/web_fetch。
     let has_google_search = tools
         .as_ref()
         .is_some_and(|t| t.iter().any(|tool| tool.google_search.is_some()));
-    if has_function_decls && has_google_search {
+    if has_google_search {
         if let Some(tools_vec) = tools.as_mut() {
             tools_vec.retain(|tool| tool.google_search.is_none());
             if tools_vec.is_empty() {
@@ -1045,7 +1055,7 @@ pub fn chat_normalized_to_gemini_request(
             }
         }
         tracing::info!(
-            "gemini_native: dropped wire googleSearch tool because functionDeclarations cannot coexist on Gemini (cliproxy-aligned; no soft-constraint injection)."
+            "gemini_native: dropped wire googleSearch tool (MOC-208: provider-native web search disabled, use self-built web_search/web_fetch)."
         );
     }
 
@@ -1379,6 +1389,15 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
         });
     }
 
+    // [MOC-250] 合并相邻同 role 的 Content。computer-use 截图在 responses→chat 折叠时被
+    // 提升为 tool 结果之后的独立 user message,转 Gemini 后会产出
+    // `[user(functionResponse), user(inlineData)]` 两个**连续 user content**;而 Gemini wire
+    // 要求 user/model 严格交替(见下方注释),连续 user 会 400。合并成单个 user turn
+    // (functionResponse + 截图 inlineData 同 turn)正是 Gemini computer-use 的标准形态,
+    // 也对齐 LiteLLM 对相邻同 role 的 parts 合并。非破坏:仅把相邻同 role 的 parts 顺序拼接,
+    // 不跨非同 role 边界,等价于「同一 turn 多个 part」。
+    let mut contents = merge_adjacent_same_role_contents(contents);
+
     // **Gemini wire 严格要求**(2026-05-10 实测 400):"function call turn comes
     // immediately after a user turn or after a function response turn" — contents
     // 必须以 user role 开头(且 user/model 严格交替)。Codex.app 多轮 session resume
@@ -1410,6 +1429,20 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
 
 fn role_of(msg: &Value) -> &str {
     msg.get("role").and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// [MOC-250] 合并相邻同 role 的 [`Content`](parts 顺序拼接)。用于消除 computer-use 截图
+/// 提升产生的连续 user content(Gemini 要求 user/model 交替)。只在相邻 role 相同时合并,
+/// 不跨非同 role 边界,语义等价于「同一 turn 里多个 part」。
+fn merge_adjacent_same_role_contents(contents: Vec<Content>) -> Vec<Content> {
+    let mut merged: Vec<Content> = Vec::with_capacity(contents.len());
+    for c in contents {
+        match merged.last_mut() {
+            Some(last) if last.role == c.role => last.parts.extend(c.parts),
+            _ => merged.push(c),
+        }
+    }
+    merged
 }
 
 /// 取 call_id 对应的 thoughtSignature(P1-B — Gemini 3 多轮 thinking roundtrip;
@@ -1753,6 +1786,8 @@ fn function_object_to_declaration(func: Option<&Value>) -> Option<FunctionDeclar
 ///   思路 — 旧实现直接 remove $ref/$defs 导致引用断 + schema 不完整)
 /// - 剥 OpenAPI 高级 keyword(`additionalProperties` / `strict` / `$schema` / `$id`)
 /// - enum 内空字符串 → null(LiteLLM `_fix_enum_empty_strings:466`)
+/// - 非 string 类型字段的 enum **删除**(MOC-251;LiteLLM `_fix_enum_types` —— Gemini/Vertex
+///   只允许 string 字段带 enum,整数 enum 原样发出会 400 `enum[0] (TYPE_STRING)`)
 /// - anyOf 单一 null branch → 当作 nullable + 提取另一 branch(LiteLLM
 ///   `convert_anyof_null_to_nullable:745`)
 /// - object 类型未指定 properties 时补 `properties:{}`(Gemini 强制要求)
@@ -1926,6 +1961,32 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                 }
                 // 其他形态(多 non-null / pure null)— anyOf 字段**保留**不剥,
                 // Gemini 自己 validate(它文档支持 anyOf union type)
+            }
+            // [MOC-251] Gemini/Vertex 只允许 **string 类型**字段带 enum(对齐 LiteLLM
+            // `_fix_enum_types`)。非 string-typed 的 enum(如 integer 枚举)原样发出 → 上游
+            // 400(`enum[0] (TYPE_STRING), <int>`,computer-use 工具实测)。**删 enum 保 type**
+            // (不主动破坏性降级:只去 Gemini 表达不了的枚举约束,类型/参数语义不动)。
+            // **必须放在上面 anyOf nullable 折叠之后**:折叠会把单 non-null branch 的 type+enum
+            // 拷到 parent 再删 anyOf,而递归只 visit 子值、不重查 parent —— 剪枝若在折叠前跑,
+            // anyOf 包裹的整数 enum(`{anyOf:[{type:integer,enum:[1,2]},{type:null}]}`)会漏过去、
+            // 同样 400(#497 bot review P2)。type 数组已归一为单 string;空串已转 null。保留判定:
+            //   - type 显式 == "string" → 保留
+            //   - typeless 但 enum 值全是 string/null(纯字符串枚举,空串已转 null)→ 保留
+            //   - 其余(type 显式非 string,或 typeless 含整数等非字符串值)→ 删 enum
+            // **gate 在 `enum` 值确实是数组**:enum 关键字值永远是数组;若工具参数名恰好叫
+            // `enum`(在 `properties` map 里它是 schema 对象、非枚举数组),不能当 enum 关键字删
+            // (否则参数丢失 + `required:["enum"]` 悬空,#497 bot review P2 round-2)。
+            if obj.get("enum").is_some_and(|e| e.is_array()) {
+                let keep_enum = match obj.get("type").and_then(|t| t.as_str()) {
+                    Some(t) => t.eq_ignore_ascii_case("string"),
+                    None => obj
+                        .get("enum")
+                        .and_then(|e| e.as_array())
+                        .is_some_and(|arr| arr.iter().all(|v| v.is_string() || v.is_null())),
+                };
+                if !keep_enum {
+                    obj.remove("enum");
+                }
             }
             // oneOf / allOf:**刻意不处理、原样透传**(MOC-205 / codex 0.139 #24118+#27084)。
             // ai.google.dev 的 Schema 字段表只列 anyOf、未列 oneOf/allOf,LiteLLM
@@ -3044,20 +3105,24 @@ mod tests {
     }
 
     #[test]
-    fn responses_to_gemini_with_web_search_emits_google_search_tool() {
-        // 关键端到端回归:Codex.app /responses + tools=[web_search] →
-        // Gemini RequestBody 必须含 tools=[{googleSearch:{}}]
+    fn responses_to_gemini_with_web_search_drops_google_search_unconditionally() {
+        // [MOC-208] 关闭所有 provider 原生 web search:即便 tools 只含 web_search
+        // (无 function 工具的边界请求),也**无条件** drop googleSearch,不发上游。
+        // 模型改走自研 web_search/web_fetch。
         let body = serde_json::json!({
             "model":"gemini-3.1-pro-preview",
             "input":[{"type":"message","role":"user","content":"今天纽约天气?"}],
             "tools":[{"type":"web_search","external_web_access":true}]
         });
         let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
-        let tools = req.tools.expect("tools 应存在");
+        let has_google_search = req
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|t| t.google_search.is_some()));
         assert!(
-            tools.iter().any(|t| t.google_search.is_some()),
-            "必须含 googleSearch tool;实际:{}",
-            serde_json::to_string(&tools).unwrap()
+            !has_google_search,
+            "googleSearch 必须被无条件 drop;实际 tools:{}",
+            serde_json::to_string(&req.tools).unwrap()
         );
     }
 
@@ -3143,6 +3208,95 @@ mod tests {
         assert_eq!(arr[0], "a");
         assert!(arr[1].is_null(), "空字符串必须转 null");
         assert_eq!(arr[2], "b");
+    }
+
+    #[test]
+    fn schema_sanitize_drops_enum_on_non_string_type() {
+        // [MOC-251] Gemini/Vertex 只允许 string 字段带 enum;整数 enum 原样发出 → 上游 400
+        // (`enum[0] (TYPE_STRING), <int>`,computer-use 工具实测)。type 非 string → 删 enum
+        // 保 type;string-typed enum 保留。
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "button": {"type": "integer", "enum": [1, 2, 3]},
+                "mode": {"type": "string", "enum": ["fast", "slow"]},
+                "ratio": {"type": "number", "enum": [0.5, 1.0]},
+            }
+        });
+        let cleaned = sanitize_schema(schema);
+        let btn = &cleaned["properties"]["button"];
+        assert!(
+            btn.get("enum").is_none(),
+            "integer-typed enum 必须删掉(Gemini 拒非 string enum)"
+        );
+        assert_eq!(btn["type"], "integer", "type 必须保留不动");
+        assert_eq!(
+            cleaned["properties"]["mode"]["enum"],
+            serde_json::json!(["fast", "slow"]),
+            "string-typed enum 必须保留"
+        );
+        assert!(
+            cleaned["properties"]["ratio"].get("enum").is_none(),
+            "number-typed enum 同样删掉"
+        );
+    }
+
+    #[test]
+    fn schema_sanitize_keeps_typeless_string_enum_drops_typeless_int_enum() {
+        // typeless 纯字符串 enum 保留(不回归 enum_empty_string_to_null 既有行为);
+        // typeless 含整数等非字符串值的 enum 删掉(Gemini enum ⟹ string)。
+        let cleaned_str = sanitize_schema(serde_json::json!({"enum": ["a", "b"]}));
+        assert_eq!(cleaned_str["enum"], serde_json::json!(["a", "b"]));
+        let cleaned_int = sanitize_schema(serde_json::json!({"enum": [1, 2]}));
+        assert!(
+            cleaned_int.get("enum").is_none(),
+            "typeless 整数 enum 必须删"
+        );
+    }
+
+    #[test]
+    fn schema_sanitize_drops_enum_from_nullable_anyof_integer() {
+        // [#497 bot review P2] nullable 整数 enum 用 anyOf 表达:
+        // `{anyOf:[{type:integer,enum:[1,2]},{type:null}]}` → anyOf nullable 折叠把
+        // 非 null branch 的 type+enum 拷到 parent;enum 剪枝必须在折叠**后**跑,否则
+        // 整数 enum 漏给 Gemini → 同样 400。
+        let schema = serde_json::json!({
+            "anyOf": [
+                {"type": "integer", "enum": [1, 2]},
+                {"type": "null"}
+            ]
+        });
+        let cleaned = sanitize_schema(schema);
+        assert_eq!(
+            cleaned["type"], "integer",
+            "非 null branch 的 type 应折叠到 parent"
+        );
+        assert_eq!(cleaned["nullable"], true, "null branch → nullable");
+        assert!(cleaned.get("anyOf").is_none(), "anyOf 已折叠");
+        assert!(
+            cleaned.get("enum").is_none(),
+            "anyOf 折叠上来的整数 enum 必须被剪掉(否则 Gemini 400)"
+        );
+    }
+
+    #[test]
+    fn schema_sanitize_keeps_property_named_enum() {
+        // [#497 bot review P2 round-2] 工具参数名恰好叫 "enum"(值是 schema 对象、非枚举数组)
+        // 不能被当成 enum 关键字删掉(否则参数丢失 + required:["enum"] 悬空)。
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "enum": {"type": "string", "description": "a param literally named enum"}
+            },
+            "required": ["enum"]
+        });
+        let cleaned = sanitize_schema(schema);
+        assert!(
+            cleaned["properties"]["enum"].is_object(),
+            "名为 enum 的参数必须保留"
+        );
+        assert_eq!(cleaned["properties"]["enum"]["type"], "string");
+        assert_eq!(cleaned["required"], serde_json::json!(["enum"]));
     }
 
     #[test]
@@ -3401,6 +3555,21 @@ mod tests {
             names.contains(&"exec_command".to_owned()),
             "普通 function 也保留;实际:{names:?}"
         );
+        // [MOC-296] gemini 路径同样追加「按名补搜」规则(与 chat 共享常量)。
+        let ts_desc = req
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.function_declarations.as_ref())
+            .flatten()
+            .find(|d| d.name == "tool_search")
+            .and_then(|d| d.description.as_deref())
+            .expect("tool_search functionDeclaration 必须有 description");
+        assert!(
+            ts_desc.contains("BM25") && ts_desc.ends_with(TOOL_SEARCH_BY_NAME_HINT),
+            "description 应为上游原文 + 按名补搜规则;实际:{ts_desc}"
+        );
         // [MOC-217] Codex 真机省略 tool_search.parameters(本 case 也是)。Gemini 严格按 schema,
         // 空 properties 会让模型返 {} 而非 BM25 query → 发现不了工具 → 死循环。必须合成显式
         // `query` schema(chatgpt-codex-connector review 实证)。
@@ -3500,6 +3669,92 @@ mod tests {
         assert!(
             names.contains(&"tool_search".to_owned()),
             "tool_search 本身仍保留(模型可继续 query 更多);实际:{names:?}"
+        );
+    }
+
+    // ───────── [MOC-250] computer-use 截图提升 → Gemini inlineData ─────────
+
+    #[test]
+    fn merge_adjacent_same_role_contents_coalesces_consecutive_user() {
+        let part = |t: &str| Part {
+            text: Some(t.to_owned()),
+            ..Default::default()
+        };
+        let contents = vec![
+            Content {
+                role: "user".into(),
+                parts: vec![part("a")],
+            },
+            Content {
+                role: "user".into(),
+                parts: vec![part("b")],
+            },
+            Content {
+                role: "model".into(),
+                parts: vec![part("c")],
+            },
+            Content {
+                role: "user".into(),
+                parts: vec![part("d")],
+            },
+        ];
+        let merged = merge_adjacent_same_role_contents(contents);
+        assert_eq!(merged.len(), 3, "相邻两个 user 应合并");
+        assert_eq!(merged[0].role, "user");
+        assert_eq!(merged[0].parts.len(), 2, "合并后 parts 顺序拼接");
+        assert_eq!(merged[1].role, "model");
+        assert_eq!(merged[2].role, "user");
+    }
+
+    #[test]
+    fn computer_use_screenshot_becomes_inline_data_in_function_response_turn() {
+        // 整链路:Codex /responses(function_call + 含图 function_call_output)→ Gemini wire。
+        // 截图必须作为 inlineData(真图)落在 functionResponse 同一个 user turn,
+        // 不得变成 base64 文本、也不得产生连续 user content(Gemini 会 400)。
+        let body = json!({
+            "model": "gemini-3-flash-agent",
+            "stream": true,
+            "input": [
+                {"type":"function_call","call_id":"call_1","name":"screenshot","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":[
+                    {"type":"input_text","text":"Wall time: 0.2s"},
+                    {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/SHOT","detail":"high"}
+                ]}
+            ]
+        });
+        let p = dummy_provider();
+        let req = responses_body_to_gemini_request_with_session(&body, &p, None).unwrap();
+        let wire = serde_json::to_value(&req.request).unwrap();
+        let contents = wire["contents"].as_array().expect("contents 数组");
+        let wire_s = serde_json::to_string(&req.request).unwrap();
+
+        // 1. 截图作为 inlineData(真图),不是 base64 文本里的 functionResponse
+        assert!(
+            wire_s.contains("inlineData"),
+            "截图应作为 inlineData: {wire_s}"
+        );
+
+        // 2. 无连续 user content(合并已生效)
+        let mut prev = "";
+        for c in contents {
+            let role = c["role"].as_str().unwrap_or("");
+            assert!(
+                !(role == "user" && prev == "user"),
+                "不应出现连续 user content(Gemini 会 400): {wire_s}"
+            );
+            prev = role;
+        }
+
+        // 3. functionResponse 与截图 inlineData 合并进同一个 user turn
+        let has_merged_turn = contents.iter().any(|c| {
+            let parts = c["parts"].as_array().cloned().unwrap_or_default();
+            let has_inline = parts.iter().any(|p| p.get("inlineData").is_some());
+            let has_fr = parts.iter().any(|p| p.get("functionResponse").is_some());
+            has_inline && has_fr
+        });
+        assert!(
+            has_merged_turn,
+            "functionResponse 与截图 inlineData 应在同一 user turn: {wire_s}"
         );
     }
 }

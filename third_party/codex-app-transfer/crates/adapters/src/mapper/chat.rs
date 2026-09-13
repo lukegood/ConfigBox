@@ -53,6 +53,15 @@ pub(crate) fn prepare_responses_request(
     }
 
     let upstream_path = routes::redirect_responses_to_chat(client_path);
+    // 空 / 纯空白请求体:Codex reconnect / warmup 探活落到 HTTP /responses 时会发零字节体,
+    // 裸 serde 报 "expected value at line 1 column 1",经 forward.rs 包成 "proxy adapter error:
+    // bad request: body 不是合法 JSON" 吓人且无指向。给明确人类可读信息(防御性 —— 根因是
+    // 上游错误触发 Codex 反复重连,已由 usage_limit_reached fail-fast 在源头切断)。
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Err(AdapterError::BadRequest(
+            "空请求体:未携带 /responses JSON(通常是连接探活 / warmup 帧,可忽略)".to_owned(),
+        ));
+    }
     let parsed: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| AdapterError::BadRequest(format!("body 不是合法 JSON: {e}")))?;
     let original_responses_request = Some(parsed.clone());
@@ -63,12 +72,18 @@ pub(crate) fn prepare_responses_request(
     )?;
     let new_body = serde_json::to_vec(&conversion.body)
         .map_err(|e| AdapterError::Internal(format!("re-serialize: {e}")))?;
-    // fix(#210 P1-1): 传递 history_lost 标志到 adapter_metadata,
-    // transform_response_stream 据此注入 X-Session-History-Lost header
-    let adapter_metadata = if conversion.history_lost {
-        Some(serde_json::json!({"history_lost": true}))
-    } else {
+    // adapter_metadata 是 adapter→proxy 内部通道(不进 user-facing 协议):
+    // - fix(#210 P1-1): history_lost → transform_response_stream 注入 X-Session-History-Lost header
+    // [MOC-232] context_breakdown 不再经此透传 —— 改由 responses::request 内
+    // spawn_blocking 后台算并直接按对话 uuid 落盘(搬离转发关键路径,见 context_breakdown.rs)。
+    let mut metadata = serde_json::Map::new();
+    if conversion.history_lost {
+        metadata.insert("history_lost".into(), serde_json::json!(true));
+    }
+    let adapter_metadata = if metadata.is_empty() {
         None
+    } else {
+        Some(serde_json::Value::Object(metadata))
     };
     Ok(RequestPlan {
         upstream_path,

@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use codex_app_transfer_gemini_oauth::ZaiProvider;
 use codex_app_transfer_registry::model_alias::{
     normalize_model_mappings, openai_model_slot, provider_slug, strip_internal_model_suffix,
 };
@@ -56,6 +57,33 @@ pub enum AuthScheme {
     ///
     /// Cookie 不在 provider.api_key,而在 `provider.extra["grokWeb"]["cookies"]` JSON object。
     GrokCookie,
+    /// z.ai / bigmodel(GLM **Coding Plan** 账号登录)。换出的**组织 API key** 不在
+    /// `provider.api_key`,由 `gemini_oauth::zai::ZaiCredentialStore` 持久化
+    /// (`~/.codex-app-transfer/{zai,bigmodel}-oauth.json`)+ 请求时 load(**无 refresh**,
+    /// 过期/未登录 → needs_login)。打 [`ZaiProvider::config().model_base`] 的 Anthropic
+    /// Messages wire,forward.rs 注 `Authorization: Bearer <org_key>` + ZCode 指纹头。
+    /// 内含 [`ZaiProvider`] 区分 z.ai vs bigmodel(两者 model_base / token 文件不同)。
+    ZaiOauth(ZaiProvider),
+    /// WorkBuddy(腾讯 CodeBuddy)账号登录。access token 不在 `provider.api_key`,
+    /// 由 `gemini_oauth::workbuddy::WorkbuddyCredentialStore` 持久化
+    /// (`~/.codex-app-transfer/workbuddy-oauth.json`)+ 请求时 `ensure_valid_workbuddy_token`
+    /// load + **自动 refresh**(`X-Refresh-Token` 头)。打 `copilot.tencent.com/v2/chat/completions`
+    /// 的 OpenAI Chat 兼容 wire,forward.rs 注 `Authorization: Bearer <access_token>` +
+    /// 完整 coding 模式指纹头(与 API-key 路 `workbuddy` preset 对齐)。
+    WorkbuddyOauth,
+    /// QoderWork CN(阿里 Qoder)legacy 模型通道:鉴权由 WASM(`qoder_auth`)生成的
+    /// **Cosy 签名**(`Authorization: Bearer COSY.<sig>` + 一整套 `Cosy-*` 头 + AES-GCM
+    /// 加密 body),host 钉死 `gateway.qoder.com.cn`。device token 由
+    /// `gemini_oauth::qoder` 多账号池持久化 + 请求时 refresh。签名/加密/整份出站
+    /// url+header+body 在 `forward.rs` 的 build_and_send_upstream QoderCosy 分支产出。
+    QoderCosy,
+    /// grok build(xAI grok CLI 编码后端)账号登录。access token 不在 `provider.api_key`,
+    /// 由 `gemini_oauth::grok_build::GrokBuildCredentialStore` 持久化
+    /// (`~/.codex-app-transfer/grok-build-oauth.json`)+ 请求时 `ensure_valid_grok_build_token`
+    /// load + **自动 refresh**(`accounts.x.ai/oauth2/token`,grant_type=refresh_token)。打
+    /// `cli-chat-proxy.grok.com/v1/responses` 的 OpenAI Responses wire(passthrough),
+    /// forward.rs 注 `Authorization: Bearer <access_token>` + 完整 grok-shell 客户端指纹头。
+    GrokBuildOauth,
     /// 不写鉴权头(上游免认证 / 走 cookie 等少见情况).
     None,
 }
@@ -75,6 +103,11 @@ impl AuthScheme {
                 AuthScheme::GoogleOauthAntigravity
             }
             "grok_cookie" | "grok" | "grok_web" => AuthScheme::GrokCookie,
+            "zai_oauth" | "zai" => AuthScheme::ZaiOauth(ZaiProvider::Zai),
+            "bigmodel_oauth" | "bigmodel" => AuthScheme::ZaiOauth(ZaiProvider::BigModel),
+            "workbuddy_oauth" | "workbuddy_login" => AuthScheme::WorkbuddyOauth,
+            "qoder_oauth" | "qoder" | "qoder_cosy" => AuthScheme::QoderCosy,
+            "grok_build_oauth" | "grok_build" | "grokbuild" => AuthScheme::GrokBuildOauth,
             "" | "none" | "no" => AuthScheme::None,
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)
             _ => AuthScheme::Bearer,
@@ -198,15 +231,27 @@ impl StaticResolver {
         if token == expected {
             return Ok(());
         }
-        // [MOC-104 relay / connector P1 review] relay 模式活动 `~/.codex/auth.json` 是真实
-        // chatgpt,Codex 模型请求发的是 chatgpt access_token(JWT,**不是** cas_ gateway key);
-        // 放行让 `decide_provider` 按 active_provider 转发(不依赖 gateway key)。但**只验 JWT
-        // claim 不够** —— 攻击者可自造未签名、payload 含 chatgpt_account_id 的三段 JWT 绕过
-        // gateway key 花用户 provider 凭据(proxy 无 OpenAI 公钥、无法验签名)。故放行条件收紧
-        // 为:形状是 chatgpt JWT **且逐字 == 本地活动 auth.json 里 Codex 真在用的 access_token**
-        // —— 自造 token 不匹配本地真 token 即拒。实时读盘(relay 下 transfer 不刷新、Codex 自刷
-        // auth.json,构造时传会 stale)。安全锚:放行的凭据来自本地 auth 文件、而非未签名 claim。
-        if is_chatgpt_access_token(token) && token_matches_active_chatgpt(token) {
+        // [MOC-546] gateway 宽松化:精确匹配失败后,若 token 仍符合 cas_ 格式则放行。
+        // gateway 定位为防误调用而非防攻击(真安全在本地文件权限),cas_ 格式校验足以
+        // 区分"被 transfer 配置过的 Codex"与"不相干的外部请求"。消除 gateway key 双写
+        // (proxy config ↔ auth.json)不一致导致的间歇性 401(Refs #546):无论双写怎么
+        // 漂移,两边都是 cas_ 格式,格式兜底恒放行。与 MOC-189 relay JWT 形状校验同思路。
+        if is_cas_gateway_key(token) {
+            return Ok(());
+        }
+        // [MOC-189] relay 模式活动 `~/.codex/auth.json` 是真实 chatgpt,Codex 的**模型请求**
+        // 发的是 chatgpt access_token(JWT,**不是** cas_ gateway key);放行让 `decide_provider`
+        // 按 active_provider 转发到第三方 provider(用 provider 自己的 key,GPT JWT 不出本机、
+        // 被 `forward::is_strip_on_forward` 剥掉)。
+        //
+        // 这里**只验形状**(chatgpt JWT),**不再**要求逐字匹配本地 auth.json(放宽 MOC-124 SEC-1):
+        // - 鉴权的真实边界是 proxy 只绑 `127.0.0.1`(`proxy_runner.rs`)+ apikey 模式的 cas_ 兜底。
+        //   能连 loopback 又能伪造 chatgpt 形状 JWT 的本机进程,本就能直接读 auth.json 拿真 token,
+        //   逐字匹配挡不住该威胁、属冗余门槛。
+        // - 旧的逐字匹配把「第三方对话可用性」错误绑死在 ChatGPT token 匹配状态上:token 轮换竞态 /
+        //   `CODEX_HOME` 读串 / 未真正登 ChatGPT 都会让模型请求 401 → Codex WS idle timeout → 对话
+        //   卡死。而 GPT JWT 功能上只服务 `/backend-api/*` 透传,坏了应只影响 plugins/账号,不该拖垮对话。
+        if is_chatgpt_access_token(token) {
             return Ok(());
         }
         Err(ResolveError::Unauthorized)
@@ -286,8 +331,34 @@ impl ProviderResolver for StaticResolver {
             AuthScheme::GoogleOauthAntigravity => {
                 "https://daily-cloudcode-pa.googleapis.com".to_string()
             }
+            // z.ai/bigmodel:上游 base 按 provider 钉死(`api.z.ai/api/anthropic` /
+            // `open.bigmodel.cn/api/anthropic`),不允许用户 baseUrl 漂移
+            AuthScheme::ZaiOauth(zai_provider) => zai_provider.config().model_base.to_string(),
+            // WorkBuddy 账号登录:access token scoped 给 copilot.tencent.com,强制 pin 官方
+            // 网关 base,防 user 把 authScheme=workbuddy_oauth 配到任意 baseUrl 致账号 token
+            // 外泄到非官方 host(codex review P2)。
+            AuthScheme::WorkbuddyOauth => "https://copilot.tencent.com/v2".to_string(),
+            AuthScheme::QoderCosy => "https://gateway.qoder.com.cn".to_string(),
+            // grok build:access token scoped 给 cli-chat-proxy.grok.com,pin 官方端点防
+            // user 把 authScheme=grok_build_oauth 配到任意 baseUrl 致账号 token 外泄到非官方
+            // host(同 WorkBuddy/Qoder 先例)。preset baseUrl 已带 /v1,pin 与之一致。
+            AuthScheme::GrokBuildOauth => "https://cli-chat-proxy.grok.com/v1".to_string(),
             _ => provider.base_url.clone(),
         };
+
+        // ZaiOauth:把 forced base 也写回转发用的 provider.base_url。anthropic_messages
+        // adapter 的 path 由 `build_anthropic_messages_upstream_path(&provider.base_url)`
+        // 推导(末尾是否 `/v1` 决定 `/messages` vs `/v1/messages`);若仍用用户漂移的
+        // base_url(如手填成 `…/api/anthropic/v1`)会得到 `/messages`,跟 forced base
+        // `…/api/anthropic` 拼成缺 `/v1` 的错误 URL。让 path 与 forced base 同源根治
+        // (bot P2)。cloudcode/antigravity 走 gemini_cli adapter、path 逻辑不同,不动。
+        let mut forwarded_provider = provider.clone();
+        if matches!(
+            auth_scheme,
+            AuthScheme::ZaiOauth(_) | AuthScheme::WorkbuddyOauth
+        ) {
+            forwarded_provider.base_url = upstream_base.clone();
+        }
 
         Ok(ResolvedProvider {
             provider_id: provider.id.clone(),
@@ -296,7 +367,7 @@ impl ProviderResolver for StaticResolver {
             auth_scheme,
             extra_headers: extras,
             rewritten_model,
-            provider: Arc::new(provider.clone()),
+            provider: Arc::new(forwarded_provider),
         })
     }
 }
@@ -352,31 +423,16 @@ fn is_chatgpt_access_token(token: &str) -> bool {
         .is_some_and(|s| !s.trim().is_empty())
 }
 
-/// [connector P1 review] relay 放行的安全锚:incoming token 必须**逐字 == 本地活动
-/// `auth.json` 里 Codex 真在用的 `tokens.access_token`。仅验 JWT claim
-/// ([`is_chatgpt_access_token`])挡不住自造的未签名 chatgpt 形状 JWT —— proxy 无 OpenAI
-/// 公钥、无法验签名,故改以「本地真 token 比对」作为身份证明:能发出 == 本地 access_token
-/// 的请求,等于已持有 auth.json,同样能拿 config 里的 cas_ gateway key,门槛相同;自造 token
-/// 不匹配即拒。**实时读盘**:relay 下 transfer 不刷新、Codex 自刷 auth.json,缓存/构造时传
-/// 会 stale 拒掉刚刷新的真 token。proxy 不依赖 codex_integration,按 `CODEX_HOME`(优先)/
-/// `~/.codex` 自拼路径读;读失败 / 非 chatgpt / 不匹配 → false(回退到只认 cas_)。
-fn token_matches_active_chatgpt(token: &str) -> bool {
-    let base = std::env::var_os("CODEX_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex")));
-    let Some(path) = base.map(|b| b.join("auth.json")) else {
-        return false;
-    };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return false;
-    };
-    v.get("tokens")
-        .and_then(|t| t.get("access_token"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|active| !active.is_empty() && active == token)
+/// 判断 token 是否是 cas_ 格式的 gateway key。用于 check_gateway 的格式兜底:
+/// gateway 定位为防误调用而非防攻击(真安全在本地文件权限),cas_ 格式校验足以区分
+/// "被 transfer 配置过的 Codex"与"外部误连"。容忍双写不一致的旧 key 版本(Refs #546)。
+/// 格式与 conversation_export::redact 的 `cas_[A-Za-z0-9_-]{12,}` 正则一致。
+fn is_cas_gateway_key(token: &str) -> bool {
+    let rest = token.strip_prefix("cas_").unwrap_or("");
+    rest.len() >= 12
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// 让裸 Resolver 可装进 `Arc<dyn ProviderResolver>`(给 ProxyState 共享用).
@@ -485,6 +541,59 @@ mod tests {
             AuthScheme::parse("Google-OAuth-Antigravity"),
             AuthScheme::GoogleOauthAntigravity
         );
+
+        // z.ai / bigmodel(MOC-252):别名误归 Bearer 会让 forward.rs 跳过组织 key load
+        // + 不注 ZCode 指纹 → 上游 401 / 非 GLM 客户端。两套 provider 必须解到对的
+        // ZaiProvider(决定 model_base + token 文件)。
+        assert_eq!(
+            AuthScheme::parse("zai_oauth"),
+            AuthScheme::ZaiOauth(ZaiProvider::Zai)
+        );
+        assert_eq!(
+            AuthScheme::parse("zai"),
+            AuthScheme::ZaiOauth(ZaiProvider::Zai)
+        );
+        assert_eq!(
+            AuthScheme::parse("bigmodel_oauth"),
+            AuthScheme::ZaiOauth(ZaiProvider::BigModel)
+        );
+        assert_eq!(
+            AuthScheme::parse("bigmodel"),
+            AuthScheme::ZaiOauth(ZaiProvider::BigModel)
+        );
+        assert_eq!(
+            AuthScheme::parse("BigModel-OAuth"),
+            AuthScheme::ZaiOauth(ZaiProvider::BigModel)
+        );
+
+        // WorkbuddyOauth / QoderCosy(账号池系):别名误归 Bearer 会让 forward.rs 跳过各自
+        // 的账号池选择 + 签名分支 → 上游静默 401/破坏。QoderCosy 更严重:误归 Bearer 会同时
+        // 跳过 send_qoder_cosy WASM 签名 + unwrap_qoder_cosy_stream 信封解包 → 全链静默坏。
+        assert_eq!(
+            AuthScheme::parse("workbuddy_oauth"),
+            AuthScheme::WorkbuddyOauth
+        );
+        assert_eq!(
+            AuthScheme::parse("workbuddy_login"),
+            AuthScheme::WorkbuddyOauth
+        );
+        assert_eq!(AuthScheme::parse("qoder_oauth"), AuthScheme::QoderCosy);
+        assert_eq!(AuthScheme::parse("qoder"), AuthScheme::QoderCosy);
+        assert_eq!(AuthScheme::parse("qoder_cosy"), AuthScheme::QoderCosy);
+        assert_eq!(AuthScheme::parse("Qoder-OAuth"), AuthScheme::QoderCosy);
+    }
+
+    #[test]
+    fn qoder_cosy_forces_gateway_base_ignoring_provider_baseurl() {
+        // QoderCosy 的 upstream_base 钉死 gateway.qoder.com.cn,覆盖 user 保存的旧 baseUrl
+        // (qoder-login preset 历史 base 是废弃的 api2-v2 通道)。防 baseUrl 漂移 + device
+        // token 泄漏到 user 自定义 host(即便当前 send_qoder_cosy 硬编 gateway,此 pin 是纵深防御)。
+        let mut p = provider("qoder", "https://api2-v2.qoder.sh/model/v1", "");
+        p.auth_scheme = "qoder_oauth".into();
+        let r = StaticResolver::new(None, vec![p], Some("qoder".into()));
+        let parts = parts_with(&[]);
+        let resolved = r.resolve(&parts, b"{}").expect("qoder provider 应解析");
+        assert_eq!(resolved.upstream_base, "https://gateway.qoder.com.cn");
     }
 
     #[test]
@@ -525,6 +634,33 @@ mod tests {
         assert_eq!(res.rewritten_model, None);
     }
 
+    #[test]
+    fn ok_when_cas_format_but_different_value() {
+        let r = StaticResolver::new(
+            Some("cas_real_key_here".into()),
+            vec![provider("openai", "https://up", "sk-1")],
+            Some("openai".into()),
+        );
+        // proxy 持有 cas_real_key,incoming 发不同的 cas_ key (模拟双写不一致)
+        let p = parts_with(&[("authorization", "Bearer cas_different_key")]);
+        let res = r.resolve(&p, b"{}").unwrap();
+        assert_eq!(res.provider_id, "openai");
+        assert_eq!(res.api_key, "sk-1");
+    }
+
+    #[test]
+    fn unauthorized_when_non_cas_non_jwt() {
+        let r = StaticResolver::new(
+            Some("cas_real_key_here".into()),
+            vec![provider("openai", "https://up", "sk-1")],
+            Some("openai".into()),
+        );
+        // 随机非 cas_ 非 JWT 字符串 -> 拒绝 (挡住外部误连)
+        let p = parts_with(&[("authorization", "Bearer sk-fake-token")]);
+        let err = r.resolve(&p, b"{}").unwrap_err();
+        assert!(matches!(err, ResolveError::Unauthorized));
+    }
+
     /// 构造一个 ChatGPT access_token(JWT,payload 含 chatgpt_account_id)用于测试。
     fn chatgpt_jwt() -> String {
         use base64::Engine;
@@ -536,31 +672,21 @@ mod tests {
         format!("eyJhbGciOiJub25lIn0.{p}.sig")
     }
 
-    /// [MOC-104 relay / connector P1] relay 放行的 chatgpt token 必须**逐字 == 本地活动
-    /// auth.json 的 access_token**,而非任意带 chatgpt_account_id claim 的 JWT。设临时
-    /// CODEX_HOME + 写活动 auth.json,覆盖:① 本地真 token 放行 ② cas_ 仍放行 ③ 自造
-    /// chatgpt JWT(claim 合法但 ≠ 本地 token)拒 ④ 随机乱串拒。
+    /// [MOC-189] relay 放行**任意 chatgpt 形状的 JWT**,不再要求逐字匹配本地 auth.json。
+    /// 鉴权边界 = localhost 绑定 + cas_ 兜底;放宽逐字匹配是为了让「第三方对话可用性」不再被
+    /// ChatGPT token 轮换 / `CODEX_HOME` 读串 / 未登 ChatGPT 拖死(模型请求 401 → WS idle
+    /// timeout)。覆盖:① chatgpt 形状 JWT 放行 ② cas_ 仍放行 ③ 另一 account_id 的 chatgpt JWT
+    /// 同样放行(不再匹配本地)④ 非 JWT 乱串拒。
     #[test]
-    fn relay_accepts_only_local_active_chatgpt_token() {
+    fn relay_accepts_any_chatgpt_shaped_jwt() {
         use base64::Engine;
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let active = chatgpt_jwt(); // 本地活动 auth.json 里 Codex 真在用的 token
-        let mut f = std::fs::File::create(dir.path().join("auth.json")).unwrap();
-        write!(
-            f,
-            r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{active}","refresh_token":"rt"}}}}"#
-        )
-        .unwrap();
-        std::env::set_var("CODEX_HOME", dir.path());
-
         let r = StaticResolver::new(
             Some("cas-secret".into()),
             vec![provider("openai", "https://up", "sk-1")],
             Some("openai".into()),
         );
-        // ① 本地活动 chatgpt token → 放行,decide_provider 走 active_provider
-        let auth = format!("Bearer {active}");
+        // ① chatgpt 形状 JWT → 放行,decide_provider 走 active_provider
+        let auth = format!("Bearer {}", chatgpt_jwt());
         let p = parts_with(&[("authorization", auth.as_str())]);
         let res = r.resolve(&p, br#"{"model":"gpt-5.5"}"#).unwrap();
         assert_eq!(res.provider_id, "openai");
@@ -568,30 +694,38 @@ mod tests {
         // ② cas_ gateway key 仍放行(exact match 分支不变)
         let p_cas = parts_with(&[("authorization", "Bearer cas-secret")]);
         assert!(r.resolve(&p_cas, b"{}").is_ok());
-        // ③ 自造 chatgpt JWT(claim 合法但 ≠ 本地 access_token)→ 拒(connector P1:挡未签名伪造)
-        let forged_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        // ③ 另一个 account_id 的 chatgpt JWT → 同样放行(MOC-189:不再要求匹配本地 auth.json)
+        let other_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(
-                &serde_json::json!({"https://api.openai.com/auth":{"chatgpt_account_id":"acc_evil"}}),
+                &serde_json::json!({"https://api.openai.com/auth":{"chatgpt_account_id":"acc_other"}}),
             )
             .unwrap(),
         );
-        let forged = format!("Bearer eyJhbGciOiJub25lIn0.{forged_payload}.sig");
-        let pf = parts_with(&[("authorization", forged.as_str())]);
+        let other = format!("Bearer eyJhbGciOiJub25lIn0.{other_payload}.sig");
+        let po = parts_with(&[("authorization", other.as_str())]);
         assert!(
-            matches!(
-                r.resolve(&pf, b"{}").unwrap_err(),
-                ResolveError::Unauthorized
-            ),
-            "自造 chatgpt JWT ≠ 本地活动 token 应拒"
+            r.resolve(&po, b"{}").is_ok(),
+            "任意 chatgpt 形状 JWT 都应放行(localhost + cas_ 已是鉴权边界)"
         );
-        // ④ 随机乱串 → 拒
+        // ④ 非 JWT 乱串 → 拒
         let pr = parts_with(&[("authorization", "Bearer random-junk")]);
         assert!(matches!(
             r.resolve(&pr, b"{}").unwrap_err(),
             ResolveError::Unauthorized
         ));
-
-        std::env::remove_var("CODEX_HOME");
+        // ⑤ 3 段 JWT 但 payload 无 chatgpt_account_id claim → 拒(pin 住 is_chatgpt_access_token
+        //    的 claim 校验:gate 放宽后这是唯一剩下的判别逻辑,防未来回归成"任意 3 段 token 放行")
+        let no_claim_payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"sub\":\"x\"}");
+        let no_claim = format!("Bearer eyJhbGciOiJub25lIn0.{no_claim_payload}.sig");
+        let pnc = parts_with(&[("authorization", no_claim.as_str())]);
+        assert!(
+            matches!(
+                r.resolve(&pnc, b"{}").unwrap_err(),
+                ResolveError::Unauthorized
+            ),
+            "缺 chatgpt_account_id 的 3 段 JWT 不算 chatgpt token,应拒"
+        );
     }
 
     #[test]
@@ -610,6 +744,43 @@ mod tests {
         assert_eq!(res.provider_id, "deepseek");
         assert_eq!(res.api_key, "sk-2");
         assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn grok_build_scheme_parses_and_maps_codex_models_and_pins_upstream() {
+        // MOC-299 核心回归:grok-build preset(models.default=grok-build)必须把 Codex 发的
+        // gpt-5.x 模型名映射成 grok-build,**不透传 gpt 名到上游**(否则 cli-chat-proxy 400);
+        // 且 authScheme=grok_build_oauth 解析正确、upstream_base 钉死官方 host。
+        assert_eq!(
+            AuthScheme::parse("grok_build_oauth"),
+            AuthScheme::GrokBuildOauth
+        );
+        assert_eq!(AuthScheme::parse("grok-build"), AuthScheme::GrokBuildOauth);
+
+        let mut gb = provider("grok-build", "https://cli-chat-proxy.grok.com/v1", "");
+        gb.auth_scheme = "grok_build_oauth".into();
+        gb.api_format = "responses".into();
+        gb.models.clear();
+        gb.models.insert("default".into(), "grok-build".into());
+
+        let r = StaticResolver::new(None, vec![gb], Some("grok-build".into()));
+        let p = parts_with(&[]);
+        // Codex 实际会发的 slot 模型名(见 model_alias::MODEL_SLOTS),均未在 grok models 里
+        // 显式映射 → fallback default = grok-build。
+        for codex_model in ["gpt-5.3-codex", "gpt-5.5", "gpt-5.2", "gpt-5.4-mini"] {
+            let body = format!(r#"{{"model":"{codex_model}"}}"#);
+            let res = r.resolve(&p, body.as_bytes()).unwrap();
+            assert_eq!(
+                res.rewritten_model.as_deref(),
+                Some("grok-build"),
+                "{codex_model} 必须映射为 grok-build,不透传 gpt 名到上游"
+            );
+            assert_eq!(res.auth_scheme, AuthScheme::GrokBuildOauth);
+            assert_eq!(
+                res.upstream_base, "https://cli-chat-proxy.grok.com/v1",
+                "upstream_base 必须钉死官方 host,不随 user baseUrl 漂移"
+            );
+        }
     }
 
     #[test]
@@ -678,6 +849,35 @@ mod tests {
         assert_eq!(res.provider_id, "");
         assert_eq!(res.upstream_base, "https://up-1");
         assert_eq!(res.rewritten_model.as_deref(), Some("qna-v1"));
+    }
+
+    #[test]
+    fn zai_oauth_forces_base_and_path_source_even_when_baseurl_drifts() {
+        // bot P2:用户 baseUrl 漂移带 /v1 时,forced upstream_base **和**转发用的
+        // provider.base_url 都应钉成 model_base —— 这样 anthropic adapter 的 path 推导
+        // (`build_anthropic_messages_upstream_path` 看 base 末尾是否 `/v1`)与 base 同源,
+        // 不会拼出缺 `/v1` 的错误 URL。
+        let mut p = provider("bm", "https://open.bigmodel.cn/api/anthropic/v1", "");
+        p.auth_scheme = "bigmodel_oauth".into();
+        p.api_format = "anthropic_messages".into();
+        let r = StaticResolver::new(None, vec![p], Some("bm".into()));
+        let parts = parts_with(&[]);
+        let res = r.resolve(&parts, br#"{"model":"glm-4.7"}"#).unwrap();
+        let forced = "https://open.bigmodel.cn/api/anthropic";
+        assert_eq!(res.upstream_base, forced, "upstream_base 应钉成 model_base");
+        assert_eq!(
+            res.provider.base_url, forced,
+            "转发 provider.base_url 也应钉成 forced base(否则 adapter path 推导用漂移值)"
+        );
+        // z.ai 同理
+        let mut pz = provider("z", "https://api.z.ai/api/anthropic/v1/", "");
+        pz.auth_scheme = "zai_oauth".into();
+        pz.api_format = "anthropic_messages".into();
+        let rz = StaticResolver::new(None, vec![pz], Some("z".into()));
+        let resz = rz
+            .resolve(&parts_with(&[]), br#"{"model":"glm-4.7"}"#)
+            .unwrap();
+        assert_eq!(resz.provider.base_url, "https://api.z.ai/api/anthropic");
     }
 
     #[test]

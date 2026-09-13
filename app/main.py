@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Body, Depends, FastAPI, Query, Request, Response
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -37,7 +37,7 @@ from .storage import (
 from . import gateway
 
 
-app = FastAPI(title="ConfigBox", version="0.5.0")
+app = FastAPI(title="ConfigBox", version="1.0.0")
 
 
 @app.on_event("startup")
@@ -255,18 +255,50 @@ def gateway_restore(user: AuthUser = Depends(require_user)) -> dict:
 
 
 @app.get("/api/gateway/oauth/{kind}/status")
-def gateway_oauth_status(kind: str, user: AuthUser = Depends(require_user)) -> dict:
-    return gateway.oauth_status(kind)
+def gateway_oauth_status(
+    kind: str,
+    provider_id: str | None = Query(default=None, alias="providerId"),
+    user: AuthUser = Depends(require_user),
+) -> dict:
+    return gateway.oauth_status(kind, provider_id)
 
 
 @app.post("/api/gateway/oauth/{kind}/login")
-def gateway_oauth_login(kind: str, user: AuthUser = Depends(require_user)) -> dict:
-    return gateway.oauth_login(kind)
+def gateway_oauth_login(
+    kind: str,
+    provider_id: str | None = Query(default=None, alias="providerId"),
+    user: AuthUser = Depends(require_user),
+) -> dict:
+    return gateway.oauth_login(kind, provider_id)
 
 
 @app.delete("/api/gateway/oauth/{kind}/logout")
-def gateway_oauth_logout(kind: str, user: AuthUser = Depends(require_user)) -> dict:
-    return gateway.oauth_logout(kind)
+def gateway_oauth_logout(
+    kind: str,
+    provider_id: str | None = Query(default=None, alias="providerId"),
+    uid: str | None = Query(default=None),
+    user: AuthUser = Depends(require_user),
+) -> dict:
+    return gateway.oauth_logout(kind, provider_id, uid)
+
+
+@app.post("/api/gateway/oauth/{kind}/switch")
+def gateway_oauth_switch(
+    kind: str,
+    provider_id: str = Query(alias="providerId"),
+    uid: str = Query(),
+    user: AuthUser = Depends(require_user),
+) -> dict:
+    return gateway.oauth_switch_account(kind, provider_id, uid)
+
+
+@app.post("/api/gateway/oauth/{kind}/submit-code")
+def gateway_oauth_submit_code(
+    kind: str,
+    payload: dict = Body(default_factory=dict),
+    user: AuthUser = Depends(require_user),
+) -> dict:
+    return gateway.oauth_submit_code(kind, str(payload.get("code") or ""))
 
 
 @app.get("/api/gateway/oauth/antigravity/models")

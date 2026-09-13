@@ -15,7 +15,7 @@ RUN mkdir -p /usr/local/cargo \
 
 WORKDIR /gateway
 COPY third_party/codex-app-transfer ./
-RUN cargo build --release -p codex-gateway
+RUN /usr/local/cargo/bin/cargo build --release -p codex-gateway
 
 FROM python:3.12-slim AS backend
 

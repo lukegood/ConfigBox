@@ -8,12 +8,13 @@ members = [
     "crates/proxy",
     "crates/adapters",
     "crates/gemini_oauth",
+    "crates/qoder_auth",
     "crates/gateway",
 ]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 license = "MIT"
 authors = ["Codex App Transfer maintainers"]
 repository = "https://github.com/Cmochance/codex-app-transfer"

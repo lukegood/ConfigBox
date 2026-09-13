@@ -30,6 +30,9 @@ use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, http::HeaderValue, Message as WsMessage},
 };
 
+// [MOC-195] main 前隔离 home,防集成测试读写真机 sessions.db(详见 common/mod.rs)
+mod common;
+
 /// echo-back 上游:把收到的请求镜像成 JSON 返回。`marker` 用来在响应头里
 /// 标记是哪个 mock,以便测试断言代理选对了上游。
 ///
@@ -801,6 +804,48 @@ async fn websocket_responses_route_uses_legacy_responses_conversion() {
     assert_eq!(body["model"], "kimi-for-coding");
     assert_eq!(body["stream"], true);
     assert!(body["messages"].is_array());
+}
+
+#[tokio::test]
+async fn websocket_responses_route_426_for_native_responses_provider() {
+    // [followup MOC-239] native responses provider(api_format=responses)+ ws→ws 透传关(默认):
+    // /responses 的 WS upgrade 应回 **426 Upgrade Required**,触发 Codex session-scoped HTTP
+    // fallback —— Codex 转走 HTTP /responses 并原生 inline previous_response_id(免 proxy rebuild、
+    // 免 5/5)。对照上面 chat 类 provider 仍接受 WS 走 ws→http 转换。
+    let mut native = provider(
+        "freemodel-like",
+        "http://127.0.0.1:9/v1",
+        "sk-native",
+        "bearer",
+        &[],
+    );
+    native.api_format = "responses".into();
+    native.models.insert("default".into(), "gpt-5.5".into());
+    let resolver = Arc::new(StaticResolver::new(
+        Some("cas_test_gw".into()),
+        vec![native],
+        Some("freemodel-like".into()),
+    ));
+    let proxy = spawn(build_router(resolver)).await;
+
+    let mut request = format!("ws://{proxy}/responses")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_static("Bearer cas_test_gw"),
+    );
+    match connect_async(request).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(
+                resp.status().as_u16(),
+                426,
+                "native responses WS upgrade 应回 426 让 Codex 降级 HTTP"
+            );
+        }
+        Ok(_) => panic!("native responses WS upgrade 不应 101 成功(应 426 触发 HTTP 降级)"),
+        Err(other) => panic!("expected HTTP 426, got {other:?}"),
+    }
 }
 
 #[tokio::test]

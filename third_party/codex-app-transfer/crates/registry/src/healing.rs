@@ -118,7 +118,14 @@ pub(crate) fn heal_with_preset_index(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
-        let Some(preset) = pick_matching_preset(candidates, &user_name, &user_api_format) else {
+        let user_auth_scheme = obj
+            .get("authScheme")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let Some(preset) =
+            pick_matching_preset(candidates, &user_name, &user_api_format, &user_auth_scheme)
+        else {
             continue;
         };
 
@@ -250,6 +257,97 @@ pub fn heal_legacy_update_url(cfg: &mut Value) -> bool {
 
     settings.insert("updateUrl".to_owned(), Value::String(canonical.to_owned()));
     true
+}
+
+/// 一次性迁移:把用户 config.json 里 `providers[].name` 字段中的旧预设显示名
+/// 改为新显示名(精确匹配,不动用户已手改过其他名字的 provider)。
+///
+/// 背景:v2.x 前端重构改了三个 preset 的 `name` 字段展示方式,
+/// 但 `heal_builtin_provider_fields` 不覆写 `name`(name 属于用户可改字段),
+/// 已配置的 provider 仍显示旧名。此迁移在 load 时一次性修正。
+///
+/// 有改动返回 `true`(由调用方决定是否写回磁盘)。
+pub fn migrate_legacy_preset_names(cfg: &mut Value) -> bool {
+    const RENAMES: &[(&str, &str)] = &[
+        ("Kimi (月之暗面)", "Kimi (MoonShot)"),
+        ("智谱 GLM Coding", "GLM Coding"),
+        ("智谱 GLM", "GLM"),
+        ("阿里云百炼 (Token Plan)", "Aliyuncs (Token Plan)"),
+        ("阿里云百炼", "Aliyuncs"),
+    ];
+
+    let Some(providers) = cfg.get_mut("providers").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+
+    let mut changed = false;
+    for provider in providers.iter_mut() {
+        let Some(obj) = provider.as_object_mut() else {
+            continue;
+        };
+        let Some(name_val) = obj.get("name") else {
+            continue;
+        };
+        let Some(name) = name_val.as_str() else {
+            continue;
+        };
+        if let Some(&new_name) =
+            RENAMES
+                .iter()
+                .find_map(|(old, new)| if *old == name { Some(new) } else { None })
+        {
+            obj.insert("name".to_owned(), Value::String(new_name.to_owned()));
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// [MOC-319] grok 把编码主模型 `grok-build` **下线**、换成 `grok-4.5`。healing 保留用户可调的
+/// `models` / `modelCapabilities`(`heal_builtin_provider_fields` 不覆盖),故已登录用户的 grok
+/// provider 仍指着已下线的 `grok-build` → resolver 把 Codex 槽映射成 grok-build,上游 400/不识别。
+/// 此处一次性迁移:grok provider(authScheme grok_build_oauth 系)的 `models` 值 + `modelCapabilities`
+/// key 里的 `grok-build` → `grok-4.5`(grok-build 已不可用,非用户偏好 → 安全迁移;registry crate 不能
+/// 依赖 gemini_oauth,故内联 authScheme alias 判定)。
+pub fn migrate_grok_build_model_to_grok_4_5(cfg: &mut Value) -> bool {
+    let Some(providers) = cfg.get_mut("providers").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    for provider in providers.iter_mut() {
+        let is_grok = provider
+            .get("authScheme")
+            .and_then(|v| v.as_str())
+            .map(|a| a.trim().to_ascii_lowercase().replace('-', "_"))
+            .is_some_and(|a| matches!(a.as_str(), "grok_build_oauth" | "grok_build" | "grokbuild"));
+        if !is_grok {
+            continue;
+        }
+        let Some(obj) = provider.as_object_mut() else {
+            continue;
+        };
+        // models 里所有值 == "grok-build"(default + 槽映射)→ "grok-4.5"。
+        if let Some(models) = obj.get_mut("models").and_then(|v| v.as_object_mut()) {
+            for v in models.values_mut() {
+                if v.as_str() == Some("grok-build") {
+                    *v = Value::String("grok-4.5".to_owned());
+                    changed = true;
+                }
+            }
+        }
+        // modelCapabilities:key "grok-build" → "grok-4.5"(500k;已有 grok-4.5 则不覆盖)。
+        if let Some(caps) = obj
+            .get_mut("modelCapabilities")
+            .and_then(|v| v.as_object_mut())
+        {
+            if caps.remove("grok-build").is_some() {
+                caps.entry("grok-4.5".to_owned())
+                    .or_insert_with(|| serde_json::json!({ "context_window": 500000 }));
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// provider 是否有合法的 `grokWeb.cookies.sso` JWT(非空 string)。
@@ -396,6 +494,7 @@ fn pick_matching_preset<'a>(
     candidates: &'a [Map<String, Value>],
     user_name: &str,
     user_api_format: &str,
+    user_auth_scheme: &str,
 ) -> Option<&'a Map<String, Value>> {
     if candidates.len() == 1 {
         return candidates.first();
@@ -411,6 +510,24 @@ fn pick_matching_preset<'a>(
                 .unwrap_or(false)
         }) {
             return Some(p);
+        }
+    }
+    // 1.5 authScheme 唯一匹配 — 同 baseUrl + 同 apiFormat 的双 preset(如 workbuddy /
+    //     workbuddy-login:bearer vs workbuddy_oauth)靠 authScheme 区分,否则下面 apiFormat
+    //     fallback 会挑到第一个(API-key preset),把账号登录 provider 的 authScheme 覆盖成
+    //     bearer、OAuth 路失效(codex review P2)。仅当恰好一个候选 authScheme 命中时采用。
+    let uas = user_auth_scheme.trim().to_lowercase();
+    if !uas.is_empty() {
+        let mut hits = candidates.iter().filter(|p| {
+            p.get("authScheme")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_lowercase() == uas)
+                .unwrap_or(false)
+        });
+        if let Some(p) = hits.next() {
+            if hits.next().is_none() {
+                return Some(p);
+            }
         }
     }
     // 2. apiFormat 匹配 — user provider 用 antigravity_oauth 想要 antigravity preset
@@ -434,6 +551,34 @@ fn pick_matching_preset<'a>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── pick_matching_preset authScheme 判别(codex review P2)────────────
+
+    #[test]
+    fn pick_matching_preset_disambiguates_same_baseurl_by_auth_scheme() {
+        // workbuddy / workbuddy-login 同 baseUrl + 同 apiFormat,只 authScheme 不同。
+        // healing 必须靠 authScheme 区分,否则把账号登录 provider 的 authScheme 覆盖成 bearer。
+        let mk = |id: &str, scheme: &str| {
+            let mut m = Map::new();
+            m.insert("id".into(), json!(id));
+            m.insert("name".into(), json!(id));
+            m.insert("apiFormat".into(), json!("openai_chat"));
+            m.insert("authScheme".into(), json!(scheme));
+            m
+        };
+        let candidates = vec![
+            mk("workbuddy", "bearer"),
+            mk("workbuddy-login", "workbuddy_oauth"),
+        ];
+        // 账号登录 provider 即使被改名(name 不命中),authScheme 也能命中 login preset
+        let p = pick_matching_preset(&candidates, "我的 WB", "openai_chat", "workbuddy_oauth")
+            .expect("应命中 login preset");
+        assert_eq!(p.get("id").unwrap(), "workbuddy-login");
+        // API-key provider:authScheme=bearer → 命中 API-key preset(不被 OAuth preset 抢)
+        let p2 = pick_matching_preset(&candidates, "随便起的名", "openai_chat", "bearer")
+            .expect("应命中 API-key preset");
+        assert_eq!(p2.get("id").unwrap(), "workbuddy");
+    }
 
     // ── normalize_base_url ───────────────────────────────────────────
 
@@ -549,6 +694,34 @@ mod tests {
     }
 
     #[test]
+    fn heals_stale_zhipu_coding_claude_cli_ua_to_empty() {
+        // 回归(PR #502):旧 zhipu-coding preset 曾带 `User-Agent: claude-cli/...`,
+        // 存量用户 config.json 已快照该 UA。ZCode 指纹头改由 forward.rs 代码层注入后,
+        // preset extraHeaders 置为空对象 `{}` —— healing 必须把残留的 claude-cli UA
+        // 覆盖成 `{}`(preset 声明了该字段 → preset_specifies==true),否则它会与代码层
+        // 注入的 ZCode UA append 成双 User-Agent,BigModel 判定为非 ZCode 客户端。
+        let mut cfg = json!({
+            "providers": [
+                {
+                    "id": "a1b2c3d4",
+                    "name": "智谱 GLM Coding",
+                    "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+                    "isBuiltin": true,
+                    "apiFormat": "openai_chat",
+                    "extraHeaders": { "User-Agent": "claude-cli/2.1.175 (external, cli)" }
+                }
+            ]
+        });
+        let changed = heal_builtin_provider_fields(&mut cfg);
+        assert!(changed, "残留的 claude-cli UA 应被清除 → 报告有改动");
+        assert_eq!(
+            cfg["providers"][0]["extraHeaders"],
+            json!({}),
+            "extraHeaders 应被 healing 覆盖成空对象,残留 claude-cli UA 清除"
+        );
+    }
+
+    #[test]
     fn heals_user_built_provider_when_baseurl_matches_preset() {
         // 关键回归(2026-05-08):真机配置里所有 builtin-类 provider 都
         // `isBuiltin=false`、id 是随机 hex —— 老识别规则 (id == preset.id)
@@ -590,14 +763,14 @@ mod tests {
                     "name": "Xiaomi MiMo (Token Plan)",
                     "baseUrl": "https://token-plan-sgp.xiaomimimo.com/v1",
                     "isBuiltin": false,
-                    "apiFormat": "responses"   // 错误值,需被覆盖回 preset 的 openai_chat
+                    "apiFormat": "openai_chat"   // 错误值,需被覆盖回 preset 的 responses
                 }
             ]
         });
         let changed = heal_builtin_provider_fields(&mut cfg);
         assert!(changed);
         let p = &cfg["providers"][0];
-        assert_eq!(p["apiFormat"], "openai_chat");
+        assert_eq!(p["apiFormat"], "responses");
         assert_eq!(p["isBuiltin"], json!(true));
         assert_eq!(
             p["baseUrl"], "https://token-plan-sgp.xiaomimimo.com/v1",
@@ -607,15 +780,15 @@ mod tests {
 
     #[test]
     fn forces_apiformat_override_even_if_user_edited_to_bogus_value() {
-        // 关键回归(2026-05-08 MiMo 404):用户手改把 apiFormat 改成 "responses"
+        // 用户手改把 apiFormat 改成 "responses"
         // → apply 跳过代理直连上游 → 404
         // 新策略:命中 preset 即强制覆盖,不管用户改成了什么。
         let mut cfg = json!({
             "providers": [
                 {
-                    "id": "xiaomi-mimo-token-plan",
-                    "name": "Xiaomi MiMo (Token Plan)",
-                    "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1",
+                    "id": "deepseek",
+                    "name": "DeepSeek",
+                    "baseUrl": "https://api.deepseek.com",
                     "isBuiltin": true,
                     "apiFormat": "responses",
                     "extraHeaders": {}
@@ -626,7 +799,7 @@ mod tests {
         assert!(changed);
         assert_eq!(
             cfg["providers"][0]["apiFormat"], "openai_chat",
-            "MiMo apiFormat 必须被强制覆盖回 preset 的 openai_chat"
+            "DeepSeek apiFormat 必须被强制覆盖回 preset 的 openai_chat"
         );
     }
 
@@ -945,5 +1118,43 @@ mod tests {
         assert_eq!(p["authScheme"], "custom-auth");
         assert_eq!(p["extraHeaders"]["User-Agent"], "Custom-UA");
         assert!(p["extraHeaders"].get("X-Default").is_none());
+    }
+
+    #[test]
+    fn migrates_grok_build_model_to_grok_4_5() {
+        // [MOC-319] 已登录用户的 grok provider 从下线的 grok-build 迁到 grok-4.5(default + 槽 + caps key)。
+        let mut cfg = json!({"providers":[
+            {"id":"x","authScheme":"grok_build_oauth","models":{"default":"grok-build","gpt_5_4":"grok-composer-2.5-fast"},
+             "modelCapabilities":{"grok-build":{"context_window":512000}}},
+            // alias 形式(grokbuild)也要迁。
+            {"id":"y","authScheme":"grokbuild","models":{"default":"grok-build"}},
+            // 非 grok provider 不动。
+            {"id":"z","authScheme":"bearer","models":{"default":"grok-build"}}
+        ]});
+        assert!(migrate_grok_build_model_to_grok_4_5(&mut cfg));
+        let ps = cfg["providers"].as_array().unwrap();
+        assert_eq!(ps[0]["models"]["default"], "grok-4.5", "default 迁移");
+        assert_eq!(
+            ps[0]["models"]["gpt_5_4"], "grok-composer-2.5-fast",
+            "非 grok-build 槽不动"
+        );
+        assert!(
+            ps[0]["modelCapabilities"].get("grok-build").is_none(),
+            "caps 旧 key 删"
+        );
+        assert_eq!(
+            ps[0]["modelCapabilities"]["grok-4.5"]["context_window"],
+            500000
+        );
+        assert_eq!(
+            ps[1]["models"]["default"], "grok-4.5",
+            "grokbuild alias 也迁"
+        );
+        assert_eq!(
+            ps[2]["models"]["default"], "grok-build",
+            "非 grok provider 不动"
+        );
+        // 幂等:再跑无改动。
+        assert!(!migrate_grok_build_model_to_grok_4_5(&mut cfg));
     }
 }

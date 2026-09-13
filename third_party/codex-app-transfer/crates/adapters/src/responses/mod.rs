@@ -7,36 +7,45 @@
 //!   但**单元 / 集成测试可以独立 driving 响应侧**)。
 //! - **响应侧**:Chat SSE → Responses SSE 状态机(text-only)。tool / reasoning /
 //!   function call 留 Stage 3.3。
-//!
-//! **MOC-219 preamble fallback**:Codex 26.609 把完成态 reasoning 从渲染层移除,
-//! chat 路径新增 `preamble` 子模块(跨轮静默轮数记忆 / reasoning 截取)与
-//! `converter` 内 message 缓冲判定 —— 模型 message 永远原样下发;模型静默的
-//! 工具轮按轮数节流(连续静默满 N 轮)注入 reasoning 转述为合成 assistant
-//! message,工具轮间不再全程空白也不每轮刷屏。
 
 pub mod apply_patch_preflight;
 pub mod artifact_store;
 // MOC-142: sessions.db 大 data: blob 内容寻址外置(去重),仅 responses 内部用。
 mod blob_store;
 pub mod compact;
+// [MOC-231] 上下文 by-source 明细(供 Codex Desktop context 下拉面板)。
+pub mod context_breakdown;
 pub mod converter;
+/// [MOC-301/304] grok passthrough 响应侧 tool-call shim(function_call → custom_tool_call/tool_search_call)。
+pub(crate) mod grok_tool_shim;
 // MOC-168: sessions.db 每条消息内容寻址外置(收文字/tool 侧逐轮快照重复)。
 mod message_store;
-// MOC-219: preamble fallback 注入(跨轮静默轮数记忆 / 注入节流 / 文本截取)。
-pub mod preamble;
+// [MOC-234] responses 1:1 passthrough 的只读会话观测镜像(供 responses 原生 breakdown 拼全历史)。
+pub mod passthrough_observe;
 pub mod request;
 pub mod session;
 pub mod stream;
 pub mod tool_call_cache;
+// [MOC-234] responses passthrough orphan function_call 降级修复(store:false 上游)。
+pub mod tool_call_repair;
 
-pub use artifact_store::{global_tool_artifact_store, ToolArtifactStore};
+pub use artifact_store::{global_tool_artifact_store, read_tool_artifact_raw, ToolArtifactStore};
+// [MOC-231/232] 上下文明细:类型 + 计算入口 + 异步落盘/读取。request.rs 在转换末尾起
+// spawn_blocking 后台算并 persist(MOC-232 搬离转发关键路径),quota injector 读盘渲染。
+pub use context_breakdown::{
+    compute_context_breakdown, compute_context_breakdown_responses, gc_context_breakdown,
+    load_context_breakdown, set_breakdown_enabled, spawn_compute_and_persist,
+    spawn_compute_and_persist_responses, BreakdownCategory, ContextBreakdown,
+};
 pub use converter::ChatToResponsesConverter;
 // [MOC-75] gemini_native 复用 chat 的 apply_patch input 解析(alt-key 容错一致)
-pub(crate) use converter::extract_apply_patch_input;
+// [MOC-88] extract_custom_tool_input:非 apply_patch 的 custom freeform 工具浅提取
+pub(crate) use converter::{extract_apply_patch_input, extract_custom_tool_input};
 // [MOC-75] gemini_native 复用 chat 的 V4A 后验语法校验(完整但畸形的 patch → emit
 // status=incomplete,对齐 #322 MOC-57 破坏性半应用防护)。V4aError 不具名导出 —— 调用方
 // 经 `validate_v4a_syntax(..).err()` 类型推断读 line/message(pub(crate) 字段),无需 re-export。
 pub(crate) use converter::validate_v4a_syntax;
+pub use passthrough_observe::{global_passthrough_observe_store, PassthroughObserveStore};
 pub use request::{
     responses_body_to_chat_body, responses_body_to_chat_body_for_provider,
     responses_body_to_chat_body_for_provider_with_session,
@@ -47,6 +56,7 @@ pub use stream::{
     convert_chat_to_responses_stream_with_session,
 };
 pub use tool_call_cache::{global_tool_call_cache, ToolCallCache, ToolCallEntry};
+pub use tool_call_repair::{is_orphan_function_call_error, rebuild_orphan_context_bytes};
 
 use codex_app_transfer_registry::Provider;
 use http::{HeaderMap, StatusCode};

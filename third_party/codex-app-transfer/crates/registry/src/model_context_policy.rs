@@ -6,12 +6,18 @@ pub const ONE_M_CONTEXT_WINDOW: u64 = 1_000_000;
 
 /// 与 `presets_data.json` 中 builtin preset 的 `modelCapabilities.context_window`
 /// 对齐。用于在未显式配置 capability 时提供保守默认值。
+///
+/// **全局表(不含 QoderWork)**:key 假定跨 provider 全局唯一的真实模型名。QoderWork 的网关 key 含
+/// `auto` / `l` 这类通用别名(与 WorkBuddy 的 `auto` 撞名),不在此表 —— 见
+/// [`documented_context_window_scoped`],只在 qoder provider 上下文里补 [`crate::qoder_catalog`] 的
+/// 最大 context,避免把 qoder 的 `auto`=180k 误加到同名的其它 provider(那些 provider 有自己的
+/// `modelCapabilities`,以显式声明为准)。
 pub fn documented_context_window(model_id: &str) -> Option<u64> {
     match model_id.trim().to_ascii_lowercase().as_str() {
         // DeepSeek
         "deepseek-v4-pro" | "deepseek-v4-flash" => Some(ONE_M_CONTEXT_WINDOW),
         // Kimi (月之暗面) + Kimi Code
-        "kimi-for-coding" | "kimi-k2.5" | "kimi-k2.6" | "kimi-2.6" => Some(262_144),
+        "kimi-for-coding" | "kimi-k2.5" | "kimi-k2.6" | "kimi-k2.7" | "kimi-2.6" => Some(262_144),
         "moonshot-v1-8k" | "moonshot-v1-8k-vision-preview" => Some(8192),
         "moonshot-v1-32k" | "moonshot-v1-32k-vision-preview" => Some(32768),
         "moonshot-v1-128k" | "moonshot-v1-auto" | "moonshot-v1-128k-vision-preview" => {
@@ -21,6 +27,7 @@ pub fn documented_context_window(model_id: &str) -> Option<u64> {
         "mimo-v2-pro" | "mimo-v2.5" | "mimo-v2.5-pro" => Some(ONE_M_CONTEXT_WINDOW),
         "mimo-v2-flash" | "mimo-v2-omni" => Some(262_144),
         // 智谱 GLM
+        "glm-5.2" => Some(ONE_M_CONTEXT_WINDOW),
         "glm-5.1" | "glm-4.7" => Some(200_000),
         // 阿里云百炼 Qwen 3.6
         "qwen3.6-plus" | "qwen3.6-flash" => Some(ONE_M_CONTEXT_WINDOW),
@@ -49,12 +56,37 @@ pub fn documented_context_window(model_id: &str) -> Option<u64> {
     }
 }
 
-/// 统一的 1M 判定策略:
+/// 按 model id + **是否 qoder provider** 查文档化 context window。qoder provider 先查
+/// [`crate::qoder_catalog`] 的最大 context(网关 key `auto`/`gm51model` 等,QoderWork 无
+/// `modelCapabilities`、context 全靠本表),再兜底全局表;非 qoder 只查全局表(WorkBuddy 的
+/// `auto` → 全局无 → 以其自身 `modelCapabilities` 显式声明为准,不被 qoder 的 180k 污染)。
+pub fn documented_context_window_scoped(model_id: &str, is_qoder: bool) -> Option<u64> {
+    if is_qoder {
+        crate::qoder_catalog::qoder_max_context(model_id.trim())
+            .or_else(|| documented_context_window(model_id))
+    } else {
+        documented_context_window(model_id)
+    }
+}
+
+/// 统一的 1M 判定策略(优先级从高到低):
 /// 1. `[1m]` 内部后缀
-/// 2. 文档化 context_window >= 1M
-/// 3. `modelCapabilities[model].supports1m = true/false`
-/// 4. `modelCapabilities[model].context_window >= 1_000_000`
+/// 2. 显式 `modelCapabilities[model].context_window` 数值(权威:>= 1M → true,< 1M → false;
+///    不再 fall through 到 documented,与 `model_catalog::explicit_context_window` 同优先级)
+/// 3. 文档化 context_window >= 1M
+/// 4. `modelCapabilities[model].supports1m = true/false`
 pub fn model_supports_1m(original_model: &str, model_capabilities: Option<&Value>) -> bool {
+    model_supports_1m_scoped(original_model, model_capabilities, false)
+}
+
+/// 同 [`model_supports_1m`],但 `is_qoder=true` 时文档化 context 走
+/// [`documented_context_window_scoped`](qoder 网关 key 才解析)。qoder provider 的默认模型 1M 判定
+/// (`providers::provider_supports_1m`)用本入口,避免 qoder 的 `gm51model`(1M)因不在全局表被判非 1M。
+pub fn model_supports_1m_scoped(
+    original_model: &str,
+    model_capabilities: Option<&Value>,
+    is_qoder: bool,
+) -> bool {
     if has_internal_one_m_suffix(original_model) {
         return true;
     }
@@ -64,26 +96,32 @@ pub fn model_supports_1m(original_model: &str, model_capabilities: Option<&Value
         return false;
     }
 
-    if documented_context_window(clean_model).is_some_and(|n| n >= ONE_M_CONTEXT_WINDOW) {
-        return true;
-    }
-
-    if let Some(b) = capability_bool(
-        model_capabilities,
-        original_model,
-        clean_model,
-        "supports1m",
-    ) {
-        return b;
-    }
-
-    capability_u64(
+    // [MOC-241] 显式 context_window 数值是最高优先级权威:用户/前端显式声明窗口时直接按它
+    // 判 1M,**不再** fall through 到 documented。否则 documented 对 Gemini 1.5/2/3 先判 1M,
+    // Gemini 1M 开关「关」写的 600000 cap 形同虚设 → apply.rs 的 legacy `model_context_window`
+    // root key 仍写 1M、与 catalog 的 600K 打架(#490 bot review)。与 explicit_context_window 对齐。
+    if let Some(n) = capability_u64(
         model_capabilities,
         original_model,
         clean_model,
         "context_window",
+    ) {
+        return n >= ONE_M_CONTEXT_WINDOW;
+    }
+
+    if documented_context_window_scoped(clean_model, is_qoder)
+        .is_some_and(|n| n >= ONE_M_CONTEXT_WINDOW)
+    {
+        return true;
+    }
+
+    capability_bool(
+        model_capabilities,
+        original_model,
+        clean_model,
+        "supports1m",
     )
-    .is_some_and(|n| n >= ONE_M_CONTEXT_WINDOW)
+    .unwrap_or(false)
 }
 
 fn capability_bool(
@@ -150,7 +188,41 @@ mod tests {
         assert_eq!(documented_context_window("qwen3.6-plus"), Some(1_000_000));
         assert_eq!(documented_context_window("MiniMax-M2.7"), Some(204_800));
         assert_eq!(documented_context_window("MiniMax-M3"), Some(1_000_000));
+        assert_eq!(documented_context_window("kimi-k2.7"), Some(262_144));
+        assert_eq!(documented_context_window("glm-5.2"), Some(1_000_000));
         assert_eq!(documented_context_window("unknown-model"), None);
+    }
+
+    #[test]
+    fn qoder_context_only_resolves_scoped_not_global() {
+        // QoderWork 原始 key → 各模型最大 context,只在 qoder-scoped(is_qoder=true)里解析。
+        assert_eq!(
+            documented_context_window_scoped("gm51model", true),
+            Some(1_000_000)
+        );
+        assert_eq!(documented_context_window_scoped("l", true), Some(1_000_000));
+        assert_eq!(
+            documented_context_window_scoped("kmodel", true),
+            Some(256_000)
+        );
+        assert_eq!(
+            documented_context_window_scoped("auto", true),
+            Some(180_000)
+        );
+        assert_eq!(
+            documented_context_window_scoped("mmodel", true),
+            Some(200_000)
+        );
+        // [HIGH 回归防护] 通用别名 `auto`/`l` 不得进全局表(会撞 WorkBuddy 等同名 provider);
+        // 非 qoder provider(is_qoder=false)也不得解析成 qoder context。
+        for m in ["auto", "l", "gm51model", "mmodel"] {
+            assert_eq!(documented_context_window(m), None, "{m} 全局表应为空");
+            assert_eq!(
+                documented_context_window_scoped(m, false),
+                None,
+                "{m} 非 qoder 不应解析"
+            );
+        }
     }
 
     #[test]
@@ -226,6 +298,20 @@ mod tests {
         assert!(model_supports_1m("custom", Some(&caps)));
         assert!(!model_supports_1m("small", Some(&caps)));
         assert!(model_supports_1m("big", Some(&caps)));
+    }
+
+    #[test]
+    fn explicit_context_window_cap_overrides_documented_1m() {
+        // [MOC-241] Gemini 1M 开关「关」写 context_window=600000:即便 documented 判
+        // gemini-3-pro 为 1M,显式 cap 也让 supports_1m=false —— 使 apply.rs 的 legacy
+        // model_context_window root key 与 catalog 的 600K 一致(#490 bot review)。
+        let capped = json!({"gemini-3-pro": {"context_window": 600000}});
+        assert!(!model_supports_1m("gemini-3-pro", Some(&capped)));
+        // 「开」写 1000000(+supports1m)→ true
+        let full = json!({"gemini-3-pro": {"context_window": 1000000, "supports1m": true}});
+        assert!(model_supports_1m("gemini-3-pro", Some(&full)));
+        // 无显式 cap → 仍按 documented 判 1M(回归保护:不影响未配 cap 的现有 provider)
+        assert!(model_supports_1m("gemini-3-pro", None));
     }
 
     #[test]
