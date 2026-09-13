@@ -41,7 +41,6 @@ v0.5.5: 5月23日更新，同步上游codex网关更新。
 v0.5.6: 5月31日更新，同步上游网关更新，修复手动更改配置不同步的问题，优化使用体验。  
 v0.5.7: 6月6日更新，同步上游codex网关更新，优化Claude与OpenCode的Provider配置体验，Provider供应商名称支持中文。  
 v0.5.8: 6月14日更新，同步上游codex转发网关更新。  
-
 v1.0.0: 9月13日更新，同步上游codex转发网关更新，支持 Z.ai、BigModel、Trae、WorkBuddy、Qoder、Grok Build 登录，并修复Profile删除不彻底的问题。
 
 ## 项目截图 :camera:
