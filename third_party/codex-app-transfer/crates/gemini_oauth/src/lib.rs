@@ -30,12 +30,19 @@
 //! Wire-level 实现参考 [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI)
 //! (Go, MIT) 的 `internal/auth/gemini/` 与 `internal/runtime/executor/gemini_cli_executor.go`。
 
+pub mod account_pool;
 pub mod antigravity;
 pub mod cloud_code;
 pub mod constants;
 pub mod flow;
+pub mod grok_build;
+pub mod pkce;
+pub mod qoder;
 pub mod service;
 pub mod token;
+pub mod trae;
+pub mod workbuddy;
+pub mod zai;
 
 pub use cloud_code::{bootstrap_project, ClientMetadata, CloudCodeError};
 pub use constants::{
@@ -55,6 +62,31 @@ pub use token::{OauthToken, TokenError, TokenStore};
 // Antigravity provider re-exports(parallel module,跟 gemini-cli 共用 token / FlowError 等)
 pub use antigravity::{
     antigravity_bootstrap_project, antigravity_static_models, fetch_antigravity_available_models,
-    refresh_antigravity_access_token, run_antigravity_oauth_flow_with_cancel,
-    AntigravityClientMetadata, AntigravityModelEntry,
+    fetch_gemini_quota_summary, refresh_antigravity_access_token,
+    run_antigravity_oauth_flow_with_cancel, AntigravityClientMetadata, AntigravityModelEntry,
+    GeminiQuota, QuotaError, QuotaWindow,
+};
+
+// z.ai / bigmodel(GLM Coding Plan 账号登录)provider re-exports(parallel module,
+// 独立 vendor wire,复用 gemini OauthFlowConfig / FlowError loopback 骨架)
+pub use zai::{
+    resume_zai_login, run_zai_login, ZaiCredential, ZaiCredentialStore, ZaiError, ZaiPendingStore,
+    ZaiPendingTokens, ZaiProvider, ZaiProviderConfig,
+};
+
+// Trae(字节 TRAE SOLO CN / Work CN 账号登录)provider re-exports(parallel module,
+// loopback OAuth2 + PKCE + 设备密钥签名 refresh + 按 provider id 多账号指纹隔离)
+pub use trae::{
+    claim_pending_for_provider, ensure_valid_trae_token, run_trae_login, DeviceFingerprint,
+    DeviceKeyPair, TraeCredential, TraeCredentialStore, TraeEdition, TraeError, TraePendingStore,
+    TraeProviderConfig,
+};
+
+// grok build(xAI grok CLI 编码后端账号登录)provider re-exports(parallel module,
+// 标准 OAuth2 device flow(RFC 8628)+ bearer token 单账号 store + 自动 refresh)
+pub use grok_build::{
+    complete_grok_build_login, ensure_valid_grok_build_token, is_grok_build_auth_scheme,
+    logout as grok_build_logout, prepare_grok_build_authorization, resolve_client_id,
+    AuthorizationRequest, GrokBuildCredential, GrokBuildCredentialStore, GrokBuildError,
+    LOOPBACK_PORT, PINNED_BASE_URL, REDIRECT_URI,
 };

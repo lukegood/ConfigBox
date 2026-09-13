@@ -37,6 +37,11 @@ pub use responses::{
     convert_chat_to_responses_stream, responses_body_to_chat_body,
     responses_body_to_chat_body_for_provider, ChatToResponsesConverter, ResponsesAdapter,
 };
+// [MOC-234] responses passthrough orphan function_call 降级修复:forward 层据此检测上游
+// orphan-400 + 拼回缺失 function_call 透明重试(store:false 反代续轮兜底)。
+pub use responses::tool_call_repair::{
+    is_orphan_function_call_error, rebuild_orphan_context_bytes,
+};
 pub use types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
 // [MOC-210] antigravity 原生出图履约:proxy(forward.rs)截获模型 image_gen 调用后,
 // 用这两个函数抽 prompt + 构造出图子请求(envelope),子请求响应的 inlineData 再经
@@ -104,14 +109,6 @@ fn drop_tool_counters() -> &'static std::sync::Mutex<std::collections::HashMap<S
     static COUNTERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
         std::sync::OnceLock::new();
     COUNTERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// 测试用 reset hook — production 永远不调,仅 `#[cfg(test)]` caller 可见。
-#[cfg(test)]
-pub(crate) fn reset_dropped_tool_counters() {
-    if let Ok(mut g) = drop_tool_counters().lock() {
-        g.clear();
-    }
 }
 
 #[cfg(test)]
@@ -184,48 +181,8 @@ mod warn_once_tests {
         );
     }
 
-    // 注:不测 `reset_dropped_tool_counters()` — 它会清掉 global counter,跟
-    // 其他并发跑的 test race。reset 函数是 trivial 的 `g.clear()`,留作 future
-    // test 想 isolated state 时用。
-}
-
-/// 本进程已自动禁用 web_search 的 provider id 集合 — 4xx fallback 路径调用
-/// `disable_web_search_for(provider_id)` 加入,`convert_web_search_tool`
-/// 调用 `is_web_search_disabled_for` 命中即 drop。
-///
-/// **设计语义**(对齐用户决策"A+B 双层"):
-/// - **A**:Provider 配置 `request_options.web_search_enabled` 默认 false,
-///   只有用户显式标 true 才会发 web_search 工具上去
-/// - **B**:上游真的拒了(MiMo plugin 没开 / token plan 套餐不支持 / 其他)
-///   后,proxy 自动加入此 cache,本进程后续 turn 立即 drop。下次启动
-///   cache 重置(用户去 UI 关 web_search_enabled = false 才是持久关闭)。
-///
-/// **本提交不做**:① transparent retry without web_search(用户视角第一次
-/// 请求失败,需要重新提问下一个 turn 才 work);② 写回 config.json 持久化
-/// (应用重启后用户配置仍是 enabled=true,需要再失败一次)。这两项留 follow-up。
-fn web_search_disabled_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    SET.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-pub fn disable_web_search_for(provider_id: &str) {
-    if let Ok(mut guard) = web_search_disabled_set().lock() {
-        if guard.insert(provider_id.to_owned()) {
-            tracing::warn!(
-                provider_id = %provider_id,
-                "auto-disabling web_search after upstream rejection (likely Web Search Plugin not activated upstream)"
-            );
-        }
-    }
-}
-
-pub fn is_web_search_disabled_for(provider_id: &str) -> bool {
-    web_search_disabled_set()
-        .lock()
-        .map(|s| s.contains(provider_id))
-        .unwrap_or(false)
+    // 注:counter 是 global OnceLock,test 间共享 —— 故各 test 用 unique tool_type 避免
+    // race(不靠 reset 清状态;原 `reset_dropped_tool_counters` test hook 因零调用已删)。
 }
 
 /// 把上游语义 error kind 映射成 Codex `response.failed` handler 认识的
@@ -238,20 +195,50 @@ pub fn is_web_search_disabled_for(provider_id: &str) -> bool {
 /// 映射策略(与 gemini_native / grok_web 共用):
 /// - 无歧义永久性(retry 同一请求必得同样失败)→ 映射成 Codex 非重试 code,
 ///   surface 错误 + 停止。当前白名单:
-///   `bad_request`, `content_filter`, `auth_error`, `permission_denied`
-///   → `"invalid_prompt"`(`ApiError::InvalidRequest`, `is_retryable()=false`)
+///   `bad_request`, `content_filter`, `auth_error`, `permission_denied`,
+///   `usage_limit_reached` → `"invalid_prompt"`(`ApiError::InvalidRequest`,
+///   `is_retryable()=false`)
 /// - 其余(timeout / rate_limited / quota_exceeded / server_error /
 ///   service_unavailable / upstream_error / upstream_transport_error /
 ///   grok_stream_error / upstream_truncated)→ 保留原 code → Codex Retryable。
 ///   **仅当确信是「无歧义永久性」分类时才加到上面白名单;拿不准留这里
 ///   (Retryable 比误杀安全,见 MOC-79 PR #325 两次 P2 教训)。**
 ///
+/// **为何配额耗尽用 `invalid_prompt` 而非语义更贴切的 `insufficient_quota`**
+/// (MOC-264 真机 e2e 实测,二者都非重试):
+/// - `invalid_prompt`:Codex 原样 surface 上游 `error.message` → 用户看到 GLM
+///   原文「已达到 5 小时的使用上限。您的限额将在 2026-06-20 18:50:41 重置。」
+///   (准确 reset 时间 + 用户语言)。
+/// - `insufficient_quota`:触发 Codex 自带 `QuotaExceeded` 模板,**覆盖**上游
+///   message → 显示英文「You've hit your usage limit. Upgrade your plan…, try
+///   again at <Codex 默认 now+1 月>」:丢失真实 reset 时间 + 误导用户去升级
+///   ChatGPT 套餐(与第三方 provider 配额无关)。故选 surface 原文的
+///   `invalid_prompt`。
+///
+/// `usage_limit_reached` vs `quota_exceeded` 的关键区别(别合并):
+/// - `usage_limit_reached`:`core::failure_stream::convert_upstream_error_stream`
+///   对 429 body 做**保守**强信号检测(计费/使用窗口用满,如 GLM「已达到 N 小时的
+///   使用上限,将在 … 重置」),在 reset 前 retry 必同样失败 → 非重试
+///   `invalid_prompt`,surface 干净 message + 停。对该函数的全部调用方(chat /
+///   grok_web / native-responses passthrough)生效。见 `body_has_usage_limit_signal`。
+/// - `quota_exceeded`:gemini_native 专用,Gemini 429 把 per-minute 限流与日配额
+///   混在一起无法区分,故**故意保留 Retryable**(误杀比漏判贵)。两者不可互换。
+///
 /// 原始语义分类仍由各 adapter 的 emit 函数写进 `error.upstream_error_kind`
 /// 诊断字段(Codex `Error` struct 无 `deny_unknown_fields`,该字段被安全忽略)。
 pub(crate) fn codex_retry_code(upstream_kind: &str) -> &str {
     match upstream_kind {
         // 无歧义永久性(retry 同一请求必得同样失败)→ Codex 非重试 code,surface + 停
-        "bad_request" | "content_filter" | "auth_error" | "permission_denied" => "invalid_prompt",
+        // 配额耗尽一并归这里:真机 e2e 实测 invalid_prompt 会 surface 上游原始
+        // message(GLM「已达到 5 小时的使用上限,将在 … 重置」原样显示);而
+        // insufficient_quota 触发 Codex 自带 quota 模板(覆盖成英文「Upgrade your
+        // plan / try again at <Codex 默认 now+1月>」,丢失真实 reset 时间 + 误导
+        // 用户升级 ChatGPT 套餐)。详见 codex_retry_code doc。
+        "bad_request"
+        | "content_filter"
+        | "auth_error"
+        | "permission_denied"
+        | "usage_limit_reached" => "invalid_prompt",
         // 其余 → 保留原 code → Codex Retryable
         other => other,
     }

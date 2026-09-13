@@ -39,6 +39,7 @@ v0.5.3: May 18, optimized configuration switching logic, synced upstream Codex g
 v0.5.4: May 18, emergency fix for Codex gateway malfunction.  
 v0.5.5: May 23, synced upstream Codex gateway updates.  
 v0.5.6: May 31, synced upstream gateway updates, fixed config not syncing when manually changed, improved user experience.
+v1.0.0: Sep 13, synced upstream account-login Gateway support for Z.ai, BigModel, Trae, WorkBuddy, Qoder, and Grok Build, and fixed legacy profile shadow files surviving deletion.
 
 ## Screenshot :camera:
 

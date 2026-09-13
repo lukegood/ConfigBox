@@ -466,13 +466,17 @@ def delete_profile(tool: ToolConfig, name: str) -> None:
                 validate_contents(tool, fallback_contents)
             path = profile_path(tool, name)
             legacy_path = legacy_profile_path(tool, name)
+            removed = False
             if path.exists() and path.is_dir():
                 shutil.rmtree(path)
+                removed = True
             elif path.exists() and path.is_file():
                 path.unlink()
-            elif legacy_path.exists() and legacy_path.is_file():
+                removed = True
+            if legacy_path != path and legacy_path.exists() and legacy_path.is_file():
                 legacy_path.unlink()
-            else:
+                removed = True
+            if not removed:
                 raise APIError("PROFILE_NOT_FOUND", "Profile not found.", 404)
             profile_history = history_profile_path(tool, name)
             if profile_history.exists():

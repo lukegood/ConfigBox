@@ -20,30 +20,47 @@ pub mod model_alias;
 pub mod model_context_policy;
 pub mod paths;
 pub mod presets;
+pub mod provider_credit_rate;
+pub mod qoder_catalog;
 pub mod raw_io;
 pub mod reasoning_effort_policy;
+pub mod reasoning_tiers;
 pub mod schema;
+pub mod workbuddy_catalog;
 
 pub use base_instructions::CAS_BASE_INSTRUCTIONS;
-pub use compact_thinking_policy::{compact_disable_thinking_wire, DisableThinkingWire};
+pub use compact_thinking_policy::{
+    compact_disable_thinking_wire, compact_disable_thinking_wire_scoped, DisableThinkingWire,
+};
 #[allow(deprecated)]
 pub use healing::heal_builtin_extra_headers;
 pub use healing::heal_builtin_provider_fields;
 pub use healing::heal_legacy_update_url;
+pub use healing::migrate_grok_build_model_to_grok_4_5;
+pub use healing::migrate_legacy_preset_names;
 pub use model_alias::{
     empty_model_mappings, has_internal_one_m_suffix, normalize_model_mappings, openai_model_slot,
     provider_slug, strip_internal_model_suffix, MODEL_ORDER, MODEL_SLOTS,
 };
 pub use model_context_policy::{
-    documented_context_window, model_supports_1m, ONE_M_CONTEXT_WINDOW,
+    documented_context_window, documented_context_window_scoped, model_supports_1m,
+    model_supports_1m_scoped, ONE_M_CONTEXT_WINDOW,
 };
 pub use paths::{
     config_dir, config_file, library_dir, resolve_home, sessions_db_file, tool_artifacts_db_file,
     HOME_OVERRIDE_ENV,
 };
 pub use presets::builtin_presets;
+pub use provider_credit_rate::display_name_with_rate;
 pub use raw_io::{load_raw_config, save_raw_config, IoError, RawConfig};
 pub use reasoning_effort_policy::{
     apply_reasoning_effort, reasoning_effort_wire, ReasoningEffortWire,
 };
+pub use reasoning_tiers::{
+    all_reasoning_tier_efforts, reasoning_tiers_for_model, reasoning_tiers_for_model_scoped,
+    reasoning_tiers_for_qoder_model, ReasoningTier, ReasoningTierSpec,
+};
 pub use schema::{Config, ModelSlotKey, Provider, Settings, APP_VERSION, DEFAULT_UPDATE_URL};
+pub use workbuddy_catalog::{
+    is_workbuddy_auth_scheme, workbuddy_catalog_display_names, WorkbuddyModel, WORKBUDDY_MODELS,
+};

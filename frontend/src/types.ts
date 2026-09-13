@@ -142,7 +142,20 @@ export type OAuthStatus = {
   loggedIn: boolean;
   email?: string | null;
   projectId?: string | null;
+  userId?: string | null;
+  nickname?: string | null;
+  obtainedAt?: number | null;
   expiresAt?: number | null;
+  expiryDate?: number | null;
   shouldRefresh?: boolean;
   cancelled?: boolean;
+  pending?: boolean;
+  accounts?: Array<{
+    uid: string;
+    display?: string | null;
+    nickname?: string | null;
+    isActive?: boolean;
+    exhausted?: boolean;
+    exhaustedUntil?: number;
+  }>;
 };

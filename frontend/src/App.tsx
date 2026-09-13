@@ -51,6 +51,8 @@ import {
   setAuth,
   startGateway,
   stopGateway,
+  submitGatewayOAuthCode,
+  switchGatewayOAuthAccount,
   updateGatewayProvider
 } from "./api";
 import type {
@@ -94,6 +96,16 @@ type GatewayProviderForm = {
   grokUserAgent: string;
   isBuiltin: boolean;
 };
+
+type GatewayOAuthKind =
+  | "gemini"
+  | "antigravity"
+  | "zai"
+  | "bigmodel"
+  | "trae"
+  | "workbuddy"
+  | "qoder"
+  | "grok_build";
 
 type GatewayCustomMapping = {
   id: string;
@@ -190,6 +202,31 @@ const gatewayApiFormats = [
   { value: "antigravity_oauth", label: "Antigravity (OAuth)" },
   { value: "grok_web", label: "Grok Web" }
 ] as const;
+
+const gatewayAuthSchemes = [
+  { value: "bearer", label: "Bearer" },
+  { value: "x-api-key", label: "X-Api-Key" },
+  { value: "google_api_key", label: "Google API Key" },
+  { value: "google_oauth_cloud_code", label: "Google OAuth Cloud Code" },
+  { value: "google_oauth_antigravity", label: "Google OAuth Antigravity" },
+  { value: "grok_cookie", label: "Grok Cookie" },
+  { value: "zai_oauth", label: "Z.ai OAuth" },
+  { value: "bigmodel_oauth", label: "BigModel OAuth" },
+  { value: "trae_oauth", label: "Trae OAuth" },
+  { value: "workbuddy_oauth", label: "WorkBuddy OAuth" },
+  { value: "qoder_oauth", label: "Qoder OAuth" },
+  { value: "grok_build_oauth", label: "Grok Build OAuth" },
+  { value: "none", label: "None" }
+] as const;
+
+const gatewayExternalLoginAuthSchemes = new Set([
+  "zai_oauth",
+  "bigmodel_oauth",
+  "trae_oauth",
+  "workbuddy_oauth",
+  "qoder_oauth",
+  "grok_build_oauth"
+]);
 
 const gatewayPredefinedModelKeys = new Set<string>(gatewayModelSlots.map((slot) => slot.key));
 let gatewayCustomMappingCounter = 0;
@@ -367,11 +404,9 @@ function App() {
   const [gatewayLogBytes, setGatewayLogBytes] = useState({ current: 0, max: 0 });
   const [gatewayProviderForm, setGatewayProviderForm] = useState<GatewayProviderForm | null>(null);
   const [gatewayRestartRequired, setGatewayRestartRequired] = useState(false);
-  const [gatewayOAuthStatus, setGatewayOAuthStatus] = useState<Record<"gemini" | "antigravity", OAuthStatus | null>>({
-    gemini: null,
-    antigravity: null
-  });
-  const [gatewayOAuthBusy, setGatewayOAuthBusy] = useState<"gemini" | "antigravity" | null>(null);
+  const [gatewayOAuthStatus, setGatewayOAuthStatus] = useState<Record<string, OAuthStatus | null>>({});
+  const [gatewayOAuthBusy, setGatewayOAuthBusy] = useState<GatewayOAuthKind | null>(null);
+  const [gatewayOAuthCode, setGatewayOAuthCode] = useState("");
   const [openCodeProviderForm, setOpenCodeProviderForm] = useState<OpenCodeProviderForm | null>(null);
   const [openCodeModelForm, setOpenCodeModelForm] = useState<OpenCodeModelForm | null>(null);
   const [claudeProviderForm, setClaudeProviderForm] = useState<ClaudeProviderForm | null>(null);
@@ -818,10 +853,13 @@ function App() {
       grokUserAgent: "",
       isBuiltin: providerIsBuiltin(provider)
     });
-    if (provider.apiFormat === "gemini_cli_oauth") {
-      void loadGatewayOAuth("gemini");
-    } else if (provider.apiFormat === "antigravity_oauth") {
-      void loadGatewayOAuth("antigravity");
+    const oauthKind = gatewayOAuthKindForProvider(provider.apiFormat, provider.authScheme);
+    if (oauthKind) {
+      void getGatewayOAuthStatus(oauthKind, ["trae", "workbuddy", "qoder"].includes(oauthKind) ? provider.id : undefined)
+        .then((next) => setGatewayOAuthStatus((current) => ({ ...current, [oauthKind]: next })))
+        .catch(() => undefined);
+    }
+    if (provider.apiFormat === "antigravity_oauth") {
       void loadGatewayAntigravityModels();
     }
   }
@@ -841,6 +879,14 @@ function App() {
           apiFormat: value,
           authScheme: recommendedGatewayAuthScheme(value)
         };
+      }
+      if (field === "authScheme") {
+        const kind = gatewayOAuthKindForProvider(current.apiFormat, value);
+        if (kind && current.id) {
+          void getGatewayOAuthStatus(kind, ["trae", "workbuddy", "qoder"].includes(kind) ? current.id : undefined)
+            .then((next) => setGatewayOAuthStatus((state) => ({ ...state, [kind]: next })))
+            .catch(() => undefined);
+        }
       }
       return { ...current, [field]: value };
     });
@@ -877,11 +923,18 @@ function App() {
       };
     });
     setShowGatewayProviderApiKey(false);
+    const oauthKind = gatewayOAuthKindForProvider(provider.apiFormat, provider.authScheme);
+    if (oauthKind) {
+      const providerId = ["trae", "workbuddy", "qoder"].includes(oauthKind) ? gatewayProviderForm?.id : undefined;
+      if (providerId || !["trae", "workbuddy", "qoder"].includes(oauthKind)) {
+        void getGatewayOAuthStatus(oauthKind, providerId)
+          .then((next) => setGatewayOAuthStatus((current) => ({ ...current, [oauthKind]: next })))
+          .catch(() => undefined);
+      }
+    }
     if (provider.apiFormat === "gemini_cli_oauth") {
-      void loadGatewayOAuth("gemini");
       setGatewayModelEntries([]);
     } else if (provider.apiFormat === "antigravity_oauth") {
-      void loadGatewayOAuth("antigravity");
       void loadGatewayAntigravityModels();
     } else {
       setGatewayModelEntries([]);
@@ -1068,26 +1121,45 @@ function App() {
     }
   }
 
-  function selectedOAuthKind() {
+  function selectedOAuthKind(): GatewayOAuthKind | null {
     if (gatewayProviderForm?.apiFormat === "gemini_cli_oauth") return "gemini";
     if (gatewayProviderForm?.apiFormat === "antigravity_oauth") return "antigravity";
+    const auth = gatewayProviderForm?.authScheme?.trim().toLowerCase().replace(/-/g, "_");
+    if (auth === "zai_oauth") return "zai";
+    if (auth === "bigmodel_oauth") return "bigmodel";
+    if (auth === "trae_oauth") return "trae";
+    if (auth === "workbuddy_oauth") return "workbuddy";
+    if (auth === "qoder_oauth") return "qoder";
+    if (auth === "grok_build_oauth") return "grok_build";
     return null;
   }
 
-  async function loadGatewayOAuth(kind: "gemini" | "antigravity") {
+  function selectedOAuthProviderId(kind: GatewayOAuthKind) {
+    if (["trae", "workbuddy", "qoder"].includes(kind)) {
+      return gatewayProviderForm?.id || "";
+    }
+    return "";
+  }
+
+  async function loadGatewayOAuth(kind: GatewayOAuthKind) {
     try {
-      const next = await getGatewayOAuthStatus(kind);
+      const next = await getGatewayOAuthStatus(kind, selectedOAuthProviderId(kind));
       setGatewayOAuthStatus((current) => ({ ...current, [kind]: next }));
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载 OAuth 状态失败");
     }
   }
 
-  async function handleGatewayOAuthLogin(kind: "gemini" | "antigravity") {
+  async function handleGatewayOAuthLogin(kind: GatewayOAuthKind) {
+    const providerId = selectedOAuthProviderId(kind);
+    if (["workbuddy", "qoder"].includes(kind) && !providerId) {
+      setError("请先保存该 Provider，再添加账号");
+      return;
+    }
     setGatewayOAuthBusy(kind);
     setError("");
     try {
-      const next = await loginGatewayOAuth(kind);
+      const next = await loginGatewayOAuth(kind, providerId);
       setGatewayOAuthStatus((current) => ({ ...current, [kind]: next }));
       setStatus(next.loggedIn ? `${oauthLabel(kind)} 已登录` : `${oauthLabel(kind)} 未登录`);
     } catch (err) {
@@ -1097,17 +1169,46 @@ function App() {
     }
   }
 
-  async function handleGatewayOAuthLogout(kind: "gemini" | "antigravity") {
+  async function handleGatewayOAuthLogout(kind: GatewayOAuthKind, uid?: string) {
     setGatewayOAuthBusy(kind);
     setError("");
     try {
-      const next = await logoutGatewayOAuth(kind);
+      const next = await logoutGatewayOAuth(kind, selectedOAuthProviderId(kind), uid);
       setGatewayOAuthStatus((current) => ({ ...current, [kind]: next }));
       setStatus(`${oauthLabel(kind)} 已退出`);
+      await loadGatewayOAuth(kind);
     } catch (err) {
       setError(err instanceof Error ? err.message : "OAuth 退出失败");
     } finally {
       setGatewayOAuthBusy(null);
+    }
+  }
+
+  async function handleGatewayOAuthSwitch(kind: GatewayOAuthKind, uid: string) {
+    const providerId = selectedOAuthProviderId(kind);
+    if (!providerId) return;
+    setError("");
+    try {
+      await switchGatewayOAuthAccount(kind, providerId, uid);
+      await loadGatewayOAuth(kind);
+      setStatus(`${oauthLabel(kind)} 已切换账号`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "切换账号失败");
+    }
+  }
+
+  async function handleGatewayOAuthSubmitCode(kind: GatewayOAuthKind) {
+    if (!gatewayOAuthCode.trim()) {
+      setError("请输入授权 code");
+      return;
+    }
+    setError("");
+    try {
+      const result = await submitGatewayOAuthCode(kind, gatewayOAuthCode.trim());
+      setStatus(result.accepted ? "授权 code 已提交" : result.error || "没有进行中的登录");
+      setGatewayOAuthCode("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "提交授权 code 失败");
     }
   }
 
@@ -2015,7 +2116,7 @@ function App() {
                   </datalist>
                 ) : null}
               </label>
-              {gatewayUsesApiKey(gatewayProviderForm.apiFormat) ? (
+              {gatewayUsesApiKey(gatewayProviderForm.apiFormat, gatewayProviderForm.authScheme) ? (
                 <label>
                   API Key
                   <div className="secret-input-wrap">
@@ -2042,13 +2143,11 @@ function App() {
                   value={gatewayProviderForm.authScheme}
                   onChange={(event) => updateGatewayProviderForm("authScheme", event.target.value)}
                 >
-                  <option value="bearer">Bearer</option>
-                  <option value="x-api-key">X-Api-Key</option>
-                  <option value="google_api_key">Google API Key</option>
-                  <option value="google_oauth_cloud_code">Google OAuth Cloud Code</option>
-                  <option value="google_oauth_antigravity">Google OAuth Antigravity</option>
-                  <option value="grok_cookie">Grok Cookie</option>
-                  <option value="none">None</option>
+                  {gatewayAuthSchemes.map((scheme) => (
+                    <option key={scheme.value} value={scheme.value}>
+                      {scheme.label}
+                    </option>
+                  ))}
                 </select>
               </label>
               <label>
@@ -2070,7 +2169,7 @@ function App() {
                 <div className="gateway-mapping-head">
                   <div>
                     <h4>{oauthLabel(selectedOAuthKind()!)} 登录</h4>
-                    <p>OAuth token 会保存到本机 token 文件；Gateway 运行后可在这里完成登录。</p>
+                    <p>登录凭证会保存到上游兼容的本机 token store；Gateway 运行后可在这里完成登录。</p>
                   </div>
                   <div className="gateway-oauth-actions">
                     <button
@@ -2100,18 +2199,69 @@ function App() {
                   </div>
                 </div>
                 <div className="gateway-credential-meta">
-                  {gatewayOAuthStatus[selectedOAuthKind()!]?.loggedIn ? (
+                  {gatewayOAuthStatus[selectedOAuthKind()!]?.accounts?.length ? (
+                    gatewayOAuthStatus[selectedOAuthKind()!]!.accounts!.map((account) => (
+                      <span key={account.uid}>
+                        {account.isActive ? "当前 " : ""}
+                        {account.display || account.nickname || account.uid}
+                        {account.exhausted ? " 额度不足" : ""}
+                        <button
+                          type="button"
+                          onClick={() => handleGatewayOAuthSwitch(selectedOAuthKind()!, account.uid)}
+                          disabled={loading || gatewayOAuthBusy !== null || account.isActive}
+                        >
+                          设为当前
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleGatewayOAuthLogout(selectedOAuthKind()!, account.uid)}
+                          disabled={loading || gatewayOAuthBusy !== null}
+                        >
+                          移除
+                        </button>
+                      </span>
+                    ))
+                  ) : gatewayOAuthStatus[selectedOAuthKind()!]?.loggedIn ? (
                     <>
                       <span>已登录</span>
                       <span>{gatewayOAuthStatus[selectedOAuthKind()!]?.email || "未知账号"}</span>
-                      <span>{gatewayOAuthStatus[selectedOAuthKind()!]?.projectId || "无 project"}</span>
+                      <span>
+                        {gatewayOAuthStatus[selectedOAuthKind()!]?.projectId ||
+                          gatewayOAuthStatus[selectedOAuthKind()!]?.userId ||
+                          "无账号标识"}
+                      </span>
                     </>
                   ) : (
-                    <span>{gatewayStatus?.running ? "未登录" : "先启动 Gateway，再登录"}</span>
+                    <span>
+                      {gatewayStatus?.running
+                        ? ["workbuddy", "qoder"].includes(selectedOAuthKind()!) && !gatewayProviderForm.id
+                          ? "先保存 Provider，再添加账号"
+                          : "未登录"
+                        : "先启动 Gateway，再登录"}
+                    </span>
                   )}
                 </div>
+                {selectedOAuthKind() === "grok_build" ? (
+                  <div className="gateway-mapping-grid">
+                    <label>
+                      授权 code
+                      <input
+                        value={gatewayOAuthCode}
+                        onChange={(event) => setGatewayOAuthCode(event.target.value)}
+                        placeholder="从 Grok 授权页复制 code"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => handleGatewayOAuthSubmitCode("grok_build")}
+                      disabled={loading || !gatewayOAuthCode.trim()}
+                    >
+                      提交 code
+                    </button>
+                  </div>
+                ) : null}
                 <p className="gateway-credential-hint">
-                  若浏览器没有自动打开，请到 Gateway 日志里复制 OAuth URL 手动访问。
+                  若浏览器没有自动打开，请到 Gateway 日志里复制 OAuth URL 手动访问。Grok Build 授权页显示 code 时，复制到这里提交。
                 </p>
               </section>
             ) : null}
@@ -2861,7 +3011,19 @@ function collectGrokWebPayload(form: GatewayProviderForm) {
   return Object.keys(payload).length ? payload : null;
 }
 
-function gatewayUsesApiKey(apiFormat: string) {
+function gatewayUsesApiKey(apiFormat: string, authScheme = "") {
+  const auth = authScheme.trim().toLowerCase().replace(/-/g, "_");
+  if (
+    [
+      "none",
+      "google_oauth_cloud_code",
+      "google_oauth_antigravity",
+      "grok_cookie",
+      ...gatewayExternalLoginAuthSchemes
+    ].includes(auth)
+  ) {
+    return false;
+  }
   return !["gemini_cli_oauth", "antigravity_oauth", "grok_web"].includes(apiFormat);
 }
 
@@ -2929,8 +3091,31 @@ function recommendedGatewayAuthScheme(apiFormat: string) {
   return "bearer";
 }
 
-function oauthLabel(kind: "gemini" | "antigravity") {
-  return kind === "gemini" ? "Gemini CLI OAuth" : "Antigravity OAuth";
+function gatewayOAuthKindForProvider(apiFormat: string, authScheme: string): GatewayOAuthKind | null {
+  if (apiFormat === "gemini_cli_oauth") return "gemini";
+  if (apiFormat === "antigravity_oauth") return "antigravity";
+  const auth = authScheme.trim().toLowerCase().replace(/-/g, "_");
+  if (auth === "zai_oauth") return "zai";
+  if (auth === "bigmodel_oauth") return "bigmodel";
+  if (auth === "trae_oauth") return "trae";
+  if (auth === "workbuddy_oauth") return "workbuddy";
+  if (auth === "qoder_oauth") return "qoder";
+  if (auth === "grok_build_oauth") return "grok_build";
+  return null;
+}
+
+function oauthLabel(kind: GatewayOAuthKind) {
+  const labels: Record<GatewayOAuthKind, string> = {
+    gemini: "Gemini CLI OAuth",
+    antigravity: "Antigravity OAuth",
+    zai: "Z.ai OAuth",
+    bigmodel: "BigModel OAuth",
+    trae: "Trae OAuth",
+    workbuddy: "WorkBuddy OAuth",
+    qoder: "Qoder OAuth",
+    grok_build: "Grok Build OAuth"
+  };
+  return labels[kind];
 }
 
 export default App;

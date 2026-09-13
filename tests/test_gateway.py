@@ -170,6 +170,19 @@ def test_gateway_presets_use_configbox_schema(tmp_path: Path):
     assert antigravity["messages"]
 
 
+def test_gateway_presets_include_synced_upstream_login_providers(tmp_path: Path):
+    gateway, *_ = load_gateway(tmp_path)
+
+    presets = gateway.list_presets()["presets"]
+    by_id = {item["id"]: item for item in presets}
+
+    assert len(presets) >= 22
+    assert by_id["qoder-login"]["provider"]["authScheme"] == "qoder_oauth"
+    assert by_id["grok-build"]["provider"]["apiFormat"] == "responses"
+    assert by_id["zai-login"]["provider"]["apiFormat"] == "anthropic_messages"
+    assert by_id["workbuddy"]["provider"]["authScheme"] == "bearer"
+
+
 def test_minimax_preset_uses_m3_with_one_m_context(tmp_path: Path):
     gateway, *_ = load_gateway(tmp_path)
 
@@ -193,7 +206,7 @@ def test_zhipu_coding_preset_uses_configbox_schema(tmp_path: Path):
 
     assert provider["apiFormat"] == "openai_chat"
     assert provider["baseUrl"] == "https://open.bigmodel.cn/api/coding/paas/v4"
-    assert provider["extraHeaders"]["User-Agent"] == "claude-cli/2.1.175 (external, cli)"
+    assert provider["extraHeaders"] == {}
     assert provider["models"]["default"] == "glm-4.7"
     assert provider["models"]["gpt_5_3_codex"] == "glm-4.6"
 

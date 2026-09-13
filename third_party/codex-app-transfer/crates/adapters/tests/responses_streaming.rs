@@ -23,6 +23,9 @@ use futures_core::Stream;
 use futures_util::stream::{self, StreamExt};
 use serde_json::Value;
 
+// [MOC-195] main 前隔离 home,防未来用例触碰真机数据(详见 common/mod.rs)
+mod common;
+
 fn fixture_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop(); // -> crates/
@@ -98,7 +101,7 @@ const KIMI_REASONING_LIFECYCLE: &[&str] = &[
     "response.output_item.added", // reasoning lazy open
     "response.reasoning_summary_part.added",
     "response.reasoning_summary_text.delta", // open_reasoning 注入的 `**Thinking**\n\n` prefix
-    "response.reasoning_summary_text.delta", // 上游真实 reasoning_content delta
+    "response.reasoning_summary_text.delta", // 上游真实 reasoning_content delta(summary 通道)
     "response.reasoning_summary_text.done",
     "response.reasoning_summary_part.done",
     "response.output_item.done", // reasoning close
@@ -124,6 +127,16 @@ async fn kimi_fixture_emits_reasoning_lifecycle_single_chunk() {
         .unwrap();
     assert_eq!(summary_done.1["text"], "**Thinking**\n\nThe");
 
+    // [单发 summary 通道] 不再发 content 通道 `reasoning_text.*`(对齐官方 v26.623、
+    // 消除重渲染);断言其确实不出现
+    assert!(
+        !events
+            .iter()
+            .any(|(n, _)| n == "response.reasoning_text.delta"
+                || n == "response.reasoning_text.done"),
+        "content 通道 reasoning_text 事件应已移除"
+    );
+
     // completed: incomplete + max_output_tokens(finish_reason=length),
     // output 里只有 reasoning item,没有 message item
     let completed = &events.last().unwrap().1["response"];
@@ -137,8 +150,10 @@ async fn kimi_fixture_emits_reasoning_lifecycle_single_chunk() {
     let output = completed["output"].as_array().unwrap();
     assert_eq!(output.len(), 1);
     assert_eq!(output[0]["type"], "reasoning");
-    assert_eq!(output[0]["content"], Value::Null);
-    assert_eq!(output[0]["encrypted_content"], Value::Null);
+    // [MOC-218 第三关] reasoning item 不带 content / encrypted_content(OpenAI
+    // 后端校验 input reasoning content 长度 0;content 通道只走 SSE 事件)
+    assert!(output[0].get("content").is_none());
+    assert!(output[0].get("encrypted_content").is_none());
     assert_eq!(output[0]["summary"][0]["type"], "summary_text");
     assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nThe");
 }

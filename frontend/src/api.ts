@@ -186,16 +186,34 @@ export async function activateGatewayProvider(providerId: string) {
   return request<GatewayProvider>(`/api/gateway/providers/${providerId}/activate`, { method: "POST" });
 }
 
-export async function getGatewayOAuthStatus(kind: "gemini" | "antigravity") {
-  return request<OAuthStatus>(`/api/gateway/oauth/${kind}/status`);
+export async function getGatewayOAuthStatus(kind: string, providerId?: string) {
+  const query = providerId ? `?providerId=${pathSegment(providerId)}` : "";
+  return request<OAuthStatus>(`/api/gateway/oauth/${kind}/status${query}`);
 }
 
-export async function loginGatewayOAuth(kind: "gemini" | "antigravity") {
-  return request<OAuthStatus>(`/api/gateway/oauth/${kind}/login`, { method: "POST" });
+export async function loginGatewayOAuth(kind: string, providerId?: string) {
+  const query = providerId ? `?providerId=${pathSegment(providerId)}` : "";
+  return request<OAuthStatus>(`/api/gateway/oauth/${kind}/login${query}`, { method: "POST" });
 }
 
-export async function logoutGatewayOAuth(kind: "gemini" | "antigravity") {
-  return request<OAuthStatus>(`/api/gateway/oauth/${kind}/logout`, { method: "DELETE" });
+export async function logoutGatewayOAuth(kind: string, providerId?: string, uid?: string) {
+  const params = new URLSearchParams();
+  if (providerId) params.set("providerId", providerId);
+  if (uid) params.set("uid", uid);
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return request<OAuthStatus>(`/api/gateway/oauth/${kind}/logout${query}`, { method: "DELETE" });
+}
+
+export async function switchGatewayOAuthAccount(kind: string, providerId: string, uid: string) {
+  const params = new URLSearchParams({ providerId, uid });
+  return request<{ active: string }>(`/api/gateway/oauth/${kind}/switch?${params.toString()}`, { method: "POST" });
+}
+
+export async function submitGatewayOAuthCode(kind: string, code: string) {
+  return request<{ accepted: boolean; error?: string }>(`/api/gateway/oauth/${kind}/submit-code`, {
+    method: "POST",
+    body: JSON.stringify({ code })
+  });
 }
 
 export async function getGatewayAntigravityModels() {

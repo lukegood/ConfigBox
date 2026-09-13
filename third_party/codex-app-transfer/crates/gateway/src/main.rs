@@ -18,6 +18,8 @@ use codex_app_transfer_registry::{load_raw_config, Config};
 use serde_json::json;
 use tokio::net::TcpListener;
 
+mod oauth_admin;
+
 #[derive(Debug, Clone)]
 struct Args {
     config: PathBuf,
@@ -141,6 +143,7 @@ async fn run() -> Result<(), String> {
             "/__admin/antigravity-oauth/logout",
             delete(antigravity_oauth_logout),
         )
+        .merge(oauth_admin::routes())
         .merge(proxy);
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()

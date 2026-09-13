@@ -480,6 +480,9 @@ pub(crate) fn prepare_cloud_code_request(
         body: bytes::Bytes::from(outer_body),
         upstream_headers: http::HeaderMap::new(),
         response_session: Some(conversion.response_session),
+        // [MOC-232] context_breakdown 不再经 adapter_metadata 透传 —— 改由 responses::request
+        // 内 spawn_blocking 后台算并按对话 uuid 落盘(搬离转发关键路径,见 context_breakdown.rs)。
+        // 本路径无其它 metadata。
         adapter_metadata: None,
         is_compact: false,
         compact_v2: false,

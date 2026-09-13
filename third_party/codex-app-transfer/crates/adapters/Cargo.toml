@@ -37,8 +37,18 @@ base64 = "0.22"
 # (借鉴 Codex generated_images / Claude paste-cache),消除逐轮快照重复存储。
 sha2 = "0.10"
 hex = "0.4"
+# tiktoken-rs 0.12 uses let-chain syntax that is not accepted by rust:1.86-slim.
+tiktoken-rs = "0.11.0"
+# [MOC-232] 把 context breakdown 的 o200k 逐 item tokenize 搬离转发关键路径:adapter 内
+# 用 Handle::try_current + spawn_blocking 起后台任务(只需 `rt`,不自建 runtime —
+# proxy / src-tauri 提供 runtime)。dev-dependencies 另带 rt-multi-thread 供测试。
+# [MOC-234] `sync`:responses 观测 tee 用 mpsc channel 把 SSE 解析整体移出流式热路径
+# (poll_next 只 O(1) 入队,解析在 spawned task 异步消费 → 对流式输出零影响)。
+tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 indexmap = "2"
 tempfile = "3"
+# [MOC-195] 集成测试 main 前隔离 home(tests/common/mod.rs),版本跟 lock 内既有传递依赖一致
+ctor = "1.0"

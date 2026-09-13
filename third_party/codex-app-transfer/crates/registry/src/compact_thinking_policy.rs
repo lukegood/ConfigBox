@@ -53,7 +53,9 @@
 //!   thinking 后,**当前调用**的模型不思考、不产 reasoning_content;但**历史**
 //!   仍可能含上一轮的 reasoning_content placeholder,不影响。
 
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+use crate::reasoning_tiers::{reasoning_tiers_for_model, reasoning_tiers_for_model_scoped};
 
 /// compact 路径 disable-thinking 的 wire 形态。
 ///
@@ -83,6 +85,20 @@ pub enum DisableThinkingWire {
     /// - 小米 MiMo v2.x 全系(`help.aliyun.com/zh/model-studio/mimo` 跟 Qwen 同款
     ///   `enable_thinking` wire)
     EnableThinkingFalse,
+
+    /// **[MOC-241] GLM 双发** —— 同时写顶级 `thinking:{"type":"disabled"}`(hosted Z.AI /
+    /// BigModel,docs.bigmodel.cn / 本仓 #248 实测)+ 嵌套 `chat_template_kwargs.enable_thinking:false`
+    /// (自建 vLLM/SGLang,GLM 官方客户端智谱 ZCode `createGlm52ReasoningProviderOptions` 的
+    /// openaiCompatible wire)。二者皆「关」、不矛盾,覆盖 hosted 与自建两种部署。
+    GlmDual,
+
+    /// **[MOC-297] QoderWork** —— 写 `reasoning_effort: "none"` 关思考。QoderWork(阿里 Qoder)
+    /// 经 remoteChatAsk `parameters.reasoning_effort` 控思考(`qoder_auth::body::build_parameters`
+    /// 透传 chat body 的 `reasoning_effort`),**实测 `reasoning_effort="none"` → 不输出 reasoning、
+    /// `high`/`max` → 思考**(gateway.qoder.com.cn)。故它的 disable = 显式 `reasoning_effort:"none"`
+    /// (不是删、也不是 thinking 顶级字段——那些会被 build_remote_chat_ask 丢弃)。**与其它派相反:
+    /// 保留而非移除 reasoning_effort**。
+    ReasoningEffortNone,
 }
 
 impl DisableThinkingWire {
@@ -102,22 +118,35 @@ impl DisableThinkingWire {
     /// 已有的 `thinking`/`enable_thinking`,若 body 已显式 **enable** thinking,则不关
     /// 思考、也保留用户/provider 的 `reasoning_effort`(不能无脑删,否则丢配置)。
     pub fn inject(self, chat_body: &mut Value) {
-        let Some(obj) = chat_body.as_object_mut() else {
-            return;
-        };
+        if let Some(obj) = chat_body.as_object_mut() {
+            self.apply_to_map(obj);
+        }
+    }
+
+    /// 同 [`Self::inject`],但直接作用在 chat body 的 `Map` 上。
+    ///
+    /// disable 逻辑的**单一来源**:compact 路径走 [`Self::inject`](`Value`),
+    /// reasoning_effort_policy 的 GLM `none` 路径走本方法(`Map`),共用同一实现。
+    pub fn apply_to_map(self, obj: &mut Map<String, Value>) {
         // 先 insert disable wire(不覆盖已有值),并判定 thinking 最终是否真被关。
         let disabled = match self {
-            Self::ThinkingTypeDisabled => {
-                let entry = obj
-                    .entry("thinking".to_owned())
-                    .or_insert_with(|| serde_json::json!({"type": "disabled"}));
-                entry.get("type").and_then(|t| t.as_str()) == Some("disabled")
+            Self::ThinkingTypeDisabled => set_thinking_type_disabled(obj),
+            Self::EnableThinkingFalse => set_enable_thinking_false(obj),
+            // [MOC-241] GLM 双发:hosted 顶级 thinking + 自建 chat_template_kwargs 都写;
+            // 任一生效即视为已关(覆盖 hosted / 自建两种部署)。
+            Self::GlmDual => {
+                let a = set_thinking_type_disabled(obj);
+                let b = set_chat_template_enable_thinking_false(obj);
+                a || b
             }
-            Self::EnableThinkingFalse => {
-                let entry = obj
-                    .entry("enable_thinking".to_owned())
-                    .or_insert_with(|| serde_json::json!(false));
-                entry.as_bool() == Some(false)
+            // QoderWork:disable = 显式 `reasoning_effort:"none"`(**覆盖**已有值,它本身就是关思考
+            // 信号)。返回 false 跳过下面的 remove——绝不删,删了 QoderWork 就当默认思考开。
+            Self::ReasoningEffortNone => {
+                obj.insert(
+                    "reasoning_effort".to_owned(),
+                    Value::String("none".to_owned()),
+                );
+                false
             }
         };
         // 仅当 thinking 确实被关掉才删 reasoning_effort(见上方 P2 说明)。
@@ -125,6 +154,36 @@ impl DisableThinkingWire {
             obj.remove("reasoning_effort");
         }
     }
+}
+
+/// 顶级 `thinking:{"type":"disabled"}`(`or_insert` 不覆盖已有);返回 thinking 是否最终为 disabled。
+fn set_thinking_type_disabled(obj: &mut Map<String, Value>) -> bool {
+    let entry = obj
+        .entry("thinking".to_owned())
+        .or_insert_with(|| serde_json::json!({"type": "disabled"}));
+    entry.get("type").and_then(|t| t.as_str()) == Some("disabled")
+}
+
+/// 顶级 `enable_thinking:false`(`or_insert` 不覆盖已有);返回是否最终为 false。
+fn set_enable_thinking_false(obj: &mut Map<String, Value>) -> bool {
+    let entry = obj
+        .entry("enable_thinking".to_owned())
+        .or_insert_with(|| serde_json::json!(false));
+    entry.as_bool() == Some(false)
+}
+
+/// 嵌套 `chat_template_kwargs.enable_thinking:false`(`or_insert` 不覆盖已有);返回是否最终为 false。
+fn set_chat_template_enable_thinking_false(obj: &mut Map<String, Value>) -> bool {
+    let kwargs = obj
+        .entry("chat_template_kwargs".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(k) = kwargs.as_object_mut() else {
+        return false;
+    };
+    let entry = k
+        .entry("enable_thinking".to_owned())
+        .or_insert_with(|| serde_json::json!(false));
+    entry.as_bool() == Some(false)
 }
 
 /// 按发到上游的 model ID 查 compact-disable 策略。
@@ -137,100 +196,27 @@ impl DisableThinkingWire {
 /// 两类已知"故意不进表"的模型在本文件末尾的 [`__unsupported_model_anchors`]
 /// doc-only 模块里保留专属注释段,**完整呈现** chat 协议全模型决策图。
 pub fn compact_disable_thinking_wire(model: &str) -> Option<DisableThinkingWire> {
-    let m = model.trim().to_ascii_lowercase();
-    match m.as_str() {
-        // ─── 派 A:顶级 thinking.type=disabled ──────────────────────────
-        //
-        // 智谱 GLM 全系。Z.AI `ChatThinking` schema 原文:
-        // "When enabled, GLM-5.1 GLM-5 GLM-5-Turbo GLM-5V-Turbo GLM-4.7 GLM-4.5V
-        // will think compulsorily, while GLM-4.6, GLM-4.6V, GLM-4.5 and others
-        // will automatically determine whether to think, default: enabled"
-        //
-        // - **compulsorily 名单**(强制思考,issue #248 GLM-5.1 真机失败实证):
-        //   `glm-5.1` / `glm-5` / `glm-5-turbo` / `glm-5v-turbo` / `glm-4.7` / `glm-4.5v`
-        // - **自适应名单**(默认开但 compact 任务自适应可能少思考):
-        //   `glm-4.6` / `glm-4.6v` / `glm-4.5`
-        //   即便自适应,文档明确支持 `thinking.type=disabled` + 默认开 → 入表是稳赚不亏
-        // 文档:https://docs.z.ai/api-reference/llm/chat-completion
-        "glm-5.1"
-        | "glm-5"
-        | "glm-5-turbo"
-        | "glm-5v-turbo"
-        | "glm-4.7"
-        | "glm-4.5v"
-        | "glm-4.6"
-        | "glm-4.6v"
-        | "glm-4.5"
-        // Kimi K2 系列(月之暗面平台 + Kimi Code 平台)
-        // thinking 默认开 + 自适应 + 共享 max_tokens 池 + 支持
-        // `thinking.type=disabled` 顶级字段。
-        // 用户实测 compact ✅(2026-05-24,kimi-k2.6 直连)是"加 disable 不变坏"
-        // 的旁证 —— **不是不加的依据**。compact 任务下 reasoning 仍是浪费 budget。
-        // `kimi-for-coding` 是 Kimi Code 平台稳定 alias,后端映射最新 K2.6+。
-        // 文档:https://platform.kimi.com/docs/guide/use-kimi-k2-thinking-model
-        | "kimi-k2.5"
-        | "kimi-k2.6"
-        | "kimi-for-coding"
-        // DeepSeek V4 实名 model(项目 preset `presets_data.json:13-21` 收录的两个)。
-        // thinking 默认开 + 自适应 + 支持 `thinking.type=disabled`(OpenAI SDK
-        // 走 extra_body,wire 上是顶级字段)。
-        // PR #224 prompt 简化已让 compact 实测稳,加 disable 是进一步优化:
-        // 1. 节省 output token(reasoning 不占 budget)
-        // 2. 节省 wall time(实测 #224 数据:短 prompt 44s / 长 prompt 94s,
-        //    主要差异在模型思考时长)
-        // 3. 节省钱(reasoning 按 output token 计费)
-        //
-        // **故意不收 `deepseek-chat` / `deepseek-reasoner` alias**:
-        // - `deepseek-reasoner` 历史上是 R1/V3-class thinking-only 模型 wrapper,
-        //   thinking 是模型设计的 integral 行为而非 toggleable;disable 可能
-        //   silently ignored 或上游 400 unknown field。
-        // - `deepseek-chat` 历史上指 non-thinking 模式,inject disable 是 no-op
-        //   占代码无意义。
-        // - 两个 alias 在 2026-04 后传言"统一指向 deepseek-v4-flash",但没找到
-        //   具体 doc URL 实证 + 没真机验证 disable 接受性 → 保守不收,等真实
-        //   issue 报告 + 真机验证再加。
-        // 文档:https://api-docs.deepseek.com/guides/thinking_mode
-        | "deepseek-v4-pro"
-        | "deepseek-v4-flash"
-        // MiniMax-M3:thinking 默认开(输出 <think>)。真机实测(2026-06-03,
-        // api.minimaxi.com 直连 MiniMax-M3 + 真实 key):**只有**顶级
-        // `thinking.type=disabled` 能关掉思考(content 直出 "Four." 无 <think>);
-        // `enable_thinking=false` / `reasoning_effort=none` /
-        // `chat_template_kwargs.enable_thinking=false` 全部被上游忽略(仍 <think>)。
-        // 故入派 A。注意:M2.x 系列(见下方无解类)直连不支持 disable,M3 与之不同。
-        | "minimax-m3" => Some(DisableThinkingWire::ThinkingTypeDisabled),
+    // [MOC-241] 整个 compact-disable 名单已收口到 [`crate::reasoning_tiers`] 表(单一真相,与
+    // Codex picker 档位 + reasoning wire 共用)。命中模型返回其 `disable_wire`:
+    // - GLM 4.5+/5.x → `GlmDual`(hosted 顶级 thinking + 自建 chat_template_kwargs 双发)
+    // - Kimi K2 / DeepSeek V4 / MiniMax-M3 → `ThinkingTypeDisabled`(顶级 thinking.type)
+    // - 阿里云百炼 Qwen 3.x / 小米 MiMo v2.x → `EnableThinkingFalse`(顶级 enable_thinking)
+    // - `None` = 表里没有(未知 / 非 thinking 模型)或**强制思考不可关**(MiniMax-M2.x / Gemini → 表里是
+    //   `SINGLE_MAX` 单档 max,`disable_wire=None`)→ 不注入 disable(保持 current behavior)。
+    // 各模型的官方文档出处见 reasoning_tiers 表注释;下方 `__unsupported_model_anchors` 段保留
+    // 「无解类 / 无 thinking 类」完整决策图。新增模型只改表一处。
+    reasoning_tiers_for_model(model).and_then(|spec| spec.disable_wire)
+}
 
-        // ─── 派 B:顶级 enable_thinking=false ───────────────────────────
-        //
-        // 阿里云百炼 Qwen 3.x 混合思考模式。
-        // 官方原话:"qwen3.6-plus 和 qwen3.6-flash 默认开启思考模式 ...
-        // 由于 enable_thinking 非 OpenAI 标准参数,需要通过 extra_body 传入"。
-        // wire 上 SDK 的 `extra_body={"enable_thinking": False}` 透传后等价于
-        // chat body 顶级 `"enable_thinking": false`。
-        // 混合思考是自适应,但 compact 任务下"不思考"永远是对的 → 入表。
-        // 文档:https://help.aliyun.com/zh/model-studio/deep-thinking
-        "qwen3.6-plus"
-        | "qwen3.6-flash"
-        | "qwen3-plus"
-        | "qwen3-flash"
-        // 小米 MiMo v2 全系。跟 Qwen 同款 `enable_thinking` wire(都走百炼
-        // OpenAI 兼容路径,共用同一参数命名约定)。
-        // `mimo-v2.5-pro` / `mimo-v2.5` / `mimo-v2-pro` 通过 xiaomimimo.com 直连
-        // 或百炼第三方上架,wire 一致。`mimo-v2-flash` / `mimo-v2-omni` 同源 family。
-        // 文档:https://help.aliyun.com/zh/model-studio/mimo
-        //       https://www.mimo-v2.com/zh/docs/quick-start/first-api-call
-        | "mimo-v2.5-pro"
-        | "mimo-v2.5"
-        | "mimo-v2-pro"
-        | "mimo-v2-flash"
-        | "mimo-v2-omni" => Some(DisableThinkingWire::EnableThinkingFalse),
-
-        // ─── 未知 model:不注入(保守) ──────────────────────────────────
-        // 用户自定义 provider 上配置的 model ID 不在表中 → 不注入,保持
-        // current behavior。下方 `__unsupported_model_anchors` 注释段记录
-        // **已知** 但故意不入表的模型,见那里。
-        _ => None,
-    }
+/// 同 [`compact_disable_thinking_wire`],但 `is_qoder=true` 时也查 QoderWork scoped 档位表
+/// (网关 key `auto`/`gm51model` 等的 disable_wire = `ReasoningEffortNone`)。compact 侧由
+/// [`crate::reasoning_tiers`] 单一来源决定关思考 wire —— 非 qoder provider(is_qoder=false)对
+/// `auto` 返 `None`,不注入 disable(还原 WorkBuddy 等同名 provider 的原 compact 行为)。
+pub fn compact_disable_thinking_wire_scoped(
+    model: &str,
+    is_qoder: bool,
+) -> Option<DisableThinkingWire> {
+    reasoning_tiers_for_model_scoped(model, is_qoder).and_then(|spec| spec.disable_wire)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -295,8 +281,9 @@ mod tests {
     // ── lookup 行为 ─────────────────────────────────────────────────
 
     #[test]
-    fn glm_compulsorily_models_resolve_to_thinking_type_disabled() {
-        // Z.AI compulsorily 名单 6 个,全部派 A
+    fn glm_compulsorily_models_resolve_to_glm_dual() {
+        // [MOC-241] GLM 现统一从 reasoning_tiers 表取 disable_wire = GlmDual(hosted 顶级 thinking
+        // + 自建 chat_template_kwargs 双发)。Z.AI compulsorily 名单 6 个。
         for m in [
             "glm-5.1",
             "glm-5",
@@ -307,21 +294,32 @@ mod tests {
         ] {
             assert_eq!(
                 compact_disable_thinking_wire(m),
-                Some(DisableThinkingWire::ThinkingTypeDisabled),
-                "GLM compulsorily model {m} 必须走 ThinkingTypeDisabled wire"
+                Some(DisableThinkingWire::GlmDual),
+                "GLM compulsorily model {m} 应走 GlmDual wire(经 reasoning_tiers 表)"
             );
         }
     }
 
     #[test]
-    fn glm_adaptive_models_also_resolve_to_thinking_type_disabled() {
-        // 自适应名单(Z.AI 文档说会"automatically determine whether to think")
-        // 仍入表 —— compact 任务"永远不需要 thinking"对自适应模型也成立
+    fn glm_adaptive_models_also_resolve_to_glm_dual() {
+        // 自适应名单(Z.AI 文档说会"automatically determine whether to think")同样入表 → GlmDual。
         for m in ["glm-4.6", "glm-4.6v", "glm-4.5"] {
             assert_eq!(
                 compact_disable_thinking_wire(m),
-                Some(DisableThinkingWire::ThinkingTypeDisabled),
-                "GLM 自适应 model {m} 也应走 ThinkingTypeDisabled wire"
+                Some(DisableThinkingWire::GlmDual),
+                "GLM 自适应 model {m} 也应走 GlmDual wire"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_glm4_not_in_table_returns_none() {
+        // [MOC-241/PR#490 P2] legacy GLM-4(不支持 thinking 控制)不在表 → compact 也不注入 disable。
+        for m in ["glm-4-plus", "glm-4-flash", "glm-4-32b-0414-128k", "glm-4"] {
+            assert_eq!(
+                compact_disable_thinking_wire(m),
+                None,
+                "legacy {m} 不应注入 disable"
             );
         }
     }
@@ -448,8 +446,9 @@ mod tests {
     #[test]
     fn lookup_is_case_insensitive_and_trims_whitespace() {
         assert_eq!(
+            // [MOC-241] GLM 经 reasoning_tiers 表 → GlmDual(表也 trim+lowercase)
             compact_disable_thinking_wire("  GLM-5.1  "),
-            Some(DisableThinkingWire::ThinkingTypeDisabled)
+            Some(DisableThinkingWire::GlmDual)
         );
         assert_eq!(
             compact_disable_thinking_wire("Kimi-K2.6"),
@@ -469,6 +468,59 @@ mod tests {
             compact_disable_thinking_wire("MIMO-V2.5-PRO"),
             Some(DisableThinkingWire::EnableThinkingFalse)
         );
+    }
+
+    #[test]
+    fn qoder_compact_disables_via_reasoning_effort_none() {
+        // [MOC-297] compact 与 reasoning wire 共用 reasoning_tiers 的 disable_wire(单一真相)。
+        // 故 qoder 模型 compact 关思考 = 写 reasoning_effort="none"(与 reasoning「none」档同一 wire),
+        // **无需 qoder compact 专门设置**。qoder key 走 scoped(is_qoder=true);思考型 key 都命中;
+        // mmodel 非思考 → None(不注入)。
+        for m in [
+            "gm51model",
+            "dmodel",
+            "dfmodel",
+            "auto",
+            "qmodel",
+            "l",
+            "kmodel",
+        ] {
+            assert_eq!(
+                compact_disable_thinking_wire_scoped(m, true),
+                Some(DisableThinkingWire::ReasoningEffortNone),
+                "{m} compact 应写 reasoning_effort=none 关思考"
+            );
+            // [HIGH 回归防护] 非 qoder provider(is_qoder=false)对同名 key 不注入 disable ——
+            // 尤其 `auto` 撞 WorkBuddy,全局无 → None,还原其原 compact 行为。qoder key 已统一
+            // scoped,旧全局入口(compact_disable_thinking_wire)对它们一律 None。
+            assert_eq!(
+                compact_disable_thinking_wire_scoped(m, false),
+                None,
+                "{m} 非 qoder 不应注入 qoder disable"
+            );
+            assert_eq!(
+                compact_disable_thinking_wire(m),
+                None,
+                "{m} 旧全局入口对 qoder key 一律 None(qoder key 已 scoped)"
+            );
+        }
+        // 注入后 compact chat body 带 reasoning_effort="none"(build_parameters 透传给 QoderWork)。
+        let mut body = Map::new();
+        body.insert("model".into(), Value::String("gm51model".into()));
+        DisableThinkingWire::ReasoningEffortNone.apply_to_map(&mut body);
+        assert_eq!(body["reasoning_effort"], "none");
+        // **compact 胜出(覆盖语义)**:compact 注入在 apply_reasoning_effort 之后(compact.rs:443),
+        // 即便用户档位已写 reasoning_effort="max",compact disable 用 insert **覆盖**成 "none"
+        // → qoder compact 一定关思考(不被深度档翻案)。这是用 insert 而非 or_insert 的关键原因。
+        let mut with_max = Map::new();
+        with_max.insert("reasoning_effort".into(), Value::String("max".into()));
+        DisableThinkingWire::ReasoningEffortNone.apply_to_map(&mut with_max);
+        assert_eq!(
+            with_max["reasoning_effort"], "none",
+            "compact disable 必须覆盖深度档"
+        );
+        // 非思考模型不注入 disable(保持 current behavior)。
+        assert_eq!(compact_disable_thinking_wire("mmodel"), None);
     }
 
     // ── 注入行为 ────────────────────────────────────────────────────

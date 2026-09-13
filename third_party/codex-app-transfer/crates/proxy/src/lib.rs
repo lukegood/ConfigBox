@@ -11,7 +11,9 @@
 //! 未实现(下阶段):provider 协议转换(`crates/adapters`,Stage 3)、
 //! OS 集成(`crates/codex_integration`,Stage 2.5)、WebSocket 透传。
 
+pub mod chat_conversation;
 pub mod diagnostics;
+pub mod fake_account;
 pub mod fixture;
 pub mod forward;
 pub mod resolver;
@@ -19,14 +21,16 @@ pub mod server;
 pub mod telemetry;
 pub mod trace_store;
 pub mod validation;
+pub mod ws_passthrough;
 
 pub use diagnostics::{
     feedback_bundle_dir, is_credential_key, recent_feedback_bundles, rescrub_persisted_bundle,
 };
+pub use fake_account::{fake_account_mode_enabled, set_fake_account_mode};
 pub use forward::{forward_handler, ProxyState};
 pub use resolver::{
     AuthScheme, ProviderResolver, ResolveError, ResolvedProvider, SharedResolver, StaticResolver,
 };
-pub use server::build_router;
+pub use server::{build_router, build_router_with_relogin};
 pub use telemetry::{proxy_log_dir, proxy_telemetry, ProxyLogEntry, ProxyStatsSnapshot};
 pub use trace_store::{trace_store, TraceEntry, TraceKind, TraceStore};

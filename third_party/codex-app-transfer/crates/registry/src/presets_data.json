@@ -31,7 +31,7 @@
   },
   {
     "id": "kimi",
-    "name": "Kimi (月之暗面)",
+    "name": "Kimi (MoonShot)",
     "baseUrl": "https://api.moonshot.cn/v1",
     "docsUrl": "https://platform.moonshot.cn/docs",
     "authScheme": "bearer",
@@ -44,6 +44,9 @@
         "context_window": 262144
       },
       "kimi-k2.6": {
+        "context_window": 262144
+      },
+      "kimi-k2.7": {
         "context_window": 262144
       },
       "moonshot-v1-8k": {
@@ -96,7 +99,7 @@
     "baseUrl": "https://api.xiaomimimo.com/v1",
     "docsUrl": "https://www.mimo-v2.com/zh/docs/quick-start/first-api-call",
     "authScheme": "bearer",
-    "apiFormat": "openai_chat",
+    "apiFormat": "responses",
     "models": {
       "default": "mimo-v2.5-pro"
     },
@@ -129,7 +132,7 @@
     "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1",
     "docsUrl": "https://www.mimo-v2.com/zh/docs/quick-start/first-api-call",
     "authScheme": "bearer",
-    "apiFormat": "openai_chat",
+    "apiFormat": "responses",
     "baseUrlOptions": [
       {
         "label": "中国集群",
@@ -168,15 +171,18 @@
   },
   {
     "id": "zhipu",
-    "name": "智谱 GLM",
+    "name": "GLM",
     "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
     "docsUrl": "https://docs.bigmodel.cn/cn/guide/develop/openai/introduction",
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
     "models": {
-      "default": "glm-5.1"
+      "default": "glm-5.2"
     },
     "modelCapabilities": {
+      "glm-5.2": {
+        "context_window": 1000000
+      },
       "glm-5.1": {
         "context_window": 200000
       },
@@ -188,14 +194,12 @@
   },
   {
     "id": "zhipu-coding",
-    "name": "智谱 GLM Coding",
+    "name": "GLM Coding",
     "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
     "docsUrl": "https://docs.bigmodel.cn/cn/coding-plan/overview",
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
-    "extraHeaders": {
-      "User-Agent": "claude-cli/2.1.175 (external, cli)"
-    },
+    "extraHeaders": {},
     "models": {
       "gpt_5_5": "glm-4.7",
       "gpt_5_4": "glm-4.7",
@@ -214,8 +218,70 @@
     "isBuiltin": true
   },
   {
+    "id": "zai-login",
+    "name": "GLM（Z.ai）",
+    "gray": true,
+    "baseUrl": "https://api.z.ai/api/anthropic",
+    "docsUrl": "https://docs.z.ai/",
+    "authScheme": "zai_oauth",
+    "apiFormat": "anthropic_messages",
+    "models": {
+      "gpt_5_5": "glm-4.7",
+      "gpt_5_4": "glm-4.7",
+      "gpt_5_4_mini": "glm-4.6",
+      "gpt_5_3_codex": "glm-4.6",
+      "default": "glm-4.7"
+    },
+    "modelCapabilities": {
+      "glm-4.7": {
+        "context_window": 200000
+      },
+      "glm-4.6": {
+        "context_window": 200000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "账号登录(OAuth)免 API key —— 在 provider 配置点登录、用 z.ai 账号授权一次,走你的 GLM Coding Plan 订阅额度。"
+      }
+    ],
+    "isBuiltin": true
+  },
+  {
+    "id": "bigmodel-login",
+    "name": "GLM（BigModel）",
+    "gray": true,
+    "baseUrl": "https://open.bigmodel.cn/api/anthropic",
+    "docsUrl": "https://docs.bigmodel.cn/cn/coding-plan/overview",
+    "authScheme": "bigmodel_oauth",
+    "apiFormat": "anthropic_messages",
+    "models": {
+      "gpt_5_5": "glm-4.7",
+      "gpt_5_4": "glm-4.7",
+      "gpt_5_4_mini": "glm-4.6",
+      "gpt_5_3_codex": "glm-4.6",
+      "default": "glm-4.7"
+    },
+    "modelCapabilities": {
+      "glm-4.7": {
+        "context_window": 200000
+      },
+      "glm-4.6": {
+        "context_window": 200000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "账号登录(OAuth)免 API key —— 在 provider 配置点登录、用智谱 bigmodel 账号授权一次,走你的 GLM Coding Plan 订阅额度。"
+      }
+    ],
+    "isBuiltin": true
+  },
+  {
     "id": "bailian",
-    "name": "阿里云百炼",
+    "name": "Aliyuncs",
     "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "docsUrl": "https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope",
     "authScheme": "bearer",
@@ -242,7 +308,7 @@
   },
   {
     "id": "bailian-token-plan",
-    "name": "阿里云百炼 (Token Plan)",
+    "name": "Aliyuncs (Token Plan)",
     "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
     "docsUrl": "https://help.aliyun.com/zh/model-studio/token-plan-quickstart",
     "authScheme": "bearer",
@@ -353,7 +419,7 @@
       },
       {
         "type": "info",
-        "text": "**Google Search grounding 已 work**:打开 web_search 工具后(Codex.app 默认开),代理把入站 OpenAI 标准 `web_search` 工具转 Gemini `tools=[{googleSearch:{}}]`。响应侧 grounding citations(`groundingMetadata.groundingChunks/groundingSupports`)直接 emit 成 Responses `response.output_text.annotation.added` 事件,Codex.app UI 显示来源链接。"
+        "text": "**联网搜索走自研工具,不再用 Gemini 原生 Google Search**(MOC-208):代理统一 drop 入站 `web_search`(不再转 `googleSearch` grounding —— built-in 与 functionDeclarations 共存会触发 Gemini 400,且原生 grounding 各家形态不一)。开启「内置联网抓取工具」后,模型用自研 `web_search` / `web_fetch`(Chrome-based,全文返回)联网,行为与其它 provider 一致。"
       },
       {
         "type": "warning",
@@ -454,6 +520,234 @@
       }
     ],
     "requestOptions": {},
+    "isBuiltin": true
+  },
+  {
+    "id": "opencode-go",
+    "name": "OpenCode Go",
+    "baseUrl": "https://opencode.ai/zen/go/v1",
+    "docsUrl": "https://opencode.ai/docs/zh-cn/go",
+    "authScheme": "bearer",
+    "apiFormat": "openai_chat",
+    "models": {
+      "default": "glm-5.2"
+    },
+    "modelCapabilities": {
+      "glm-5.2": {
+        "context_window": 1000000
+      },
+      "glm-5.1": {
+        "context_window": 200000
+      },
+      "kimi-k2.7-code": {
+        "context_window": 262144
+      },
+      "kimi-k2.6": {
+        "context_window": 262144
+      },
+      "deepseek-v4-pro": {
+        "context_window": 1000000
+      },
+      "deepseek-v4-flash": {
+        "context_window": 1000000
+      },
+      "mimo-v2.5": {
+        "context_window": 1000000
+      },
+      "mimo-v2.5-pro": {
+        "context_window": 1000000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "OpenCode Go（opencode.ai/zen/go）—— 低成本开源编程模型订阅（$5 首月 / $10 月，在 opencode.ai 注册后取 API key）。本 preset 走 OpenAI 兼容端点（/chat/completions），涵盖 GLM / Kimi / DeepSeek / MiMo 系；OpenCode Go 的 MiniMax / Qwen 系走 Anthropic 端点（/messages），不在本 preset。"
+      }
+    ],
+    "requestOptions": {},
+    "extraHeaders": {},
+    "isBuiltin": true
+  },
+  {
+    "id": "trae-cn",
+    "name": "Trae-CN",
+    "gray": true,
+    "baseUrl": "https://api.trae.cn",
+    "docsUrl": "https://docs.trae.cn/",
+    "authScheme": "trae_oauth",
+    "apiFormat": "anthropic_messages",
+    "models": {
+      "default": "Doubao_1_6"
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "账号登录（OAuth）免 API key —— 用 Trae 账号授权一次，每个 provider 条目独立设备指纹隔离（同设备多账号互不关联），走你的 Trae 订阅额度。"
+      },
+      {
+        "type": "warning",
+        "text": "当前仅支持登录 + 额度查看；模型路由开发中（Trae 为字节跳动私有协议，非标准 OpenAI/Anthropic 端点，Phase 2 接入）。"
+      }
+    ],
+    "isBuiltin": true
+  },
+  {
+    "id": "workbuddy",
+    "name": "WorkBuddy（APIKEY）",
+    "gray": true,
+    "baseUrl": "https://copilot.tencent.com/v2",
+    "docsUrl": "https://www.codebuddy.ai",
+    "authScheme": "bearer",
+    "apiFormat": "openai_chat",
+    "models": {
+      "default": "deepseek-v4-pro"
+    },
+    "modelCapabilities": {
+      "deepseek-v4-pro": {
+        "context_window": 1000000
+      },
+      "deepseek-v4-flash": {
+        "context_window": 1000000
+      },
+      "minimax-m3": {
+        "context_window": 512000
+      },
+      "glm-5.2": {
+        "context_window": 1000000
+      },
+      "glm-5.1": {
+        "context_window": 200000
+      },
+      "glm-5v-turbo": {
+        "context_window": 200000
+      },
+      "kimi-k2.7": {
+        "context_window": 256000
+      },
+      "kimi-k2.6": {
+        "context_window": 256000
+      },
+      "hy3-preview": {
+        "context_window": 192000
+      },
+      "auto": {
+        "context_window": 168000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "WorkBuddy / 腾讯 CodeBuddy 桌面端的模型网关（copilot.tencent.com/v2，OpenAI 兼容 chat completions）。API Key 填法：安装并登录 WorkBuddy/CodeBuddy 桌面端后，从 ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info 的 auth.accessToken 取（macOS）—— 是一个约 1 年期的 Keycloak Bearer token，单 token 直连，无需 X-User-Id/设备头。网关仅支持流式且 messages 至少 2 条（Codex 均天然满足）。代理出站会自动伪装成 CodeBuddy 桌面端 coding 模式 wire 指纹（X-Agent-Intent: coding + X-IDE-* + OpenAI SDK UA/X-Stainless-* + 每请求 X-Conversation-*），避免被服务端风控判定为非官方客户端。"
+      },
+      {
+        "type": "info",
+        "text": "可用模型 id（实测）：deepseek-v4-pro / deepseek-v4-flash / minimax-m3 / glm-5.2 / glm-5.1 / glm-5v-turbo / kimi-k2.7 / kimi-k2.6 / hy3-preview / auto。要换模型改 provider.models 槽位映射到上述任一 id。各渠道（如中国移动 Token Plan）实际开通子集不同，Claude（default-1.x）等模型可能未开通、调用会返回 invoke model error。"
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
+  },
+  {
+    "id": "workbuddy-login",
+    "name": "WorkBuddy（Login）",
+    "gray": true,
+    "baseUrl": "https://copilot.tencent.com/v2",
+    "docsUrl": "https://www.codebuddy.ai",
+    "authScheme": "workbuddy_oauth",
+    "apiFormat": "openai_chat",
+    "models": {
+      "default": "deepseek-v4-pro"
+    },
+    "modelCapabilities": {
+      "deepseek-v4-pro": {
+        "context_window": 1000000
+      },
+      "deepseek-v4-flash": {
+        "context_window": 1000000
+      },
+      "minimax-m3": {
+        "context_window": 512000
+      },
+      "glm-5.2": {
+        "context_window": 1000000
+      },
+      "glm-5.1": {
+        "context_window": 200000
+      },
+      "glm-5v-turbo": {
+        "context_window": 200000
+      },
+      "kimi-k2.7": {
+        "context_window": 256000
+      },
+      "kimi-k2.6": {
+        "context_window": 256000
+      },
+      "hy3-preview": {
+        "context_window": 192000
+      },
+      "auto": {
+        "context_window": 168000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "账号登录（OAuth）免手动粘 token —— 点「登录」用腾讯账号授权一次，app 自动跑 /v2/plugin/auth/{state,token} 拿凭证并落盘，access token 过期前自动 refresh（X-Refresh-Token），无需每年换。与 API-key 路（workbuddy preset）等价，只是免去手抠 token；出站同样自动伪装成 coding 模式 wire 指纹避风控。"
+      },
+      {
+        "type": "info",
+        "text": "可用模型 id（实测）：deepseek-v4-pro / deepseek-v4-flash / minimax-m3 / glm-5.2 / glm-5.1 / glm-5v-turbo / kimi-k2.7 / kimi-k2.6 / hy3-preview / auto。要换模型改 provider.models 槽位映射到上述任一 id。各渠道开通子集不同，Claude（default-1.x）等可能未开通。"
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
+  },
+  {
+    "id": "qoder-login",
+    "name": "QoderWork CN（Login）",
+    "gray": true,
+    "baseUrl": "https://gateway.qoder.com.cn",
+    "docsUrl": "https://qoder.com.cn",
+    "authScheme": "qoder_oauth",
+    "apiFormat": "openai_chat",
+    "models": {
+      "default": "auto"
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "QoderWork CN（阿里 Qoder 系）账号登录 + 模型路由。点「登录」用 Qoder 账号在浏览器授权一次（纯客户端 PKCE device flow），凭证落盘并自动 refresh，支持多账号池。模型走 legacy Cosy 通道 gateway.qoder.com.cn，鉴权由内置 WASM 生成 Cosy 签名（device token 即用，无需额外交换），请求体/响应加密。"
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
+  },
+  {
+    "id": "grok-build",
+    "name": "Grok Build（Login）",
+    "gray": true,
+    "baseUrl": "https://cli-chat-proxy.grok.com/v1",
+    "docsUrl": "https://grok.com",
+    "authScheme": "grok_build_oauth",
+    "apiFormat": "responses",
+    "models": {
+      "default": "grok-4.5"
+    },
+    "modelCapabilities": {
+      "grok-4.5": {
+        "context_window": 500000
+      },
+      "grok-composer-2.5-fast": {
+        "context_window": 200000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "xAI Grok Build（grok CLI / grok-code 的编码后端，OpenAI Responses 协议）。点「登录」用 xAI 账号在浏览器授权一次（OAuth2 authorization code + PKCE，auth.x.ai），凭证落盘并在过期前自动 refresh，无需本地安装 grok CLI。上游 cli-chat-proxy.grok.com/v1，默认模型 grok-4.5（500k，编码主力，替代已下线的 grok-build）/ grok-composer-2.5-fast（200k）。出站自动带 grok 官方客户端头（grok-shell 指纹）避风控。Codex 的 gpt-5.x 模型名经 provider.models 槽位映射为 grok 模型，不会透传到上游。"
+      }
+    ],
     "isBuiltin": true
   }
 ]

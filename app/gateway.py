@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import tomlkit
@@ -33,6 +34,15 @@ CODEX_GATEWAY_PUBLIC_HOST = os.getenv("CODEX_GATEWAY_PUBLIC_HOST", "127.0.0.1")
 DEFAULT_PROXY_PORT = int(os.getenv("CODEX_GATEWAY_PORT", "18080"))
 GATEWAY_LOG_MAX_MB = int(os.getenv("GATEWAY_LOG_MAX_MB", "50"))
 CONFIGBOX_GATEWAY_PROVIDER = "configbox_gateway"
+UPSTREAM_PRESETS_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "third_party"
+    / "codex-app-transfer"
+    / "crates"
+    / "registry"
+    / "src"
+    / "presets_data.json"
+)
 MANAGED_AUTH_KEYS = ("auth_mode", "OPENAI_API_KEY")
 MANAGED_ROOT_KEYS = (
     "model_provider",
@@ -47,6 +57,16 @@ DEFAULT_CONTEXT_WINDOW = 258_400
 ONE_M_CONTEXT_WINDOW = 1_000_000
 AUTO_COMPACT_TRIGGER_PERCENT = 80
 DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
+OAUTH_KIND_PATHS = {
+    "gemini": ("gemini-oauth", {}),
+    "antigravity": ("antigravity-oauth", {}),
+    "zai": ("zai-oauth", {"provider": "zai"}),
+    "bigmodel": ("zai-oauth", {"provider": "bigmodel"}),
+    "trae": ("trae-oauth", {}),
+    "workbuddy": ("workbuddy-oauth", {}),
+    "qoder": ("qoder-oauth", {}),
+    "grok_build": ("grok-build-oauth", {}),
+}
 CAS_BASE_INSTRUCTIONS = (
     "You are a coding agent operating inside the Codex CLI, collaborating with the user in their "
     "workspace. Read and edit files, run commands, and complete software-engineering tasks "
@@ -399,7 +419,77 @@ def list_providers() -> list[dict[str, Any]]:
 
 
 def list_presets() -> dict[str, Any]:
-    return {"presets": CONFIGBOX_GATEWAY_PRESETS}
+    return {"presets": gateway_presets()}
+
+
+def gateway_presets() -> list[dict[str, Any]]:
+    upstream = upstream_gateway_presets()
+    if upstream:
+        return upstream
+    return CONFIGBOX_GATEWAY_PRESETS
+
+
+def upstream_gateway_presets() -> list[dict[str, Any]]:
+    try:
+        raw = json.loads(UPSTREAM_PRESETS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    presets: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        preset = configbox_preset_from_upstream(item, index)
+        if preset is not None:
+            presets.append(preset)
+    return presets
+
+
+def configbox_preset_from_upstream(item: dict[str, Any], index: int) -> dict[str, Any] | None:
+    provider = {
+        "name": str(item.get("name") or item.get("id") or "Provider"),
+        "baseUrl": str(item.get("baseUrl") or "").rstrip("/"),
+        "apiFormat": normalize_api_format(str(item.get("apiFormat") or "openai_chat")),
+        "authScheme": str(item.get("authScheme") or recommended_auth_scheme(str(item.get("apiFormat") or ""))),
+        "models": normalize_models(item.get("models") if isinstance(item.get("models"), dict) else {}),
+    }
+    if not provider["baseUrl"]:
+        return None
+    for source_key, target_key in (
+        ("extraHeaders", "extraHeaders"),
+        ("modelCapabilities", "modelCapabilities"),
+        ("requestOptions", "requestOptions"),
+    ):
+        value = item.get(source_key)
+        if isinstance(value, dict):
+            provider[target_key] = value
+    preset: dict[str, Any] = {
+        "id": str(item.get("id") or f"upstream-{index}"),
+        "name": provider["name"],
+        "description": str(item.get("description") or item.get("docsUrl") or provider["baseUrl"]),
+        "experimental": bool(item.get("gray") is True),
+        "provider": provider,
+    }
+    base_urls = []
+    for option in item.get("baseUrlOptions") or []:
+        if not isinstance(option, dict):
+            continue
+        url = str(option.get("url") or option.get("value") or "").strip()
+        if url:
+            base_urls.append({"url": url, "label": str(option.get("label") or "")})
+    if base_urls:
+        preset["baseUrls"] = base_urls
+    messages = []
+    for notice in item.get("notices") or []:
+        if not isinstance(notice, dict):
+            continue
+        text = str(notice.get("text") or "").strip()
+        if text:
+            messages.append({"level": str(notice.get("type") or "info"), "text": text})
+    if messages:
+        preset["messages"] = messages
+    return preset
 
 
 def provider_index(config: dict[str, Any], provider_id: str) -> int | None:
@@ -754,14 +844,20 @@ def is_port_healthy(port: int) -> bool:
         return False
 
 
-def oauth_admin_request(path: str, method: str = "GET") -> dict[str, Any]:
+def oauth_admin_request(path: str, method: str = "GET", body: dict[str, Any] | None = None) -> dict[str, Any]:
     port = proxy_port()
     if not is_port_healthy(port):
         raise APIError("GATEWAY_NOT_RUNNING", "Start Gateway before using OAuth login.", 409)
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
     request = Request(
         f"http://127.0.0.1:{port}{path}",
+        data=data,
         method=method,
-        headers={"Accept": "application/json"},
+        headers=headers,
     )
     try:
         with urlopen(request, timeout=305) as response:
@@ -778,16 +874,37 @@ def oauth_admin_request(path: str, method: str = "GET") -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def oauth_status(kind: str) -> dict[str, Any]:
-    return oauth_admin_request(oauth_path(kind, "status"))
+def oauth_status(kind: str, provider_id: str | None = None) -> dict[str, Any]:
+    return oauth_admin_request(oauth_path(kind, "status", provider_id))
 
 
-def oauth_login(kind: str) -> dict[str, Any]:
-    return oauth_admin_request(oauth_path(kind, "login"), "POST")
+def oauth_login(kind: str, provider_id: str | None = None) -> dict[str, Any]:
+    return oauth_admin_request(oauth_path(kind, "login", provider_id), "POST")
 
 
-def oauth_logout(kind: str) -> dict[str, Any]:
-    return oauth_admin_request(oauth_path(kind, "logout"), "DELETE")
+def oauth_logout(kind: str, provider_id: str | None = None, uid: str | None = None) -> dict[str, Any]:
+    normalized = normalize_oauth_kind(kind)
+    if normalized in {"workbuddy", "qoder"}:
+        if not provider_id or not uid:
+            raise APIError("INVALID_OAUTH_ACCOUNT", "providerId and uid are required for account removal.", 400)
+        query = urlencode({"providerId": provider_id, "uid": uid})
+        return oauth_admin_request(f"/__admin/{normalized}-oauth/account?{query}", "DELETE")
+    return oauth_admin_request(oauth_path(kind, "logout", provider_id), "DELETE")
+
+
+def oauth_switch_account(kind: str, provider_id: str, uid: str) -> dict[str, Any]:
+    normalized = normalize_oauth_kind(kind)
+    if normalized not in {"workbuddy", "qoder"}:
+        raise APIError("INVALID_OAUTH_KIND", "OAuth account switching is only supported by account-pool providers.", 404)
+    query = urlencode({"providerId": provider_id, "uid": uid})
+    return oauth_admin_request(f"/__admin/{normalized}-oauth/switch?{query}", "POST")
+
+
+def oauth_submit_code(kind: str, code: str) -> dict[str, Any]:
+    normalized = normalize_oauth_kind(kind)
+    if normalized != "grok_build":
+        raise APIError("INVALID_OAUTH_KIND", "OAuth code submission is only supported by Grok Build.", 404)
+    return oauth_admin_request("/__admin/grok-build-oauth/submit-code", "POST", {"code": code})
 
 
 def antigravity_models() -> dict[str, Any]:
@@ -826,10 +943,31 @@ def antigravity_models_from_presets() -> dict[str, Any]:
     }
 
 
-def oauth_path(kind: str, action: str) -> str:
-    if kind not in {"gemini", "antigravity"}:
+def normalize_oauth_kind(kind: str) -> str:
+    normalized = kind.strip().lower().replace("-", "_")
+    aliases = {
+        "grokbuild": "grok_build",
+        "grok_build_oauth": "grok_build",
+        "zai_oauth": "zai",
+        "bigmodel_oauth": "bigmodel",
+        "trae_oauth": "trae",
+        "workbuddy_oauth": "workbuddy",
+        "qoder_oauth": "qoder",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def oauth_path(kind: str, action: str, provider_id: str | None = None) -> str:
+    normalized = normalize_oauth_kind(kind)
+    route = OAUTH_KIND_PATHS.get(normalized)
+    if route is None:
         raise APIError("INVALID_OAUTH_KIND", "Unsupported OAuth provider.", 404)
-    return f"/__admin/{kind}-oauth/{action}"
+    base, params = route
+    query = dict(params)
+    if provider_id:
+        query["providerId"] = provider_id
+    suffix = f"?{urlencode(query)}" if query else ""
+    return f"/__admin/{base}/{action}{suffix}"
 
 
 def public_base_url(port: int) -> str:

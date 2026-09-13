@@ -23,6 +23,7 @@
 use codex_app_transfer_registry::Provider;
 use serde_json::{json, Map, Value};
 
+use super::context_breakdown::{breakdown_enabled, spawn_compute_and_persist};
 use super::session::ResponseSessionCache;
 use crate::core::input::{
     merge_messages_with_previous_response, response_id_for_session, MergeResult,
@@ -137,9 +138,10 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         .map(codex_app_transfer_registry::strip_internal_model_suffix);
     if !provider_supports_vision(provider, body_model.as_deref()) {
         strip_image_blocks_in_place(&mut messages);
-        // Stage 3 note: Additional input_image stripping from raw Responses input
-        // (for Computer Use base64) can be added here once we have &mut access to body.
-        // Current defense relies on strip_image_blocks_in_place after input→message conversion.
+        // [MOC-250] computer-use 截图已在 input→message 转换时拆出并挂到侧信道字段,
+        // `lift_tool_screenshot_images` 之后的第二次 strip(下方 L172)负责清掉提升出
+        // 的 user image message。此处 strip 覆盖其余 input_image 块(非 computer-use
+        // 路径),两次 strip 合作确保非视觉上游零 base64 泄漏。
     } else {
         // 含 image_url 但无 text part 时补一个空格 text part — MiMo 多模态
         // 接口强制要求(否则 400 "Param Incorrect: text is not set"),
@@ -157,14 +159,28 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     // 返回 `PreviousResponseNotFound`,proxy IntoResponse 转标准 OpenAI 400
     // (`code: "previous_response_not_found"`),与 OpenAI 服务端真实行为对齐。
     // 此处不再有"messages 为空"分支:进到这里 messages 必非空。
-    let session_messages = messages.clone();
+    // [MOC-250] cache 副本在「截图提升」之前生成,并剥掉 tool message 的图片侧信道字段:
+    // session cache 只保存折叠后的 tool 文本(无全分辨率 base64、无提升出的 user 图片消息),
+    // 这样多轮 computer-use 会话里历史截图不会跨轮累积进 cache → 撑爆上下文 / 成本。
+    let session_messages = strip_tool_image_side_fields(messages.clone());
+    // [MOC-250] 仅对发往上游的 wire 副本提升当前 input 截图为 user image message(按侧信道字段
+    // 存在判定当前轮,见 lift_tool_screenshot_images doc)。放在 cache clone 之后 → 提升出的图片
+    // 永不进 cache;并清除所有 tool message 的侧信道字段。
+    lift_tool_screenshot_images(&mut messages);
+    // 新提升出的 user image message 需与原有图片一样过视觉处理:不支持视觉的上游降级占位、
+    // 支持的补 text part(与上方 L139 同逻辑;那次跑在提升之前,覆盖不到这些新消息)。
+    if !provider_supports_vision(provider, body_model.as_deref()) {
+        strip_image_blocks_in_place(&mut messages);
+    } else {
+        ensure_text_part_when_image_present(&mut messages);
+    }
     // [MOC-193] wire-level 去重必须在 session_messages clone **之后**:cache 保持
     // 全量原貌(session 重建敏感区不动,MOC-142/168/190),只有发上游的 body 瘦身。
     dedupe_repeated_instruction_messages(&mut messages);
     result.insert("messages".into(), Value::Array(messages));
 
     // tools(function / custom 直接处理,namespace 递归展平,web_search /
-    // web_search_preview per-provider 适配上游真支持的形态,其余 Responses
+    // web_search_preview 协议层无条件 drop [MOC-208],其余 Responses
     // 专属类型 drop + warn_once)
     if let Some(Value::Array(tools)) = body.get("tools") {
         // Stage 2: Filter out computer_use_preview for non-vision models early
@@ -207,24 +223,18 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         }
         dedup_chat_tools_by_name(&mut chat_tools);
         if !chat_tools.is_empty() {
-            // **Kimi `$web_search` 强制 thinking disabled**:Kimi 官方文档
-            // (`platform.kimi.ai/docs/guide/use-web-search`)明确写
-            // "When using `$web_search` function, you must disable the thinking
-            // ability of the model"。OpenAI SDK 的 `extra_body.thinking.type=
-            // "disabled"` 在 wire 上等价于 request body 顶级 `thinking:
-            // {type:"disabled"}` 字段。如果 outbound tools 含 Kimi 内置
-            // `$web_search`,代理在这里强制注入(用户启用 web_search 时模型
-            // thinking 能力被禁用是 Kimi API 限制,UI 后续会加提示)。
-            if contains_kimi_web_search_tool(&chat_tools) {
-                result.insert("thinking".into(), serde_json::json!({"type": "disabled"}));
-            }
             result.insert("tools".into(), Value::Array(chat_tools));
         }
     }
 
-    // tool_choice 规范化
-    if let Some(tc) = body.get("tool_choice") {
-        result.insert("tool_choice".into(), normalize_tool_choice(tc));
+    // tool_choice 规范化 —— **仅当出站确有 tools 时才转发**。[MOC-208] web_search 等
+    // 被 drop 后 tools 可能整体变空(如某轮只带 web_search),此时若仍透传
+    // `tool_choice:"required"/"tool"` 会让上游收到「强制用工具但无工具」的畸形请求
+    // (400)。无 tools 时 tool_choice 无意义,直接不发(等价于上游默认 auto)。
+    if result.contains_key("tools") {
+        if let Some(tc) = body.get("tool_choice") {
+            result.insert("tool_choice".into(), normalize_tool_choice(tc));
+        }
     }
 
     // text.format → response_format
@@ -316,6 +326,32 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     }
 
     sanitize_chat_body_for_provider(&mut result, provider);
+
+    // [MOC-231] 在最终 chat body 定型(merge 历史 + dedupe 瘦身 + sanitize)后,对即将
+    // 发往上游的 messages + tools 算 by-source 明细(供 Codex Desktop 上下文面板)。
+    // [MOC-231 perf] 面板关闭(默认)时整段跳过,零开销。
+    // [MOC-232] 开启时也**不在转发关键路径上同步算** —— 起 spawn_blocking 后台算 o200k
+    // 逐 item tokenize + 按对话 uuid 落盘(实测同步算 404k 上下文 ~1s 卡 TTFB)。
+    // conv_id = 入站 `prompt_cache_key`(== rollout 文件名 == renderer fiber 的 conversationId)。
+    //
+    // **仅在 `session_cache.is_some()`(主转发产出、已恢复全历史的那次)才算**:gemini_native
+    // 会用 `session_cache=None` 再调本 fn 做 chat-shape 归一化子路径(只含当前轮、无历史),
+    // 非 session wrapper 同理。若那些也 spawn,无历史的那次会与带全历史的主产出竞争原子落盘
+    // (rename 顺序不定可能让无历史者胜出),导致 gemini/cloud_code 多轮对话面板只显当前轮
+    // (code review 实证)。
+    if breakdown_enabled() && session_cache.is_some() {
+        if let (Some(messages), Some(conv_id)) = (
+            result.get("messages").and_then(Value::as_array).cloned(),
+            input.get("prompt_cache_key").and_then(Value::as_str),
+        ) {
+            let tools = result
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            spawn_compute_and_persist(messages, tools, conv_id.to_owned());
+        }
+    }
 
     Ok(ResponsesBodyConversion {
         body: Value::Object(result),
@@ -637,17 +673,33 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool
             // 两处都挂,内部按 pending call_id 精确配对 —— 只有我们发过的 completed apply_patch call
             // 才发射,shell 等其它工具的 function_call_output 不会命中。必须在 output_value 被移走前调。
             crate::core::apply_patch_trace::emit_result(&call_id, &output_value);
+            // [MOC-250] computer-use 等工具的 output 可能是含 `input_image` 的多模态数组
+            // (浏览器截图 `data:image/...;base64`)。若直接折叠,整张图 base64 会被
+            // `serde_json::to_string` 当文本塞进 tool message content → 上游收到一坨文本、
+            // 模型看不到任何像素(真机 trace 实证截图被 bound 成 artifact 文本摘要)。
+            // 这里先把图片块从 output 拆出来:只折叠文本部分;图片以 chat `image_url` block
+            // 形态挂到 tool message 的侧信道字段 `__cas_tool_images`,交给 position-aware 的
+            // `lift_tool_screenshot_images` 决定 —— 当前轮提升为紧随其后的 user image
+            // message(上游真当图收),历史轮丢弃(防多轮 computer-use 跨轮累积全图)。
+            // 非图片 output(绝大多数工具)走 else 分支,折叠行为与改前完全一致。
+            let (text_value, tool_images) = split_tool_output_text_and_images(output_value);
             // MOC-190: 最新 1 条 tool 输出保留全文(当前轮全文进 LLM); 历史轮照常压缩。
             let output_str = if keep_full {
-                keep_recent_tool_output_full(Some(call_id.as_str()), output_value)
+                keep_recent_tool_output_full(Some(call_id.as_str()), text_value)
             } else {
-                normalize_tool_output_for_context(Some(call_id.as_str()), output_value)
+                normalize_tool_output_for_context(Some(call_id.as_str()), text_value)
             };
-            vec![json!({
+            let mut tool_msg = json!({
                 "role": "tool",
                 "tool_call_id": call_id,
                 "content": output_str,
-            })]
+            });
+            if !tool_images.is_empty() {
+                if let Some(obj) = tool_msg.as_object_mut() {
+                    obj.insert(TOOL_IMAGE_SIDE_FIELD.into(), Value::Array(tool_images));
+                }
+            }
+            vec![tool_msg]
         }
         "tool_search_call" => {
             // 实验 exp/resources-to-tool-search:input history 里 Codex 回放的
@@ -800,13 +852,23 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool
             // 的重复结果 / 非 apply_patch 的 custom 工具结果都不会进 —— 必须在 output_value 被
             // normalize 移走**之前**调。默认关、关时零开销。
             crate::core::apply_patch_trace::emit_result(&call_id, &output_value);
-            let output_str =
-                normalize_tool_output_for_context(Some(call_id.as_str()), output_value);
-            vec![json!({
+            // [MOC-250] custom_tool_call_output 与 function_call_output 共用 output 编码
+            // (string 或 content_items 数组),同样可能含 input_image。走相同的拆图逻辑,
+            // 图片不被当文本折叠;无图时是无副作用 passthrough(与改前一致)。两 arm 行为对齐,
+            // 避免「同 payload 形态、不同 arm 处理不一致」的隐藏漏洞。
+            let (text_value, tool_images) = split_tool_output_text_and_images(output_value);
+            let output_str = normalize_tool_output_for_context(Some(call_id.as_str()), text_value);
+            let mut tool_msg = json!({
                 "role": "tool",
                 "tool_call_id": call_id,
                 "content": output_str,
-            })]
+            });
+            if !tool_images.is_empty() {
+                if let Some(obj) = tool_msg.as_object_mut() {
+                    obj.insert(TOOL_IMAGE_SIDE_FIELD.into(), Value::Array(tool_images));
+                }
+            }
+            vec![tool_msg]
         }
         "input_image" => {
             let image_url = item
@@ -890,6 +952,10 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool
                 .unwrap_or("")
                 .trim()
                 .to_owned();
+            // [#262 followup] 中文用户下把英文 summary 前缀换成中文,消除 compact 后
+            // 上游 user message 里的英文 framing(语言漂移真因);响应侧仍英文(Codex
+            // startswith 识别)。其它语言 / 无前缀 → 原样。
+            let summary = crate::responses::compact::localize_compaction_summary_prefix(&summary);
             if summary.is_empty() {
                 Vec::new()
             } else {
@@ -916,11 +982,17 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool
 /// `pub(crate)`:gemini_native 请求侧复用同一发现逻辑(MOC-217),避免 gemini
 /// 重写一套 namespace 提取后漂移。参数是整个 body(内部取 `.input`)。
 pub(crate) fn discovered_tools_from_tool_search_output(input: &Value) -> Vec<Value> {
-    let Some(items) = input.get("input").and_then(|v| v.as_array()) else {
-        return Vec::new();
+    // [review Pjof7] Responses `input` 可是**数组**或**单对象**;两种形态都要扫,否则单对象
+    // tool_search_output(合法但少见)发现的工具收不到 → 注入不到 tools[] → grok 无 function 可调、
+    // 死循环调 tool_search。
+    let items: Vec<&Value> = match input.get("input") {
+        Some(Value::Array(arr)) => arr.iter().collect(),
+        Some(single @ Value::Object(_)) => vec![single],
+        _ => return Vec::new(),
     };
     let outputs: Vec<&Value> = items
         .iter()
+        .copied()
         .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_search_output"))
         .collect();
     let discovered: Vec<Value> = outputs
@@ -1048,6 +1120,129 @@ fn recompress_stale_full_tool_outputs(messages: &mut [Value], keep_recent_count:
     }
 }
 
+/// [MOC-250] tool message 上携带「待提升的截图」的侧信道字段名。`input_item_to_messages`
+/// 在折叠 computer-use 等多模态 output 时把图片块塞这里,`lift_tool_screenshot_images`
+/// 消费后清除 —— 该字段**永不**出现在发往上游的 wire body 或 session cache 里。
+const TOOL_IMAGE_SIDE_FIELD: &str = "__cas_tool_images";
+
+/// [MOC-250] Responses content block 是否图片块(`input_image` / 已转好的 `image_url`)。
+fn is_responses_image_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(|v| v.as_str()),
+        Some("input_image") | Some("image_url")
+    )
+}
+
+/// [MOC-250] 拆分 `function_call_output.output`:
+/// - 若是**含图片块**的多模态数组 → 返回(拼接后的文本 `Value::String`, 图片 chat block 列表)。
+///   图片块用 [`responses_block_to_chat_block`] 转成 `{type:"image_url", image_url:{url,detail}}`,
+///   与普通 message 里图片的归一化形态一致(chat 路径直接可用、gemini 路径 `image_url_block_to_part`
+///   也认),避免另造一套图片表示。
+/// - 否则(非数组 / 数组无图)→ 原样返回 output + 空图片列表,**折叠行为与改前完全一致**。
+fn split_tool_output_text_and_images(output_value: Value) -> (Value, Vec<Value>) {
+    let Value::Array(blocks) = &output_value else {
+        return (output_value, Vec::new());
+    };
+    if !blocks.iter().any(is_responses_image_block) {
+        return (output_value, Vec::new());
+    }
+    let mut text = String::new();
+    let mut images: Vec<Value> = Vec::new();
+    for block in blocks {
+        if is_responses_image_block(block) {
+            if let Some(chat_block) = responses_block_to_chat_block(block) {
+                images.push(chat_block);
+            }
+            continue;
+        }
+        // 文本块(input_text / output_text / text)取 `text` 拼进折叠文本。
+        // **非文本非图片的罕见块**(input_file / input_audio / refusal / 未知未来类型)
+        // 不静默丢:保留其 JSON 形态拼进文本 —— 对齐改前「整数组 serde_json::to_string」
+        // 的非破坏语义,也守用户「不主动破坏性降级」硬规则。computer-use output 实测只
+        // 含 text + image,这条仅是 future-proof 兜底,正常路径不触发。
+        let chunk = match block.get("type").and_then(|v| v.as_str()) {
+            Some("input_text" | "output_text" | "text") => block
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| serde_json::to_string(block).unwrap_or_default()),
+            _ => serde_json::to_string(block).unwrap_or_default(),
+        };
+        if !chunk.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&chunk);
+        }
+    }
+    (Value::String(text), images)
+}
+
+/// [MOC-250] 剥掉所有 tool message 上的 [`TOOL_IMAGE_SIDE_FIELD`] 侧信道字段。给 cache 副本用:
+/// 不缓存全分辨率截图、也不缓存提升出的 user image message,避免跨轮累积。
+fn strip_tool_image_side_fields(mut messages: Vec<Value>) -> Vec<Value> {
+    for m in &mut messages {
+        if let Some(obj) = m.as_object_mut() {
+            obj.remove(TOOL_IMAGE_SIDE_FIELD);
+        }
+    }
+    messages
+}
+
+/// [MOC-250] 截图提升:把**当前 input** 里每条带 [`TOOL_IMAGE_SIDE_FIELD`] 的 tool message
+/// 的图片提升为紧随其后的 user image message(chat tool role 不能携图;OpenAI / Gemini 都要求
+/// 图片落在 user turn)。无论是否提升,**所有** tool message 的侧信道字段都在此清除 —— 它绝不
+/// 出现在发上游的 wire 上。
+///
+/// **以「侧信道字段是否存在」判定当前轮,而非 trailing-tool 位置**(chatgpt-codex P2 修):
+/// 侧信道字段只在 [`input_item_to_messages`] 给**本轮 input** 的 function_call_output 挂,cache
+/// 副本已剥字段(见 [`strip_tool_image_side_fields`]),故合并历史后带字段的恒为当前 input 的
+/// tool message。早先版本按「末尾 keep_count 个 tool」判定,在 Codex 完整循环的
+/// `[function_call_output(截图), 新 user 输入]` 形态下 `current_tool_count==0` → 当前截图被静默
+/// 丢弃(正是需要像素的那一轮)。改为按字段存在判定后,只要是本轮 input 的截图就提升,不依赖
+/// 是否有 trailing user;跨轮累积仍由 cache 剥字段独立防住(历史截图早已在它**作为当前轮那次**
+/// 发过上游一次,续轮 cache 里不带字段、不重发,符合 computer-use「按需重新截图」的上下文管理)。
+///
+/// **图片在整段 tool-result 连续块之后才落 user message,不插在块中间**(chatgpt-codex P2 修):
+/// 并行 tool call(assistant.tool_calls=[a,b,c])要求其全部 tool result 在下一条非 tool 消息前
+/// **连续排列**(`repair_tool_call_ids` / issue #180:strict OpenAI 校验器靠这个把每个
+/// tool_call id 配上 result)。若某个 tool(b) 返图就紧跟着插一条 user image,会把后续 tool(c)
+/// 挤到 user 消息之后 → tool(c) 变孤儿 → 400。故累积本连续块内所有图片,遇到**下一条非 tool
+/// 消息(或结尾)再一次性 flush** 成一条 user image message,保持 tool-result 块完整。
+fn lift_tool_screenshot_images(messages: &mut Vec<Value>) {
+    // 绝大多数请求没有任何带图侧信道字段 → 快速返回,零额外分配。
+    if !messages
+        .iter()
+        .any(|m| m.get(TOOL_IMAGE_SIDE_FIELD).is_some())
+    {
+        return;
+    }
+    let is_tool = |m: &Value| m.get("role").and_then(|v| v.as_str()) == Some("tool");
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+    // 当前 tool-result 连续块内累积的待提升图片;遇非 tool 消息或结尾时 flush。
+    let mut pending: Vec<Value> = Vec::new();
+    for mut msg in std::mem::take(messages) {
+        // 非 tool 消息前先把上一段 tool 块累积的图片 flush 掉,保证图片落在 tool 块之后、
+        // 不打断 tool-result 连续性。
+        if !is_tool(&msg) && !pending.is_empty() {
+            out.push(
+                json!({ "role": "user", "content": Value::Array(std::mem::take(&mut pending)) }),
+            );
+        }
+        if let Some(Value::Array(arr)) = msg
+            .as_object_mut()
+            .and_then(|o| o.remove(TOOL_IMAGE_SIDE_FIELD))
+        {
+            pending.extend(arr);
+        }
+        out.push(msg);
+    }
+    if !pending.is_empty() {
+        out.push(json!({ "role": "user", "content": Value::Array(pending) }));
+    }
+    *messages = out;
+}
+
 /// 最新 1 条 tool 输出保留全文(MOC-190): ≤ 上限直接全文(当前轮全文进 LLM), 超过仍 bound 防撑爆。
 /// 与 [`normalize_tool_output_for_context`] 互补 —— 后者无条件压缩, 本函数给"当前轮那条"开全文绿灯。
 pub(crate) fn keep_recent_tool_output_full(call_id: Option<&str>, output_value: Value) -> String {
@@ -1105,6 +1300,21 @@ fn build_bounded_tool_output_summary(
         out.push_str(&format!("Artifact ID: {}\n", artifact.artifact_id));
         if let Some(call_id) = artifact.call_id.as_deref() {
             out.push_str(&format!("Tool call ID: {call_id}\n"));
+        }
+        // MOC-235: 仅当 artifact **持久化到共享 DB** 时才告知可回取 —— read_tool_artifact 跑在
+        // 独立 `--mcp-serve-webfetch` 进程、只读 DB,读不到仅落 proxy 进程内存的降级 fallback。
+        // 否则会给模型一个 reader 看不到的 id、把回取变成 miss/重跑(MOC-235 review #4)。
+        if artifact.persisted {
+            out.push_str(&format!(
+                "To read the FULL untruncated output on demand, call the read_tool_artifact tool with artifact_id \"{}\" (only when the head/tail excerpt below is not enough).\n",
+                artifact.artifact_id
+            ));
+        } else {
+            // 非持久化(DB 不可用/写失败 → 仅落 proxy 内存): 显式标本 id 不可回取, 抵消 MCP server 级
+            // 「见 Artifact ID 就调 read_tool_artifact」的通用指引, 防模型拿死 id 空调(MOC-235 review #5)。
+            out.push_str(
+                "(This artifact is stored in-process only and is NOT retrievable via read_tool_artifact — do not call read_tool_artifact for this ID.)\n",
+            );
         }
     } else {
         out.push_str("Artifact ID: unavailable; raw payload could not be stored.\n");
@@ -1775,7 +1985,18 @@ fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
                 | "stream_options"
                 | "mask_sensitive_info"
         ) || (key == "response_format" && response_format_allowed)
-            || (is_m3_plus && matches!(key.as_str(), "parallel_tool_calls" | "reasoning_effort"))
+            // [MOC-241] M3 的 OpenAI-compat `/v1/chat/completions` 原生接受 top-level
+            // `thinking:{type:disabled|adaptive}`(platform.minimax.io 实证,经 extra_body
+            // 透传;`reasoning_effort`/`enable_thinking` 均**不**控制 M3 思考)。reasoning
+            // 档位选 `none` 时 `apply_reasoning_effort` 在本 sanitize 之前(request.rs:243 <
+            // 313)写入 `thinking:{type:disabled}`,若不放行会被本 retain 剥掉 → 上游 M3 收不到
+            // 关思考、picker 显 none 却仍思考。M2.x 不放行(其端点字段集更窄、且 M2.x 走
+            // SINGLE_MAX 单档 max、无 none 档,本就不会带 thinking)。
+            || (is_m3_plus
+                && matches!(
+                    key.as_str(),
+                    "parallel_tool_calls" | "reasoning_effort" | "thinking"
+                ))
     });
 
     // MiniMax 官方建议 OpenAI-compatible M2.7 工具调用启用
@@ -2271,11 +2492,8 @@ fn provider_supports_vision(provider: Option<&Provider>, model: Option<&str>) ->
             // Xiaomi MiMo 文本-only 子集(实测响应 "I don't see any image attached")
             "mimo-v2-pro",
             "mimo-v2.5-pro",
-            // 智谱 GLM 文本旗舰模型（官方明确为文本模型，视觉走 GLM-5V 等独立模型）
-            "glm-5.1",
-            "glm-4.7",
-            // GLM Coding Plan 套餐档（zhipu-coding preset 的 mini/codex 槽,同纯文本）
-            "glm-4.6",
+            // 智谱 GLM 文本款不在此硬编码 —— 由下方 `is_glm_text_only_model` 版本谓词统一覆盖
+            //(glm-5.1/4.7/4.6/5/5.2/5-turbo… 全系文本款 + 未来版本,视觉 glm-*v 款不误伤)。
             // 阿里云百炼 Qwen 标准版（视觉能力走 Qwen-VL 系列）
             "qwen3.6-plus",
             "qwen3.6-flash",
@@ -2285,9 +2503,42 @@ fn provider_supports_vision(provider: Option<&Provider>, model: Option<&str>) ->
         if TEXT_ONLY_MODELS.iter().any(|n| lc == *n) {
             return false;
         }
+        // 3.5:智谱 GLM 文本款(版本谓词,覆盖全系 + 未来版本,见 [`is_glm_text_only_model`])。
+        // 修 glm-5.2 漏判:旧硬编码只列 glm-5.1/4.7/4.6,glm-5.2 落到默认 `true` 被当视觉,
+        // 含图会话(如 view_image 截图)继续时把 base64 发往 bigmodel 文本端点 → 拒/断流 →
+        // 会话毒化、重启也无法继续。
+        if is_glm_text_only_model(&lc) {
+            return false;
+        }
     }
 
     // 4:默认支持(覆盖未列在白名单的新模型 / OpenAI 标准 vision provider)
+    true
+}
+
+/// 智谱 GLM **纯文本模型**(非视觉)判定:`glm-` 前缀且不是视觉变体。
+///
+/// GLM 视觉款在**版本号后紧跟 `v`**(`glm-4v` / `glm-4.5v` / `glm-4.6v` / `glm-5v` /
+/// `glm-5v-turbo` / `glm-4.1v-thinking` 等);文本款无此 `v`(`glm-4` / `glm-4.5` /
+/// `glm-4.6` / `glm-4.7` / `glm-5` / `glm-5.1` / `glm-5.2` / `glm-5-turbo` / `glm-air` 等)。
+/// 智谱官方文本旗舰不收图(视觉走独立 GLM-xV);实测 bigmodel chat-completions 文本端点收到
+/// `image_url` 直接拒/断流,致含图会话无法继续。版本谓词覆盖全系 + 未来型号,免再漏判。
+fn is_glm_text_only_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    let Some(rest) = m.strip_prefix("glm-") else {
+        return false;
+    };
+    // 跳过版本号(数字 + 点),看紧随的首个非版本字符是否为 'v'(视觉标记)。
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+        i += 1;
+    }
+    // 版本号后紧跟 'v' → 视觉变体(4.5v / 5v / 5v-turbo / 4.1v-thinking)→ 非纯文本。
+    if i < bytes.len() && bytes[i] == b'v' {
+        return false;
+    }
+    // 其余 glm-*(glm-5.2 / glm-5-turbo / glm-air / glm-4.5-air …)→ 纯文本。
     true
 }
 
@@ -2770,10 +3021,7 @@ pub mod tools;
 #[cfg(test)]
 mod tests;
 
-use tools::{
-    contains_kimi_web_search_tool, convert_responses_tool_to_chat_tool, normalize_tool_choice,
-    APPLY_PATCH_TOOL_NAME,
-};
+use tools::{convert_responses_tool_to_chat_tool, normalize_tool_choice, APPLY_PATCH_TOOL_NAME};
 
 /// chat-path 实战指引(英文版),作为独立 `role:"system"` 注入,仅在该 turn 的
 /// tools 数组里注册了 `apply_patch` 时启用。理由参见 issue #235 真机稳定性测试。
@@ -2798,7 +3046,7 @@ use tools::{
 const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
     "[apply_patch chat-path guidance — injected by codex-app-transfer adapter because the upstream lark grammar constraint is unavailable on chat function-call providers]\n",
     "\n",
-    "**ALWAYS use the `apply_patch` tool to write file content** — new files, single-line edits, and full-file rewrites alike. **NEVER use shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / any `>` redirect to write actual file content** — doing so bypasses the Codex diff UI and audit trail. (To create a brand-new or empty file, use `*** Add File: <path>` — not a shell redirect.) **PREFER surgical targeted edits**: to change or replace existing content, emit ONLY the specific `-` (old) and `+` (new) lines for what actually changes; do NOT regenerate the whole file/section and append it, and do NOT rewrite an entire file just because part of it changed. Reserve full-file replacement (`*** Delete File: <path>` then `*** Add File: <path>` with every line `+`-prefixed, in one patch) for genuine cases ONLY: creating brand-new content, or when almost every line truly differs.\n",
+    "**ALWAYS use the `apply_patch` tool to write file content** — new files, single-line edits, and full-file rewrites alike. **NEVER use shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / any `>` redirect to write actual file content** — doing so bypasses the Codex diff UI and audit trail. **EQUALLY, NEVER use `sed -i` / `perl -i` / `ed`, or shell line-number deletion (e.g. `sed -i 'N,Md' file`), to edit or delete existing file content** — in-place shell editors bypass the diff UI and are fragile to line-number drift across successive edits (deleting by stale line numbers corrupts the file). (To create a brand-new or empty file, use `*** Add File: <path>` — not a shell redirect.) **PREFER surgical targeted edits**: to change or replace existing content, emit ONLY the specific `-` (old) and `+` (new) lines for what actually changes — keep each hunk minimal, and do NOT add or remove blank lines as part of an edit unless a blank line itself is the change (blank-line `+`/`-` are positionally ambiguous and may silently fail to apply). **To DELETE content — even a large contiguous block spanning many lines — emit those lines as `-` lines in an apply_patch hunk, or use `*** Delete File: <path>` to remove an entire file; do NOT switch to `sed`/`python` line-range deletion just because the block is large.** Multiple non-adjacent edits to the SAME file may go in ONE apply_patch call as separate hunks. Do NOT regenerate the whole file/section and append it, and do NOT rewrite an entire file just because part of it changed. Reserve full-file replacement (`*** Delete File: <path>` then `*** Add File: <path>` with every line `+`-prefixed, in one patch) for genuine cases ONLY: creating brand-new content, or when almost every line truly differs.\n",
     "\n",
     "When you call the `apply_patch` tool, follow these rules empirically observed with non-OpenAI chat providers:\n",
     "\n",
@@ -2812,7 +3060,8 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
     "**NEVER add a trailing `@@`** (`@@ <header> @@` is wrong) — Codex Desktop's V4A applier treats trailing `@@` as literal text and fails with `Failed to find context '... @@'`. ",
     "For deeply nested disambiguation use MULTIPLE `@@` lines on separate rows (e.g. `@@ class Outer\\n@@ def inner():`), each single-sided.\n",
     "\n",
-    "2. Add File uses NO `@@` markers and NO hunks. After `*** Add File: <path>`, prefix EVERY line of the new file's content with `+`, including blank lines (write them as a bare `+` on its own row). Raw source code without `+` prefix (e.g. `def main():` directly) causes `'def main():' is not a valid hunk header` errors.\n",
+    "2. Add File uses NO `@@` markers and NO hunks. After `*** Add File: <path>`, prefix every line of the new file's CONTENT with `+`, including blank lines (write them as a bare `+` on its own row). Raw source code without `+` prefix (e.g. `def main():` directly) causes `'def main():' is not a valid hunk header` errors. ",
+    "But the structural markers `*** Begin Patch` / `*** Add File:` / `*** End Patch` are NOT content — write them with NO prefix. In particular **do NOT prefix the terminator** (`+*** End Patch` is wrong); a `+`-prefixed terminator is treated as a content line and leaves a literal `*** End Patch` row at the end of the created file.\n",
     "\n",
     "3. Every `-` line and space-prefixed context line MUST match the file byte-for-byte (same leading whitespace, no trimmed trailing spaces, exact characters). If unsure, run `cat <path>` or `sed -n '1,80p' <path>` via shell first, then compose the patch from real bytes. Guessing produces `Failed to find context '<your guess>'` errors.\n",
     "\n",
@@ -2822,13 +3071,17 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
     "\n",
     "5. To populate a brand-new or empty file, use `*** Add File: <path>` with every line `+`-prefixed (not `*** Update File:`, not a shell redirect).\n",
     "\n",
-    "6. In a multi-line file, lone `+` lines without a corresponding `-` line APPEND below the previous context — they do NOT replace any existing line. To change an existing line, you MUST include BOTH a `-` line (removing the old content) AND a `+` line (adding the new content).\n",
+    "6. In a multi-line file, lone `+` lines without a corresponding `-` line APPEND below the previous context — they do NOT replace any existing line. To change an existing line, you MUST include BOTH a `-` line (removing the old content) AND a `+` line (adding the new content). ",
+    "A space-prefixed context line is MATCHED against the file, never added — it must already exist in the file. To introduce a brand-new line, prefix it `+`; writing a not-yet-present line as a context line (or with no prefix) yields a hunk with no real change that fails to apply or `Failed to find context`.\n",
     "\n",
-    "7. If an Update fails with `Failed to find context`, the `-`/context lines did not match the file byte-for-byte — re-read the file (`cat <path>` / `sed -n`) and fix those lines to match exactly, then retry the SAME surgical Update. Do NOT escalate to rewriting or re-appending the whole file; keep the edit targeted to the lines that change.\n",
+    "7. If an Update fails with `Failed to find context`, the `-`/context lines did not match the file byte-for-byte — re-read the file (`cat <path>` / `sed -n`) and fix those lines to match exactly, then retry the SAME surgical Update. Do NOT escalate to rewriting or re-appending the whole file; keep the edit targeted to the lines that change. ",
+    "When you make several edits to the SAME file in one turn, each applied hunk shifts the file's content — put related edits in ONE patch as separate hunks, or re-read the file between separate calls. A `-` line that no longer matches may have ALREADY been removed (by a prior hunk or an earlier edit this turn) — confirm it still exists before re-issuing the same deletion, instead of blindly retrying.\n",
     "\n",
     "8. `*** Begin Patch` MUST be the literal first line of the `input` string — no leading whitespace, no other content before it, never put `*** Add File:` or any operation header directly. Forgetting this causes `invalid patch: The first line of the patch must be '*** Begin Patch'`.\n",
     "\n",
     "9. `*** Update File: <old>` + `*** Move to: <new>` REQUIRES at least one hunk (with `-`/`+` lines or `*** End of File` marker). An empty Update+Move block fails with `Update file hunk for path '<old>' is empty`. **For pure rename without content change**, use `*** Delete File: <old>` + `*** Add File: <new>` within the same patch (copy original content with `+` prefix per line). **For rename WITH content change**, keep Update+Move and include the actual `-`/`+` hunks.\n",
+    "\n",
+    "10. Editing memory files (e.g. `~/.codex/memories/MEMORY.md`) needs extra care: a concurrent process may rewrite the file between when you last read it and when your patch applies. `cat` the file IMMEDIATELY before patching, make every `-`/context line a row that exists in the CURRENT file, and use minimal unique anchors (e.g. a single `@@ <section header>` plus only the exact rows you change). Stale `-` lines — content a concurrent consolidation already changed — fail with `Failed to find context`; on failure re-read and rebuild from the current bytes rather than retrying the stale patch.\n",
     "\n",
     "Following these rules avoids retry storms and improves the success rate on first attempt."
 );
@@ -2849,11 +3102,11 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
 ///   `context` / `patch` / `function` 等(混入中文反而不自然)
 /// - 强调词译:**ALWAYS** → **务必**;**NEVER** → **绝不**;**MUST** → **必须**;
 ///   PREFERRED → 推荐;SINGLE-SIDED → 单端;DEEPLY NESTED → 深层嵌套
-/// - 跟英文版**逐条对应**(9 条规则 + 引言段),不简化不漏 emphasis
+/// - 跟英文版**逐条对应**(10 条规则 + 引言段,rule 10 = MOC-268 memory 专属引导),不简化不漏 emphasis
 const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH: &str = concat!(
     "[apply_patch chat-path 指引 — 由 codex-app-transfer adapter 注入,因为上游 lark 语法约束在 chat function-call provider 上不可用]\n",
     "\n",
-    "**务必使用 `apply_patch` tool 写文件内容** —— 新建文件、单行编辑、整文件重写都一样。**绝不使用 shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / 任何 `>` 重定向来写实际文件内容** —— 这样做会绕过 Codex diff UI 和审计 trail。(新建或空文件用 `*** Add File: <path>` —— 不要用 shell 重定向。)**优先外科式针对性编辑**:要改/替换已有内容时,只发改动那几行的 `-`(旧)和 `+`(新);**不要**整段重新生成再追加,**不要**因为改了一部分就整文件重写。整文件替换(同一 patch 内 `*** Delete File: <path>` + `*** Add File: <path>`、每行前缀 `+`)**仅限**真正需要时:新建全新内容,或几乎每行都不同。\n",
+    "**务必使用 `apply_patch` tool 写文件内容** —— 新建文件、单行编辑、整文件重写都一样。**绝不使用 shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / 任何 `>` 重定向来写实际文件内容** —— 这样做会绕过 Codex diff UI 和审计 trail。**同样,绝不使用 `sed -i` / `perl -i` / `ed`、或 shell 按行号删除(如 `sed -i 'N,Md' file`)来编辑或删除已有文件内容** —— 就地 shell 编辑器绕过 diff UI,且对多次编辑间的行号漂移很脆弱(按过期行号删会切错、损坏文件)。(新建或空文件用 `*** Add File: <path>` —— 不要用 shell 重定向。)**优先外科式针对性编辑**:要改/替换已有内容时,只发改动那几行的 `-`(旧)和 `+`(新),保持每个 hunk 最小;且**不要**把增删空行作为编辑的一部分,除非空行本身就是改动(空行 `+`/`-` 位置歧义、可能静默 apply 失败)。**删除内容 —— 即便是跨很多行的大段连续块 —— 也用 apply_patch hunk 里的 `-` 行表达,或用 `*** Delete File: <path>` 删整个文件;不要因为块大就改用 `sed`/`python` 按行范围删除。** 对同一文件的多处不相邻编辑可以放进**一次** apply_patch 调用、分成多个 hunk。**不要**整段重新生成再追加,**不要**因为改了一部分就整文件重写。整文件替换(同一 patch 内 `*** Delete File: <path>` + `*** Add File: <path>`、每行前缀 `+`)**仅限**真正需要时:新建全新内容,或几乎每行都不同。\n",
     "\n",
     "调用 `apply_patch` tool 时,遵循以下基于非 OpenAI chat provider 实战观察总结的规则:\n",
     "\n",
@@ -2867,7 +3120,8 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH: &str = concat!(
     "**绝不加尾随 `@@`**(`@@ <header> @@` 是错的)—— Codex Desktop 的 V4A applier 会把尾随 `@@` 当字面文本,报 `Failed to find context '... @@'`。",
     "深层嵌套消歧时用**多个** `@@` 行各占一行(例如 `@@ class Outer\\n@@ def inner():`),每条都是单端。\n",
     "\n",
-    "2. Add File **不用** `@@` 标记、**不用** hunk。`*** Add File: <path>` 之后,新文件**每一行**(包括空行,写成单个 `+` 占一行)都前缀 `+`。没 `+` 前缀的原始源码(例如直接写 `def main():`)会触发 `'def main():' is not a valid hunk header` 错误。\n",
+    "2. Add File **不用** `@@` 标记、**不用** hunk。`*** Add File: <path>` 之后,新文件**每一行内容**(包括空行,写成单个 `+` 占一行)都前缀 `+`。没 `+` 前缀的原始源码(例如直接写 `def main():`)会触发 `'def main():' is not a valid hunk header` 错误。",
+    "但结构标记 `*** Begin Patch` / `*** Add File:` / `*** End Patch` **不是内容,不加前缀**。尤其**绝不给终止符加前缀**(`+*** End Patch` 是错的):带 `+` 的终止符会被当成内容行,在新建文件末尾留下一行字面 `*** End Patch`。\n",
     "\n",
     "3. 每个 `-` 行和空格前缀的 context 行**必须**跟文件 byte-for-byte 一致(同样的前导 whitespace,不能 trim 尾随空格,字符完全相同)。不确定时先用 shell 跑 `cat <path>` 或 `sed -n '1,80p' <path>` 查一下,再用真实字节组 patch。靠猜会触发 `Failed to find context '<your guess>'` 错误。\n",
     "\n",
@@ -2877,13 +3131,17 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH: &str = concat!(
     "\n",
     "5. 新建或空文件用 `*** Add File: <path>`、每行前缀 `+`(不要用 `*** Update File:`,也不要用 shell 重定向)。\n",
     "\n",
-    "6. 多行文件里,**没有**对应 `-` 行的孤立 `+` 行会**追加**在上文 context 之下 —— **不会**替换任何已有行。要修改已有行,**必须**同时包含 `-` 行(删旧内容)和 `+` 行(加新内容)。\n",
+    "6. 多行文件里,**没有**对应 `-` 行的孤立 `+` 行会**追加**在上文 context 之下 —— **不会**替换任何已有行。要修改已有行,**必须**同时包含 `-` 行(删旧内容)和 `+` 行(加新内容)。",
+    "空格前缀的 context 行是拿来**跟文件匹配**的、绝不新增 —— 它必须已存在于文件中。要引入全新行,前缀 `+`;把文件里还没有的行写成 context(或不加前缀)会得到一个无实际改动、apply 失败或 `Failed to find context` 的 hunk。\n",
     "\n",
-    "7. Update 报 `Failed to find context` 时,说明 `-`/context 行跟文件 byte 对不上 —— 重新 `cat <path>` / `sed -n` 读文件、把这些行改成完全一致,再重试**同一个**针对性 Update。**不要**升级成整文件重写/重新追加,把编辑保持在改动的那几行。\n",
+    "7. Update 报 `Failed to find context` 时,说明 `-`/context 行跟文件 byte 对不上 —— 重新 `cat <path>` / `sed -n` 读文件、把这些行改成完全一致,再重试**同一个**针对性 Update。**不要**升级成整文件重写/重新追加,把编辑保持在改动的那几行。",
+    "在**一次**回合里对**同一文件**做多处编辑时,每个已应用的 hunk 都会改变文件内容 —— 把相关编辑放进**一个** patch 的多个 hunk,或在多次独立调用之间重新读文件。某个 `-` 行不再匹配,可能是它**已经被删掉**(被前一个 hunk、或本回合更早的编辑)—— 重发同一删除前先确认它还在,别盲目重试。\n",
     "\n",
     "8. `*** Begin Patch` **必须**是 `input` 字符串的字面第一行 —— 不能有前导空格,前面不能有其它内容,绝不能直接写 `*** Add File:` 或任何操作 header。漏了会触发 `invalid patch: The first line of the patch must be '*** Begin Patch'`。\n",
     "\n",
     "9. `*** Update File: <old>` + `*** Move to: <new>` **要求**至少一个 hunk(带 `-`/`+` 行或 `*** End of File` 标记)。空的 Update+Move 块会报 `Update file hunk for path '<old>' is empty`。**纯重命名不改内容**时,在同一 patch 内用 `*** Delete File: <old>` + `*** Add File: <new>`(把原内容每行前缀 `+` 复制过去)。**重命名同时改内容**时,保留 Update+Move 并写真实的 `-`/`+` hunk。\n",
+    "\n",
+    "10. 编辑 memory 文件(如 `~/.codex/memories/MEMORY.md`)要格外小心:并发进程可能在你上次读它、到你的 patch 落地之间重写该文件。打 patch **前立即** `cat` 该文件,让每个 `-`/context 行都是**当前**文件里存在的行,并用最小唯一锚点(如单个 `@@ <section header>` + 只写你实际改的那几行)。过期的 `-` 行 —— 内容已被并发固化(consolidation)改掉 —— 会报 `Failed to find context`;失败时重新读、按当前字节重建,而不是重试过期 patch。\n",
     "\n",
     "遵循这些规则可以避免 retry 风暴,提升首次尝试的成功率。"
 );
@@ -2928,10 +3186,29 @@ fn tools_register_apply_patch(body: &Value) -> bool {
     })
 }
 
+/// 中文用户语言引导(MOC-243 followup #262):第三方模型(gemini-3-flash-agent 等)在大段英文
+/// Codex system 模板下倾向英文回复,即便 input 全中文(实测 mochan-translator 续轮多轮全英文)。
+/// 在 system instruction 顶部(apply_patch 指引之前)放一条显式中文指令,引导模型用中文回复用户。
+const CHINESE_LANGUAGE_DIRECTIVE: &str =
+    "**请始终使用简体中文回复用户**(代码、命令、标识符、文件路径等技术内容保持原文,不要翻译)。";
+
+/// apply_patch chat-path 指引 system message。**中文用户**额外在指引最前面 prepend
+/// [`CHINESE_LANGUAGE_DIRECTIVE`] —— 该 message 已位于 system instruction 顶部(Codex 原生
+/// instructions 多为空 sentinel),故 directive 成为模型最先读到的指令,纠正英文漂移。
+/// 拼进**同一条** message(而非独立 message)是为了不改变后续 message 下标,避免破坏读
+/// `messages[1]` 的既有断言;且仅当本 turn 注册 apply_patch 时注入(Codex Desktop 必注册),
+/// 与指引同生命周期,后续 turn 经 session_cache merge 已含。
 fn apply_patch_chat_guidance_message() -> Value {
+    use crate::core::language::{current_language, Language};
+    let guidance = apply_patch_chat_path_guidance_for_current_language();
+    let content = if current_language() == Language::Chinese {
+        format!("{CHINESE_LANGUAGE_DIRECTIVE}\n\n{guidance}")
+    } else {
+        guidance.to_owned()
+    };
     json!({
         "role": "system",
-        "content": apply_patch_chat_path_guidance_for_current_language(),
+        "content": content,
     })
 }
 

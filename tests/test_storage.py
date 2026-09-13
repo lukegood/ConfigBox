@@ -129,6 +129,20 @@ def test_delete_active_profile_switches_to_fallback(tmp_path: Path):
     assert "中文供应商" not in {profile["name"] for profile in storage.list_profiles(tool)}
 
 
+def test_delete_multifile_profile_removes_legacy_file_shadow(tmp_path: Path):
+    registry, storage, _, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("codex")
+    storage.create_profile(tool, "shadow", "empty")
+    legacy = tool.profile_dir / "shadow.json"
+    legacy.write_text('{"OPENAI_API_KEY": "old"}\n', encoding="utf-8")
+
+    storage.delete_profile(tool, "shadow")
+
+    assert not (tool.profile_dir / "shadow").exists()
+    assert not legacy.exists()
+    assert "shadow" not in {profile["name"] for profile in storage.list_profiles(tool)}
+
+
 def test_active_profile_reports_runtime_change(tmp_path: Path):
     registry, storage, _, claude_path, *_ = load_modules(tmp_path)
     tool = registry.get_tool("claude")
