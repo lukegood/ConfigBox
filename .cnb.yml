@@ -16,7 +16,7 @@ master:
           image: python:3.12-slim
           script:
             - pip install --no-cache-dir -r requirements.txt
-            - pytest -q
+            - python -m pytest -q
 
         - name: Frontend build
           image: node:22-bookworm-slim
