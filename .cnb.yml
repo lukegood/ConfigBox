@@ -5,9 +5,6 @@ master:
         tags: cnb:arch:amd64
         cpus: 8
 
-      services:
-        - docker
-
       docker:
         image: ubuntu:24.04
 
@@ -25,6 +22,27 @@ master:
             - npm ci --no-audit --no-fund
             - npm run build
 
-        - name: Docker build
-          script:
-            - docker build -t configbox:cnb-test .
+
+"v*":
+  tag_push:
+    - name: ConfigBox Docker Hub Auth Test
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 8
+
+      services:
+        - docker
+
+      docker:
+        image: ubuntu:24.04
+
+      imports:
+        - https://cnb.cool/linuxmore/ConfigBox-Secrets/-/blob/main/dockerhub.yml
+
+      stages:
+        - name: Docker Hub login
+          script: |
+            printf '%s' "$DOCKERHUB_TOKEN" | \
+              docker login \
+                --username "$DOCKERHUB_USERNAME" \
+                --password-stdin
