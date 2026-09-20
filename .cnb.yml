@@ -25,7 +25,7 @@ master:
 
 "v*":
   tag_push:
-    - name: CNB Registry TLS Diagnosis
+    - name: CNB Registry CA Diagnosis
       runner:
         tags: cnb:arch:amd64
         cpus: 8
@@ -37,85 +37,71 @@ master:
         image: ubuntu:24.04
 
       stages:
-        - name: Diagnose CNB registry TLS
+        - name: Check CA environment
+          script: |
+            set -eu
+
+            echo "=== OS ==="
+            cat /etc/os-release
+
+            echo
+            echo "=== ca-certificates package ==="
+            dpkg -s ca-certificates || true
+
+            echo
+            echo "=== CA bundle ==="
+            ls -l /etc/ssl/certs/ca-certificates.crt || true
+
+        - name: Install CA certificates
+          script: |
+            set -eu
+
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive \
+              apt-get install -y --no-install-recommends ca-certificates
+
+            update-ca-certificates
+
+            echo
+            echo "=== CA bundle after installation ==="
+            ls -lh /etc/ssl/certs/ca-certificates.crt
+
+        - name: Test Buildx push
           script: |
             set -eu
 
             CNB_IMAGE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
 
-            echo "========================================"
-            echo "CNB Registry TLS diagnosis"
-            echo "Registry: ${CNB_DOCKER_REGISTRY}"
-            echo "Image:    ${CNB_IMAGE}"
-            echo "========================================"
-
-            echo
-            echo "=== Docker version ==="
+            echo "=== Docker ==="
             docker version
 
             echo
-            echo "=== Docker info ==="
-            docker info
-
-            echo
-            echo "=== Docker Buildx version ==="
+            echo "=== Buildx ==="
             docker buildx version
-
-            echo
-            echo "=== Docker Buildx builders ==="
             docker buildx ls
-
-            echo
-            echo "=== Current Buildx builder ==="
             docker buildx inspect --bootstrap
 
             echo
-            echo "=== Login to CNB registry ==="
+            echo "=== Login ==="
             printf '%s' "${CNB_TOKEN}" | \
               docker login "${CNB_DOCKER_REGISTRY}" \
                 --username "${CNB_TOKEN_USER_NAME}" \
                 --password-stdin
 
             echo
-            echo "========================================"
-            echo "TEST 1: Docker CLI push"
-            echo "========================================"
-
-            mkdir -p /tmp/cnb-docker-test
-
-            printf 'FROM scratch\nLABEL test="cnb-docker-cli-tls"\n' \
-              > /tmp/cnb-docker-test/Dockerfile
-
-            docker build \
-              -t "${CNB_IMAGE}:tls-docker-test" \
-              /tmp/cnb-docker-test
-
-            docker push "${CNB_IMAGE}:tls-docker-test"
-
-            echo
-            echo "Docker CLI push: SUCCESS"
-
-            echo
-            echo "========================================"
-            echo "TEST 2: Buildx / BuildKit push"
-            echo "========================================"
+            echo "=== Buildx push test ==="
 
             mkdir -p /tmp/cnb-buildx-test
 
-            printf 'FROM scratch\nLABEL test="cnb-buildx-tls"\n' \
+            printf 'FROM scratch\nLABEL test="cnb-buildx-ca-fixed"\n' \
               > /tmp/cnb-buildx-test/Dockerfile
 
             docker buildx build \
               --progress=plain \
               --platform linux/amd64 \
-              -t "${CNB_IMAGE}:tls-buildx-test" \
+              -t "${CNB_IMAGE}:tls-buildx-ca-test" \
               --push \
               /tmp/cnb-buildx-test
 
             echo
             echo "Buildx push: SUCCESS"
-
-            echo
-            echo "========================================"
-            echo "All CNB registry TLS tests passed"
-            echo "========================================"
