@@ -25,7 +25,7 @@ master:
 
 "v*":
   tag_push:
-    - name: ConfigBox Docker Hub Auth Test
+    - name: ConfigBox Release
       runner:
         tags: cnb:arch:amd64
         cpus: 8
@@ -40,9 +40,66 @@ master:
         - https://cnb.cool/linuxmore/ConfigBox-Secrets/-/blob/main/dockerhub.yml
 
       stages:
-        - name: Docker Hub login
+        - name: Validate release tag
           script: |
-            printf '%s' "$DOCKERHUB_TOKEN" | \
-              docker login \
-                --username "$DOCKERHUB_USERNAME" \
+            set -eu
+
+            if ! printf '%s\n' "${CNB_BRANCH}" | \
+              grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "Invalid release tag: ${CNB_BRANCH}"
+              echo "Expected format: v1.2.3"
+              exit 1
+            fi
+
+            echo "Release tag: ${CNB_BRANCH}"
+            echo "Release version: ${CNB_BRANCH#v}"
+
+        - name: Python tests
+          image: python:3.12-slim
+          script:
+            - pip install --no-cache-dir -r requirements.txt
+            - python -m pytest -q
+
+        - name: Frontend build
+          image: node:22-bookworm-slim
+          script:
+            - cd frontend
+            - npm ci --no-audit --no-fund
+            - npm run build
+
+        - name: Login to registries
+          script: |
+            set -eu
+
+            printf '%s' "${CNB_TOKEN}" | \
+              docker login "${CNB_DOCKER_REGISTRY}" \
+                --username "${CNB_TOKEN_USER_NAME}" \
                 --password-stdin
+
+            printf '%s' "${DOCKERHUB_TOKEN}" | \
+              docker login \
+                --username "${DOCKERHUB_USERNAME}" \
+                --password-stdin
+
+        - name: Build and publish multi-arch image
+          script: |
+            set -eu
+
+            VERSION="${CNB_BRANCH#v}"
+
+            CNB_IMAGE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
+            DOCKERHUB_IMAGE="cloudcollector/configbox"
+
+            echo "Building ConfigBox ${VERSION}"
+            echo "Platforms: linux/amd64, linux/arm64"
+            echo "CNB image: ${CNB_IMAGE}:${VERSION}"
+            echo "Docker Hub image: ${DOCKERHUB_IMAGE}:${VERSION}"
+
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              -t "${CNB_IMAGE}:${VERSION}" \
+              -t "${CNB_IMAGE}:latest" \
+              -t "${DOCKERHUB_IMAGE}:${VERSION}" \
+              -t "${DOCKERHUB_IMAGE}:latest" \
+              --push \
+              .
