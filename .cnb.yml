@@ -1,0 +1,30 @@
+master:
+  push:
+    - name: ConfigBox CI
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 8
+
+      services:
+        - docker
+
+      docker:
+        image: ubuntu:24.04
+
+      stages:
+        - name: Python tests
+          image: python:3.12-slim
+          script:
+            - pip install --no-cache-dir -r requirements.txt
+            - pytest -q
+
+        - name: Frontend build
+          image: node:22-bookworm-slim
+          script:
+            - cd frontend
+            - npm ci --no-audit --no-fund
+            - npm run build
+
+        - name: Docker build
+          script:
+            - docker build -t configbox:cnb-test .
