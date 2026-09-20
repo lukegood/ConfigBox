@@ -25,7 +25,7 @@ master:
 
 "v*":
   tag_push:
-    - name: ConfigBox Release
+    - name: CNB Registry TLS Diagnosis
       runner:
         tags: cnb:arch:amd64
         cpus: 8
@@ -36,70 +36,86 @@ master:
       docker:
         image: ubuntu:24.04
 
-      imports:
-        - https://cnb.cool/linuxmore/ConfigBox-Secrets/-/blob/main/dockerhub.yml
-
       stages:
-        - name: Validate release tag
+        - name: Diagnose CNB registry TLS
           script: |
             set -eu
 
-            if ! printf '%s\n' "${CNB_BRANCH}" | \
-              grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-              echo "Invalid release tag: ${CNB_BRANCH}"
-              echo "Expected format: v1.2.3"
-              exit 1
-            fi
+            CNB_IMAGE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
 
-            echo "Release tag: ${CNB_BRANCH}"
-            echo "Release version: ${CNB_BRANCH#v}"
+            echo "========================================"
+            echo "CNB Registry TLS diagnosis"
+            echo "Registry: ${CNB_DOCKER_REGISTRY}"
+            echo "Image:    ${CNB_IMAGE}"
+            echo "========================================"
 
-        - name: Python tests
-          image: python:3.12-slim
-          script:
-            - pip install --no-cache-dir -r requirements.txt
-            - python -m pytest -q
+            echo
+            echo "=== Docker version ==="
+            docker version
 
-        - name: Frontend build
-          image: node:22-bookworm-slim
-          script:
-            - cd frontend
-            - npm ci --no-audit --no-fund
-            - npm run build
+            echo
+            echo "=== Docker info ==="
+            docker info
 
-        - name: Login to registries
-          script: |
-            set -eu
+            echo
+            echo "=== Docker Buildx version ==="
+            docker buildx version
 
+            echo
+            echo "=== Docker Buildx builders ==="
+            docker buildx ls
+
+            echo
+            echo "=== Current Buildx builder ==="
+            docker buildx inspect --bootstrap
+
+            echo
+            echo "=== Login to CNB registry ==="
             printf '%s' "${CNB_TOKEN}" | \
               docker login "${CNB_DOCKER_REGISTRY}" \
                 --username "${CNB_TOKEN_USER_NAME}" \
                 --password-stdin
 
-            printf '%s' "${DOCKERHUB_TOKEN}" | \
-              docker login \
-                --username "${DOCKERHUB_USERNAME}" \
-                --password-stdin
+            echo
+            echo "========================================"
+            echo "TEST 1: Docker CLI push"
+            echo "========================================"
 
-        - name: Build and publish multi-arch image
-          script: |
-            set -eu
+            mkdir -p /tmp/cnb-docker-test
 
-            VERSION="${CNB_BRANCH#v}"
+            printf 'FROM scratch\nLABEL test="cnb-docker-cli-tls"\n' \
+              > /tmp/cnb-docker-test/Dockerfile
 
-            CNB_IMAGE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
-            DOCKERHUB_IMAGE="cloudcollector/configbox"
+            docker build \
+              -t "${CNB_IMAGE}:tls-docker-test" \
+              /tmp/cnb-docker-test
 
-            echo "Building ConfigBox ${VERSION}"
-            echo "Platforms: linux/amd64, linux/arm64"
-            echo "CNB image: ${CNB_IMAGE}:${VERSION}"
-            echo "Docker Hub image: ${DOCKERHUB_IMAGE}:${VERSION}"
+            docker push "${CNB_IMAGE}:tls-docker-test"
+
+            echo
+            echo "Docker CLI push: SUCCESS"
+
+            echo
+            echo "========================================"
+            echo "TEST 2: Buildx / BuildKit push"
+            echo "========================================"
+
+            mkdir -p /tmp/cnb-buildx-test
+
+            printf 'FROM scratch\nLABEL test="cnb-buildx-tls"\n' \
+              > /tmp/cnb-buildx-test/Dockerfile
 
             docker buildx build \
-              --platform linux/amd64,linux/arm64 \
-              -t "${CNB_IMAGE}:${VERSION}" \
-              -t "${CNB_IMAGE}:latest" \
-              -t "${DOCKERHUB_IMAGE}:${VERSION}" \
-              -t "${DOCKERHUB_IMAGE}:latest" \
+              --progress=plain \
+              --platform linux/amd64 \
+              -t "${CNB_IMAGE}:tls-buildx-test" \
               --push \
-              .
+              /tmp/cnb-buildx-test
+
+            echo
+            echo "Buildx push: SUCCESS"
+
+            echo
+            echo "========================================"
+            echo "All CNB registry TLS tests passed"
+            echo "========================================"
