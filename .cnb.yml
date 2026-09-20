@@ -25,7 +25,7 @@ master:
 
 "v*":
   tag_push:
-    - name: CNB Registry CA Diagnosis
+    - name: ConfigBox Release
       runner:
         tags: cnb:arch:amd64
         cpus: 8
@@ -36,72 +36,82 @@ master:
       docker:
         image: ubuntu:24.04
 
+      imports:
+        - https://cnb.cool/linuxmore/ConfigBox-Secrets/-/blob/main/dockerhub.yml
+
       stages:
-        - name: Check CA environment
+        - name: Validate release tag
           script: |
             set -eu
 
-            echo "=== OS ==="
-            cat /etc/os-release
+            if ! printf '%s\n' "${CNB_BRANCH}" | \
+              grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "Invalid release tag: ${CNB_BRANCH}"
+              echo "Expected format: v1.2.3"
+              exit 1
+            fi
 
-            echo
-            echo "=== ca-certificates package ==="
-            dpkg -s ca-certificates || true
+            echo "Release tag: ${CNB_BRANCH}"
+            echo "Release version: ${CNB_BRANCH#v}"
 
-            echo
-            echo "=== CA bundle ==="
-            ls -l /etc/ssl/certs/ca-certificates.crt || true
+        - name: Python tests
+          image: python:3.12-slim
+          script:
+            - pip install --no-cache-dir -r requirements.txt
+            - python -m pytest -q
+
+        - name: Frontend build
+          image: node:22-bookworm-slim
+          script:
+            - cd frontend
+            - npm ci --no-audit --no-fund
+            - npm run build
 
         - name: Install CA certificates
           script: |
             set -eu
 
             apt-get update
+
             DEBIAN_FRONTEND=noninteractive \
               apt-get install -y --no-install-recommends ca-certificates
 
             update-ca-certificates
 
-            echo
-            echo "=== CA bundle after installation ==="
-            ls -lh /etc/ssl/certs/ca-certificates.crt
-
-        - name: Test Buildx push
+        - name: Login to registries
           script: |
             set -eu
 
-            CNB_IMAGE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
-
-            echo "=== Docker ==="
-            docker version
-
-            echo
-            echo "=== Buildx ==="
-            docker buildx version
-            docker buildx ls
-            docker buildx inspect --bootstrap
-
-            echo
-            echo "=== Login ==="
             printf '%s' "${CNB_TOKEN}" | \
               docker login "${CNB_DOCKER_REGISTRY}" \
                 --username "${CNB_TOKEN_USER_NAME}" \
                 --password-stdin
 
-            echo
-            echo "=== Buildx push test ==="
+            printf '%s' "${DOCKERHUB_TOKEN}" | \
+              docker login \
+                --username "${DOCKERHUB_USERNAME}" \
+                --password-stdin
 
-            mkdir -p /tmp/cnb-buildx-test
+        - name: Build and publish multi-arch image
+          script: |
+            set -eu
 
-            printf 'FROM scratch\nLABEL test="cnb-buildx-ca-fixed"\n' \
-              > /tmp/cnb-buildx-test/Dockerfile
+            VERSION="${CNB_BRANCH#v}"
+
+            CNB_IMAGE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
+            DOCKERHUB_IMAGE="cloudcollector/configbox"
+
+            echo "Building ConfigBox ${VERSION}"
+            echo "Platforms: linux/amd64, linux/arm64"
+            echo "CNB image: ${CNB_IMAGE}:${VERSION}"
+            echo "Docker Hub image: ${DOCKERHUB_IMAGE}:${VERSION}"
 
             docker buildx build \
               --progress=plain \
-              --platform linux/amd64 \
-              -t "${CNB_IMAGE}:tls-buildx-ca-test" \
+              --platform linux/amd64,linux/arm64 \
+              -t "${CNB_IMAGE}:${VERSION}" \
+              -t "${CNB_IMAGE}:latest" \
+              -t "${DOCKERHUB_IMAGE}:${VERSION}" \
+              -t "${DOCKERHUB_IMAGE}:latest" \
               --push \
-              /tmp/cnb-buildx-test
-
-            echo
-            echo "Buildx push: SUCCESS"
+              .
