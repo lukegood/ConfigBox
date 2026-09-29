@@ -55,6 +55,18 @@ import {
   switchGatewayOAuthAccount,
   updateGatewayProvider
 } from "./api";
+import { PiProviderModal } from "./components/PiProviderModal";
+import {
+  applyPiProviderForm,
+  deletePiProvider,
+  emptyPiProviderForm,
+  hasPiJsoncSyntax,
+  piProviderFormFromContent,
+  readPiDefaults,
+  setPiDefaultModel,
+  summarizePiModels
+} from "./pi";
+import type { PiProviderForm } from "./pi";
 import type {
   ConfigFile,
   GatewayConfig,
@@ -410,6 +422,7 @@ function App() {
   const [openCodeProviderForm, setOpenCodeProviderForm] = useState<OpenCodeProviderForm | null>(null);
   const [openCodeModelForm, setOpenCodeModelForm] = useState<OpenCodeModelForm | null>(null);
   const [claudeProviderForm, setClaudeProviderForm] = useState<ClaudeProviderForm | null>(null);
+  const [piProviderForm, setPiProviderForm] = useState<PiProviderForm | null>(null);
   const [showGatewayProviderApiKey, setShowGatewayProviderApiKey] = useState(false);
   const [showOpenCodeProviderApiKey, setShowOpenCodeProviderApiKey] = useState(false);
   const [showClaudeProviderToken, setShowClaudeProviderToken] = useState(false);
@@ -420,6 +433,14 @@ function App() {
   const openCodeStats = useMemo(() => summarizeOpenCodeConfig(activeContent), [activeContent]);
   const openCodeProviders = useMemo(() => summarizeOpenCodeProviders(activeContent), [activeContent]);
   const claudeStats = useMemo(() => summarizeClaudeConfig(activeContent), [activeContent]);
+  const piModelsContent = files.find((file) => file.id === "models")?.content ?? "";
+  const piSettingsContent = files.find((file) => file.id === "settings")?.content ?? "";
+  const piStats = useMemo(() => summarizePiModels(piModelsContent), [piModelsContent]);
+  const piDefaults = useMemo(() => readPiDefaults(piSettingsContent), [piSettingsContent]);
+  const piDefaultKey = piDefaults.provider && piDefaults.model ? `${piDefaults.provider}/${piDefaults.model}` : "";
+  const piDefaultInModels = piStats.providers.some(
+    (provider) => provider.id === piDefaults.provider && provider.modelIds.includes(piDefaults.model)
+  );
   const visibleGatewayPresets = useMemo(
     () => gatewayPresets.filter((preset) => showGatewayExperimentalPresets || preset.experimental !== true),
     [gatewayPresets, showGatewayExperimentalPresets]
@@ -435,7 +456,9 @@ function App() {
   const showRuntimeImport = mode === "profile" && selectedProfileActive && runtimeChanged;
   const showOpenCodeAssistant = toolId === "opencode" && mode === "profile" && activeFile?.format === "json";
   const showClaudeAssistant = toolId === "claude" && mode === "profile" && activeFile?.format === "json";
-  const showProfileAssistant = showOpenCodeAssistant || showClaudeAssistant;
+  // The pi helper edits both models.json and settings.json, so it is shown on either tab.
+  const showPiAssistant = toolId === "pi" && mode === "profile" && files.length > 1;
+  const showProfileAssistant = showOpenCodeAssistant || showClaudeAssistant || showPiAssistant;
   const sensitive = files.some((file) => /api[_-]?key|token|secret|password/i.test(file.content));
   const contentLength = files.reduce((sum, file) => sum + file.content.length, 0);
 
@@ -661,7 +684,13 @@ function App() {
       await loadLists();
       setMode("profile");
       setSelectedHistory(null);
-      applyDocument(active, `Profile: ${selectedProfile}`, `已启用 Profile: ${selectedProfile}`);
+      applyDocument(
+        active,
+        `Profile: ${selectedProfile}`,
+        toolId === "pi"
+          ? `已启用 Profile: ${selectedProfile}，请在 pi 中执行 /reload 或重启 pi`
+          : `已启用 Profile: ${selectedProfile}`
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "启用失败");
     } finally {
@@ -1507,8 +1536,68 @@ function App() {
     }
   }
 
+  function openPiProviderForm(providerId?: string) {
+    if (!providerId) {
+      setPiProviderForm(emptyPiProviderForm());
+      return;
+    }
+    try {
+      setPiProviderForm(piProviderFormFromContent(piModelsContent, providerId));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取 Pi Provider 失败");
+    }
+  }
+
+  function confirmPiCommentLoss() {
+    return !piStats.hasComments || window.confirm("models.json 中的 // 注释和尾逗号会在写回时被移除，继续？");
+  }
+
+  function handlePiProviderSubmit(form: PiProviderForm) {
+    if (!confirmPiCommentLoss()) return;
+    try {
+      const next = applyPiProviderForm(piModelsContent, piSettingsContent, form);
+      updateFileContent("models", next.modelsContent);
+      if (next.settingsContent !== null) {
+        updateFileContent("settings", next.settingsContent);
+      }
+      setPiProviderForm(null);
+      setError("");
+      setStatus(`${form.originalProviderId ? "已更新" : "已添加"} Pi Provider: ${form.providerId.trim()}，保存后生效`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存 Pi Provider 失败");
+    }
+  }
+
+  function handlePiDeleteProvider(providerId: string) {
+    if (!window.confirm(`删除 Pi Provider "${providerId}"？`) || !confirmPiCommentLoss()) return;
+    try {
+      updateFileContent("models", deletePiProvider(piModelsContent, providerId));
+      setError("");
+      setStatus(`已删除 Pi Provider: ${providerId}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除 Pi Provider 失败");
+    }
+  }
+
+  function handlePiDefaultModelChange(value: string) {
+    const separator = value.indexOf("/");
+    const provider = separator > 0 ? value.slice(0, separator) : "";
+    const model = separator > 0 ? value.slice(separator + 1) : "";
+    try {
+      updateFileContent("settings", setPiDefaultModel(piSettingsContent, provider, model));
+      setError("");
+      setStatus(provider ? `默认模型已改为 ${value}，保存后生效` : "已清除默认模型，保存后生效");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "更新默认模型失败");
+    }
+  }
+
   function handleFormat() {
-    if (!activeFile || activeFile.format !== "json") {
+    if (activeFile?.format === "jsonc" && hasPiJsoncSyntax(activeFile.content)) {
+      setStatus("含 // 注释或尾逗号的 JSONC 保留原格式");
+      return;
+    }
+    if (!activeFile || (activeFile.format !== "json" && activeFile.format !== "jsonc")) {
       setStatus("TOML 保留原格式");
       return;
     }
@@ -1522,6 +1611,10 @@ function App() {
 
   function updateActiveContent(content: string) {
     setFiles((current) => current.map((file) => (file.id === activeFile?.id ? { ...file, content } : file)));
+  }
+
+  function updateFileContent(fileId: string, content: string) {
+    setFiles((current) => current.map((file) => (file.id === fileId ? { ...file, content } : file)));
   }
 
   async function logout() {
@@ -2008,6 +2101,78 @@ function App() {
                   </div>
                 </div>
               ) : null}
+              {showPiAssistant ? (
+                <div className="opencode-helper">
+                  <div className="opencode-helper-title">
+                    <span>Pi Provider 助手</span>
+                    <span className={piStats.valid ? "pill" : "pill muted-pill"}>
+                      {piStats.valid ? "JSONC" : "models.json 错误"}
+                    </span>
+                    {piDefaults.valid ? null : <span className="pill muted-pill">settings.json 错误</span>}
+                  </div>
+                  <div className="opencode-helper-stats">
+                    <span>{piStats.providers.length} providers</span>
+                    <span>{piStats.modelCount} models</span>
+                    <select
+                      className="pi-default-select"
+                      value={piDefaultKey}
+                      onChange={(event) => handlePiDefaultModelChange(event.target.value)}
+                      disabled={loading || !piDefaults.valid}
+                      title="settings.json defaultProvider / defaultModel"
+                    >
+                      <option value="">默认模型：pi 自动选择</option>
+                      {piDefaultKey && !piDefaultInModels ? (
+                        <option value={piDefaultKey}>默认：{piDefaultKey}（内置或未在 models.json 中）</option>
+                      ) : null}
+                      {piStats.providers.flatMap((provider) =>
+                        provider.modelIds.map((modelId) => (
+                          <option key={`${provider.id}/${modelId}`} value={`${provider.id}/${modelId}`}>
+                            默认：{provider.id}/{modelId}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </div>
+                  <div className="opencode-helper-actions">
+                    <button type="button" onClick={() => openPiProviderForm()} disabled={loading || !piStats.valid}>
+                      <FolderPlus size={15} />
+                      Provider
+                    </button>
+                  </div>
+                  {piStats.providers.length ? (
+                    <div className="assistant-provider-list">
+                      {piStats.providers.map((provider) => (
+                        <div className="assistant-provider-row" key={provider.id}>
+                          <span>
+                            <strong>{provider.name || provider.id}</strong>
+                            <small>
+                              {provider.id}
+                              {provider.api ? ` · ${provider.api}` : ""}
+                            </small>
+                          </span>
+                          <span>{provider.modelIds.length} models</span>
+                          <span>{provider.baseUrl || "-"}</span>
+                          <span className="provider-actions">
+                            <button type="button" onClick={() => openPiProviderForm(provider.id)}>
+                              编辑
+                            </button>
+                            <button
+                              type="button"
+                              className="danger"
+                              onClick={() => handlePiDeleteProvider(provider.id)}
+                            >
+                              <Trash2 size={15} />
+                            </button>
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                  <p className="assistant-note">
+                    启用后需在 pi 中执行 /reload 或重启 pi。auth.json（/login 保存的凭据）不受 Profile 管理，且对同名 Provider 优先于这里的 apiKey。
+                  </p>
+                </div>
+              ) : null}
               <div className="editor-wrap">
                 <Editor
                   key={`${toolId}-${mode}-${selectedProfile}-${selectedHistory?.profileName ?? ""}-${selectedHistory?.name ?? ""}-${activeFile?.id ?? "file"}`}
@@ -2015,7 +2180,16 @@ function App() {
                   value={activeContent}
                   onChange={(value) => updateActiveContent(value ?? "")}
                   loading={<div className="editor-loading">加载编辑器...</div>}
-                  language={activeFile?.format === "json" ? "json" : "plaintext"}
+                  language={activeFile?.format === "json" || activeFile?.format === "jsonc" ? "json" : "plaintext"}
+                  beforeMount={(monaco) => {
+                    // Monaco's JSON diagnostics are global; align them with the file being mounted.
+                    const jsonc = activeFile?.format === "jsonc";
+                    monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
+                      ...monaco.languages.json.jsonDefaults.diagnosticsOptions,
+                      allowComments: jsonc,
+                      trailingCommas: jsonc ? "ignore" : "error"
+                    });
+                  }}
                   theme={theme === "dark" ? "vs-dark" : "vs"}
                   options={{
                     automaticLayout: true,
@@ -2615,6 +2789,13 @@ function App() {
             </div>
           </form>
         </div>
+      ) : null}
+      {piProviderForm ? (
+        <PiProviderModal
+          initial={piProviderForm}
+          onCancel={() => setPiProviderForm(null)}
+          onSubmit={handlePiProviderSubmit}
+        />
       ) : null}
       {claudeProviderForm ? (
         <div className="modal-backdrop" role="presentation">

@@ -29,6 +29,8 @@ def load_modules(tmp_path: Path):
     os.environ["CODEX_CONFIG_TOML_PATH"] = str(codex_toml_path)
     os.environ["CODEX_GATEWAY_DIR"] = str(data_dir / "codex-gateway")
     os.environ["OPENCODE_CONFIG_PATH"] = str(opencode_path)
+    os.environ["PI_MODELS_PATH"] = str(tmp_path / "config" / "pi" / "models.json")
+    os.environ["PI_SETTINGS_PATH"] = str(tmp_path / "config" / "pi" / "settings.json")
     os.environ["HISTORY_RETENTION"] = "50"
 
     for name in list(sys.modules):
@@ -413,3 +415,57 @@ def test_password_hash_tool_prints_manual_values_on_write_failure(tmp_path: Path
     assert "APP_PASSWORD=\n" in captured.out
     assert "APP_PASSWORD_HASH=pbkdf2_sha256$$" in captured.out
     assert "SESSION_SECRET=" in captured.out
+
+
+def test_pi_missing_runtime_files_get_pi_compatible_defaults(tmp_path: Path):
+    registry, storage, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("pi")
+    pi_dir = tmp_path / "config" / "pi"
+
+    assert json.loads((pi_dir / "models.json").read_text(encoding="utf-8")) == {"providers": {}}
+    assert (pi_dir / "settings.json").read_text(encoding="utf-8") == "{}\n"
+    doc = storage.read_profile(tool, "default")
+    assert [file["id"] for file in doc["files"]] == ["models", "settings"]
+    assert doc["files"][0]["format"] == "jsonc"
+
+
+def test_pi_profile_switch_writes_models_and_settings_but_not_auth(tmp_path: Path):
+    registry, storage, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("pi")
+    pi_dir = tmp_path / "config" / "pi"
+    auth_path = pi_dir / "auth.json"
+    auth_path.write_text('{"anthropic": {"type": "oauth", "refresh": "rotated"}}\n', encoding="utf-8")
+    models = '{\n  // local endpoint\n  "providers": {"ollama": {"baseUrl": "http://localhost:11434/v1", "models": [{"id": "qwen"},]}},\n}\n'
+    settings = '{"defaultProvider": "ollama", "defaultModel": "qwen"}\n'
+
+    storage.create_profile(
+        tool,
+        "local",
+        "content",
+        files=[{"id": "models", "content": models}, {"id": "settings", "content": settings}],
+    )
+    storage.activate_profile(tool, "local")
+
+    assert (pi_dir / "models.json").read_text(encoding="utf-8") == models
+    assert (pi_dir / "settings.json").read_text(encoding="utf-8") == settings
+    assert auth_path.read_text(encoding="utf-8") == '{"anthropic": {"type": "oauth", "refresh": "rotated"}}\n'
+    assert storage.read_profile(tool, "local")["runtimeChanged"] is False
+
+
+def test_pi_models_jsonc_matches_pi_parser(tmp_path: Path):
+    registry, storage, errors, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("pi")
+
+    storage.save_profile(
+        tool,
+        "default",
+        None,
+        files=[{"id": "models", "content": '{"providers": {"x": {"baseUrl": "https://a//b"}},} // ok\n'}],
+    )
+    with pytest.raises(errors.APIError) as block_comment:
+        storage.save_profile(tool, "default", None, files=[{"id": "models", "content": '{/* no */ "providers": {}}'}])
+    with pytest.raises(errors.APIError) as settings_comment:
+        storage.save_profile(tool, "default", None, files=[{"id": "settings", "content": '{} // pi settings are strict JSON'}])
+
+    assert block_comment.value.code == "INVALID_JSON"
+    assert settings_comment.value.code == "INVALID_JSON"

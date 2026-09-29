@@ -17,6 +17,7 @@ class ToolFile:
     active_path: Path
     format: str
     path_label: str
+    default_content: str | None = None
 
     @property
     def filename(self) -> str:
@@ -66,6 +67,8 @@ class ToolConfig:
 _codex_auth_path = Path(os.getenv("CODEX_CONFIG_PATH", "/config/codex/auth.json"))
 _codex_toml_path = Path(os.getenv("CODEX_CONFIG_TOML_PATH", str(_codex_auth_path.with_name("config.toml"))))
 _opencode_config_path = Path(os.getenv("OPENCODE_CONFIG_PATH", "/config/opencode/config.json"))
+_pi_models_path = Path(os.getenv("PI_MODELS_PATH", "/config/pi/models.json"))
+_pi_settings_path = Path(os.getenv("PI_SETTINGS_PATH", str(_pi_models_path.with_name("settings.json"))))
 
 
 TOOLS: dict[str, ToolConfig] = {
@@ -121,6 +124,31 @@ TOOLS: dict[str, ToolConfig] = {
                 active_path=_opencode_config_path,
                 format="json",
                 path_label="~/.config/opencode/config.json",
+            ),
+        ),
+    ),
+    "pi": ToolConfig(
+        id="pi",
+        name="Pi",
+        profile_dir=DATA_DIR / "profiles" / "pi",
+        history_dir=DATA_DIR / "history" / "pi",
+        lock_path=DATA_DIR / "locks" / "pi.lock",
+        files=(
+            ToolFile(
+                id="models",
+                label="models.json",
+                active_path=_pi_models_path,
+                format="jsonc",
+                path_label="~/.pi/agent/models.json",
+                # pi rejects models.json without a top-level "providers" object.
+                default_content='{\n  "providers": {}\n}\n',
+            ),
+            ToolFile(
+                id="settings",
+                label="settings.json",
+                active_path=_pi_settings_path,
+                format="json",
+                path_label="~/.pi/agent/settings.json",
             ),
         ),
     ),

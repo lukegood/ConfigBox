@@ -29,7 +29,9 @@ def history_retention() -> int:
 
 
 def default_file_content(file: ToolFile) -> str:
-    return "{}\n" if file.format == "json" else ""
+    if file.default_content is not None:
+        return file.default_content
+    return "{}\n" if file.format in {"json", "jsonc"} else ""
 
 
 def default_content(tool: ToolConfig) -> str:

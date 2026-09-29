@@ -1,4 +1,4 @@
-export type ConfigFormat = "json" | "toml";
+export type ConfigFormat = "json" | "jsonc" | "toml";
 
 export type ToolFile = {
   id: string;
@@ -57,7 +57,7 @@ export type HistoryDoc = {
   files?: ConfigFile[];
 };
 
-export type ToolId = "claude" | "codex" | "opencode";
+export type ToolId = "claude" | "codex" | "opencode" | "pi";
 
 export type ViewMode = "profile" | "history" | "gateway";
 

@@ -10,6 +10,9 @@ from .errors import APIError
 
 MAX_PROFILE_NAME_LENGTH = 64
 HISTORY_ENTRY_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,180}$")
+# Mirrors pi's stripJsonComments: only `//` line comments and trailing commas, never inside strings.
+JSONC_LINE_COMMENT_RE = re.compile(r'"(?:\\.|[^"\\])*"|//[^\n]*')
+JSONC_TRAILING_COMMA_RE = re.compile(r'"(?:\\.|[^"\\])*"|,(\s*[}\]])')
 
 
 def validate_profile_name(name: str) -> None:
@@ -38,10 +41,18 @@ def validate_history_entry_name(name: str) -> None:
         raise APIError("INVALID_HISTORY_ENTRY", "Invalid history entry name.", 400)
 
 
+def strip_jsonc(content: str) -> str:
+    content = JSONC_LINE_COMMENT_RE.sub(lambda m: m.group(0) if m.group(0).startswith('"') else "", content)
+    return JSONC_TRAILING_COMMA_RE.sub(lambda m: m.group(1) if m.group(1) is not None else m.group(0), content)
+
+
 def validate_content(fmt: str, content: str) -> None:
     try:
         if fmt == "json":
             json.loads(content or "{}")
+            return
+        if fmt == "jsonc":
+            json.loads(strip_jsonc(content or "{}"))
             return
         if fmt == "toml":
             tomlkit.parse(content or "")

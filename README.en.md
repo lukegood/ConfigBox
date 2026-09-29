@@ -1,6 +1,6 @@
 <div align="center">
   <img src="logo_config.png" alt="ConfigBox" width="800">
-  <h1>ConfigBox: Web-Based Configuration Switcher for Claude Code / Codex / OpenCode</h1>
+  <h1>ConfigBox: Web-Based Configuration Switcher for Claude Code / Codex / OpenCode / Pi</h1>
   <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/lukegood/ConfigBox">
   <img alt="GitHub forks" src="https://img.shields.io/github/forks/lukegood/ConfigBox">
   <img alt="GitHub License" src="https://img.shields.io/github/license/lukegood/ConfigBox">
@@ -20,11 +20,11 @@
 
 ## What It Does :muscle:
 
-- ConfigBox is a Dockerized web management tool for visually managing and switching Claude Code, Codex, and OpenCode configuration files from your browser.
+- ConfigBox is a Dockerized web management tool for visually managing and switching Claude Code, Codex, OpenCode, and pi configuration files from your browser.
 
 - Includes Codex forwarding capabilities, supporting third-party models such as GLM, Deepseek, and Kimi connecting to Codex. Built-in Codex forwarding based on [Cmochance/codex-app-transfer](https://github.com/Cmochance/codex-app-transfer) with ongoing updates tracking upstream.
 
-- Supports Linux, macOS, and Windows. Supports Claude Code, Codex, and OpenCode.
+- Supports Linux, macOS, and Windows. Supports Claude Code, Codex, OpenCode, and pi.
 
 **Contributions and PRs are welcome — become a contributor! :raising_hand:**
 
@@ -68,11 +68,13 @@ cd ConfigBox
 ```bash
 cd deploy/linux
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.pi/agent" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
 [ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
+[ -f "$HOME/.pi/agent/models.json" ] || printf '{\n  "providers": {}\n}\n' > "$HOME/.pi/agent/models.json"
+[ -f "$HOME/.pi/agent/settings.json" ] || printf '{}\n' > "$HOME/.pi/agent/settings.json"
 ```
 - Find your user id:
 ```bash
@@ -112,11 +114,13 @@ cd ConfigBox
 ```bash
 cd deploy/macos
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.pi/agent" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
 [ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
+[ -f "$HOME/.pi/agent/models.json" ] || printf '{\n  "providers": {}\n}\n' > "$HOME/.pi/agent/models.json"
+[ -f "$HOME/.pi/agent/settings.json" ] || printf '{}\n' > "$HOME/.pi/agent/settings.json"
 ```
 
 - Edit environment variables
@@ -153,11 +157,13 @@ Set-Location ConfigBox
 ```powershell
 Set-Location deploy\windows
 Copy-Item .env.example .env
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.config\opencode", "$env:USERPROFILE\.configbox" | Out-Null
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.config\opencode", "$env:USERPROFILE\.pi\agent", "$env:USERPROFILE\.configbox" | Out-Null
 if (!(Test-Path "$env:USERPROFILE\.claude\settings.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.claude\settings.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\auth.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.codex\auth.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\config.toml")) { New-Item -ItemType File -Force "$env:USERPROFILE\.codex\config.toml" | Out-Null }
 if (!(Test-Path "$env:USERPROFILE\.config\opencode\config.json")) { '{"$schema":"https://opencode.ai/config.json","provider":{}}' | Set-Content -Encoding ascii "$env:USERPROFILE\.config\opencode\config.json" }
+if (!(Test-Path "$env:USERPROFILE\.pi\agent\models.json")) { '{"providers":{}}' | Set-Content -Encoding ascii "$env:USERPROFILE\.pi\agent\models.json" }
+if (!(Test-Path "$env:USERPROFILE\.pi\agent\settings.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.pi\agent\settings.json" }
 ```
 
 - Edit environment variables
@@ -208,11 +214,13 @@ cd ConfigBox
 ```bash
 cd deploy/linux
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.pi/agent" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
 [ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
+[ -f "$HOME/.pi/agent/models.json" ] || printf '{\n  "providers": {}\n}\n' > "$HOME/.pi/agent/models.json"
+[ -f "$HOME/.pi/agent/settings.json" ] || printf '{}\n' > "$HOME/.pi/agent/settings.json"
 ```
 
 - Find your user id:
@@ -262,11 +270,13 @@ cd ConfigBox
 ```bash
 cd deploy/macos
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.pi/agent" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
 [ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
+[ -f "$HOME/.pi/agent/models.json" ] || printf '{\n  "providers": {}\n}\n' > "$HOME/.pi/agent/models.json"
+[ -f "$HOME/.pi/agent/settings.json" ] || printf '{}\n' > "$HOME/.pi/agent/settings.json"
 ```
 
 - Edit environment variables
@@ -309,11 +319,13 @@ Set-Location ConfigBox
 ```powershell
 Set-Location deploy\windows
 Copy-Item .env.example .env
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.config\opencode", "$env:USERPROFILE\.configbox" | Out-Null
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.config\opencode", "$env:USERPROFILE\.pi\agent", "$env:USERPROFILE\.configbox" | Out-Null
 if (!(Test-Path "$env:USERPROFILE\.claude\settings.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.claude\settings.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\auth.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.codex\auth.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\config.toml")) { New-Item -ItemType File -Force "$env:USERPROFILE\.codex\config.toml" | Out-Null }
 if (!(Test-Path "$env:USERPROFILE\.config\opencode\config.json")) { '{"$schema":"https://opencode.ai/config.json","provider":{}}' | Set-Content -Encoding ascii "$env:USERPROFILE\.config\opencode\config.json" }
+if (!(Test-Path "$env:USERPROFILE\.pi\agent\models.json")) { '{"providers":{}}' | Set-Content -Encoding ascii "$env:USERPROFILE\.pi\agent\models.json" }
+if (!(Test-Path "$env:USERPROFILE\.pi\agent\settings.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.pi\agent\settings.json" }
 ```
 
 - Edit environment variables
@@ -348,6 +360,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
 | `CLAUDE_DIR` | Host Claude config directory, mounted to `/config/claude` |
 | `CODEX_DIR` | Host Codex config directory, mounted to `/config/codex` |
 | `OPENCODE_DIR` | Host OpenCode config directory, mounted to `/config/opencode` |
+| `PI_DIR` | Host pi agent config directory (usually `~/.pi/agent`), mounted to `/config/pi`; required |
 | `CONFIGBOX_DATA_DIR` | ConfigBox profiles, history, gateway config and logs directory |
 | `CONFIGBOX_UID` / `CONFIGBOX_GID` | Linux only, container runtime user, required, recommended to set to `id -u` / `id -g` |
 | `APP_USERNAME` | Web login username |
@@ -399,12 +412,13 @@ APP_COOKIE_SECURE=false
 
 <img src="yanshi.png" alt="ConfigBox screenshot" width="800">
 
-ConfigBox now treats `Profile` as the single source of truth. Choose `Claude`, `Codex`, or `OpenCode` on the left and edit the Profile directly; clicking `Activate` projects that Profile into the real runtime config files:
+ConfigBox now treats `Profile` as the single source of truth. Choose `Claude`, `Codex`, `OpenCode`, or `Pi` on the left and edit the Profile directly; clicking `Activate` projects that Profile into the real runtime config files:
 
 ```text
 Claude -> .claude/settings.json
 Codex  -> .codex/auth.json + .codex/config.toml
 OpenCode -> .config/opencode/config.json
+Pi     -> .pi/agent/models.json + .pi/agent/settings.json
 ```
 
 Profiles and their history are stored under `CONFIGBOX_DATA_DIR`:
@@ -416,11 +430,25 @@ history/claude/
 history/codex/
 ```
 
-When you save a Profile, ConfigBox first stores the previous version in `History`, then validates JSON/TOML and writes atomically. If that Profile is active, the real runtime files are updated too. Each Profile can have multiple history entries; the left-side `History` timeline shows them globally while labeling which Profile each entry belongs to. A Codex Profile stores and activates both `auth.json` and `config.toml` together.
+When you save a Profile, ConfigBox first stores the previous version in `History`, then validates JSON/TOML and writes atomically. If that Profile is active, the real runtime files are updated too. Each Profile can have multiple history entries; the left-side `History` timeline shows them globally while labeling which Profile each entry belongs to. A Codex Profile stores and activates both `auth.json` and `config.toml` together; a Pi Profile does the same for `models.json` and `settings.json`.
 
 ### OpenCode Provider / Model Editing
 
 Choose `OpenCode` on the left to edit the full `config.json` inside a Profile. When a Profile is editable, the editor shows an OpenCode helper above the file editor for adding Providers or Models. These actions first update the editor content; click `Save` to write the Profile, and the runtime file is updated too when that Profile is active.
+
+### Pi Provider / Default Model Editing
+
+A `Pi` Profile contains `models.json` (custom providers and models) and `settings.json` (default provider/model and other settings). The Pi helper above the editor can:
+
+- Add or edit a provider and its models from presets (OpenAI-compatible, Ollama, Zhipu, Moonshot, DeepSeek)
+- Delete providers, or pick pi's default model from a dropdown (writes `defaultProvider` / `defaultModel`)
+
+Notes:
+
+- `models.json` is parsed the same way pi parses it: `//` line comments and trailing commas are allowed, `/* */` block comments are not. `settings.json` must be strict JSON. Editing `models.json` through the helper reformats the file and drops comments (you are asked to confirm first).
+- Activating a Profile overwrites the whole `settings.json`, including fields pi writes itself (such as `theme` and `packages`). When pi has changed `settings.json`, ConfigBox shows a runtime-mismatch banner; use its overwrite-Profile button to sync before switching.
+- `auth.json` (OAuth credentials from `/login`) is not managed by ConfigBox, and pi gives its credentials priority over `apiKey` in `models.json`.
+- After switching Profiles, run `/reload` in pi or restart pi.
 
 ### Codex Gateway for Third-Party Models
 
@@ -447,6 +475,8 @@ Container paths:
 /config/codex/auth.json
 /config/codex/config.toml
 /config/opencode/config.json
+/config/pi/models.json
+/config/pi/settings.json
 /data
 /data/codex-gateway/config.json
 /data/codex-gateway/logs/
@@ -458,6 +488,7 @@ Host mappings:
 CLAUDE_DIR         -> /config/claude
 CODEX_DIR          -> /config/codex
 OPENCODE_DIR       -> /config/opencode
+PI_DIR             -> /config/pi
 CONFIGBOX_DATA_DIR -> /data
 ```
 
@@ -482,6 +513,7 @@ Use forward slashes in `.env`:
 CLAUDE_DIR=C:/Users/yourname/.claude
 CODEX_DIR=C:/Users/yourname/.codex
 OPENCODE_DIR=C:/Users/yourname/.config/opencode
+PI_DIR=C:/Users/yourname/.pi/agent
 CONFIGBOX_DATA_DIR=C:/Users/yourname/.configbox
 ```
 
@@ -519,7 +551,8 @@ Recommendations:
 - Use a strong random `SESSION_SECRET`
 - Use HTTPS for public deployments
 - Restrict access with firewall or security-group rules whenever possible
-- Do not commit `.env`, `.claude`, `.codex`, `.config/opencode`, or `.configbox` to public repositories
+- Do not commit `.env`, `.claude`, `.codex`, `.config/opencode`, `.pi`, or `.configbox` to public repositories
+- pi's `apiKey` accepts `!command`, which runs that command on the host. Anyone who can log in to ConfigBox can write such a command, so protect the Web login credentials
 
 ## Credits & Community :golf:
 

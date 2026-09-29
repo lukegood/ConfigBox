@@ -1,6 +1,6 @@
 <div align="center">
   <img src="logo_config.png" alt="ConfigBox" width="800">
-  <h1>ConfigBox: Web端的Claude Code / Codex / OpenCode配置切换器</h1>
+  <h1>ConfigBox: Web端的Claude Code / Codex / OpenCode / Pi配置切换器</h1>
   <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/lukegood/ConfigBox">
   <img alt="GitHub forks" src="https://img.shields.io/github/forks/lukegood/ConfigBox">
   <img alt="GitHub License" src="https://img.shields.io/github/license/lukegood/ConfigBox">
@@ -20,11 +20,11 @@
 
 ## 能做什么 :muscle:
 
-- ConfigBox是一个Docker化的Web管理工具，用于在浏览器中可视化管理和切换 Claude Code、Codex 与OpenCode的配置文件。
+- ConfigBox是一个Docker化的Web管理工具，用于在浏览器中可视化管理和切换 Claude Code、Codex、OpenCode 与 pi 的配置文件。
 
 - 具备Codex转发功能，内置基于[Cmochance/codex-app-transfer](https://github.com/Cmochance/codex-app-transfer)的Codex转发能力并将持续追踪更新。支持GLM、Deepseek、Kimi和minimax等第三方模型接入Codex。
 
-- 支持Linux、macOS 和 Windows平台。支持Claude Code, Codex和OpenCode。
+- 支持Linux、macOS 和 Windows平台。支持Claude Code, Codex, OpenCode和pi。
 
 **欢迎积极试用提PR，成为贡献者 :raising_hand:**
 
@@ -69,11 +69,13 @@ cd ConfigBox
 ```bash
 cd deploy/linux
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.pi/agent" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
 [ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
+[ -f "$HOME/.pi/agent/models.json" ] || printf '{\n  "providers": {}\n}\n' > "$HOME/.pi/agent/models.json"
+[ -f "$HOME/.pi/agent/settings.json" ] || printf '{}\n' > "$HOME/.pi/agent/settings.json"
 ```
 - 查找id
 ```bash
@@ -113,11 +115,13 @@ cd ConfigBox
 ```bash
 cd deploy/macos
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.pi/agent" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
 [ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
+[ -f "$HOME/.pi/agent/models.json" ] || printf '{\n  "providers": {}\n}\n' > "$HOME/.pi/agent/models.json"
+[ -f "$HOME/.pi/agent/settings.json" ] || printf '{}\n' > "$HOME/.pi/agent/settings.json"
 ```
 
 - 编辑环境变量
@@ -154,11 +158,13 @@ Set-Location ConfigBox
 ```powershell
 Set-Location deploy\windows
 Copy-Item .env.example .env
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.config\opencode", "$env:USERPROFILE\.configbox" | Out-Null
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.config\opencode", "$env:USERPROFILE\.pi\agent", "$env:USERPROFILE\.configbox" | Out-Null
 if (!(Test-Path "$env:USERPROFILE\.claude\settings.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.claude\settings.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\auth.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.codex\auth.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\config.toml")) { New-Item -ItemType File -Force "$env:USERPROFILE\.codex\config.toml" | Out-Null }
 if (!(Test-Path "$env:USERPROFILE\.config\opencode\config.json")) { '{"$schema":"https://opencode.ai/config.json","provider":{}}' | Set-Content -Encoding ascii "$env:USERPROFILE\.config\opencode\config.json" }
+if (!(Test-Path "$env:USERPROFILE\.pi\agent\models.json")) { '{"providers":{}}' | Set-Content -Encoding ascii "$env:USERPROFILE\.pi\agent\models.json" }
+if (!(Test-Path "$env:USERPROFILE\.pi\agent\settings.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.pi\agent\settings.json" }
 ```
 
 - 编辑环境变量
@@ -209,11 +215,13 @@ cd ConfigBox
 ```bash
 cd deploy/linux
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.pi/agent" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
 [ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
+[ -f "$HOME/.pi/agent/models.json" ] || printf '{\n  "providers": {}\n}\n' > "$HOME/.pi/agent/models.json"
+[ -f "$HOME/.pi/agent/settings.json" ] || printf '{}\n' > "$HOME/.pi/agent/settings.json"
 ```
 
 - 查找 id
@@ -263,11 +271,13 @@ cd ConfigBox
 ```bash
 cd deploy/macos
 cp .env.example .env
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.configbox"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode" "$HOME/.pi/agent" "$HOME/.configbox"
 [ -f "$HOME/.claude/settings.json" ] || printf '{}\n' > "$HOME/.claude/settings.json"
 [ -f "$HOME/.codex/auth.json" ] || printf '{}\n' > "$HOME/.codex/auth.json"
 [ -f "$HOME/.codex/config.toml" ] || touch "$HOME/.codex/config.toml"
 [ -f "$HOME/.config/opencode/config.json" ] || printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {}\n}\n' > "$HOME/.config/opencode/config.json"
+[ -f "$HOME/.pi/agent/models.json" ] || printf '{\n  "providers": {}\n}\n' > "$HOME/.pi/agent/models.json"
+[ -f "$HOME/.pi/agent/settings.json" ] || printf '{}\n' > "$HOME/.pi/agent/settings.json"
 ```
 
 - 编辑环境变量
@@ -310,11 +320,13 @@ Set-Location ConfigBox
 ```powershell
 Set-Location deploy\windows
 Copy-Item .env.example .env
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.config\opencode", "$env:USERPROFILE\.configbox" | Out-Null
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude", "$env:USERPROFILE\.codex", "$env:USERPROFILE\.config\opencode", "$env:USERPROFILE\.pi\agent", "$env:USERPROFILE\.configbox" | Out-Null
 if (!(Test-Path "$env:USERPROFILE\.claude\settings.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.claude\settings.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\auth.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.codex\auth.json" }
 if (!(Test-Path "$env:USERPROFILE\.codex\config.toml")) { New-Item -ItemType File -Force "$env:USERPROFILE\.codex\config.toml" | Out-Null }
 if (!(Test-Path "$env:USERPROFILE\.config\opencode\config.json")) { '{"$schema":"https://opencode.ai/config.json","provider":{}}' | Set-Content -Encoding ascii "$env:USERPROFILE\.config\opencode\config.json" }
+if (!(Test-Path "$env:USERPROFILE\.pi\agent\models.json")) { '{"providers":{}}' | Set-Content -Encoding ascii "$env:USERPROFILE\.pi\agent\models.json" }
+if (!(Test-Path "$env:USERPROFILE\.pi\agent\settings.json")) { "{}" | Set-Content -Encoding ascii "$env:USERPROFILE\.pi\agent\settings.json" }
 ```
 
 - 编辑环境变量
@@ -358,6 +370,7 @@ PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 | `CLAUDE_DIR` | 宿主机 Claude Code 配置目录，挂载到容器 `/config/claude` |
 | `CODEX_DIR` | 宿主机 Codex 配置目录，挂载到容器 `/config/codex` |
 | `OPENCODE_DIR` | 宿主机 OpenCode 配置目录，挂载到容器 `/config/opencode` |
+| `PI_DIR` | 宿主机 pi agent 配置目录（通常为 `~/.pi/agent`），挂载到容器 `/config/pi`，必填 |
 | `CONFIGBOX_DATA_DIR` | ConfigBox 的 profiles、history、gateway 配置和日志目录 |
 | `CONFIGBOX_UID` / `CONFIGBOX_GID` | Linux 专用，容器运行用户，必填，建议设置为 `id -u` / `id -g` |
 | `APP_USERNAME` | Web 登录用户名 |
@@ -409,12 +422,13 @@ APP_COOKIE_SECURE=false
 
 <img src="yanshi.png" alt="ConfigBox screenshot" width="800">
 
-ConfigBox 现在以 `Profile` 作为唯一配置真源。左侧选择 `Claude`、`Codex` 或 `OpenCode` 后，直接编辑对应 Profile；点击 `启用` 时，系统会把该 Profile 投影到真实生效文件中：
+ConfigBox 现在以 `Profile` 作为唯一配置真源。左侧选择 `Claude`、`Codex`、`OpenCode` 或 `Pi` 后，直接编辑对应 Profile；点击 `启用` 时，系统会把该 Profile 投影到真实生效文件中：
 
 ```text
 Claude -> .claude/settings.json
 Codex  -> .codex/auth.json + .codex/config.toml
 OpenCode -> .config/opencode/config.json
+Pi     -> .pi/agent/models.json + .pi/agent/settings.json
 ```
 
 Profile 默认存放在宿主机 `CONFIGBOX_DATA_DIR` 下：
@@ -426,11 +440,25 @@ history/claude/
 history/codex/
 ```
 
-保存 Profile 时，系统会先把旧版本写入 `History`，再校验 JSON/TOML 并原子写入新版本；如果这个 Profile 当前已启用，真实配置文件会同步更新。每个 Profile 都可以拥有多条历史记录，左侧 `History` 会按时间线展示，并在标签中标明归属的 Profile。Codex 的一个 Profile 会同时保存 `auth.json` 和 `config.toml`。
+保存 Profile 时，系统会先把旧版本写入 `History`，再校验 JSON/TOML 并原子写入新版本；如果这个 Profile 当前已启用，真实配置文件会同步更新。每个 Profile 都可以拥有多条历史记录，左侧 `History` 会按时间线展示，并在标签中标明归属的 Profile。Codex 的一个 Profile 会同时保存 `auth.json` 和 `config.toml`；Pi 的一个 Profile 会同时保存 `models.json` 和 `settings.json`。
 
 ### OpenCode Provider / Model 编辑
 
 左侧选择 `OpenCode` 后，可以直接编辑 Profile 中的完整 `config.json`。Profile 处于可编辑状态时，编辑器上方会显示 OpenCode 配置助手，可通过按钮添加 Provider 或 Model。添加动作会先写入编辑器内容，确认无误后点击 `保存` 才会写入 Profile；若该 Profile 已启用，真实文件也会同步更新。
+
+### Pi Provider / 默认模型编辑
+
+左侧选择 `Pi` 后，Profile 包含 `models.json`（自定义 Provider 与模型）和 `settings.json`（默认 Provider / 模型等设置）两个文件。编辑器上方的 Pi 配置助手可以：
+
+- 通过预设（OpenAI 兼容、Ollama、智谱、Moonshot、DeepSeek）添加或编辑 Provider 及其模型
+- 删除 Provider，或从下拉框选择 pi 的默认模型（写入 `defaultProvider` / `defaultModel`）
+
+注意事项：
+
+- `models.json` 按 pi 的规则解析，允许 `//` 行注释和尾随逗号，但不支持 `/* */` 块注释；`settings.json` 必须是严格 JSON。通过配置助手修改 `models.json` 会重新格式化文件并丢失注释（操作前会提示确认）。
+- 启用 Profile 时，`settings.json` 会被整个覆盖，pi 自己写入的字段（如 `theme`、`packages`）以 Profile 中的内容为准。pi 修改过 `settings.json` 后，界面会提示“当前本机配置与已启用 Profile 不一致”，可点击 `覆盖 Profile` 先同步再切换。
+- `auth.json`（`/login` 产生的 OAuth 凭据）不受 ConfigBox 管理；pi 中 `auth.json` 的凭据优先级高于 `models.json` 里的 `apiKey`。
+- 切换 Profile 后，需要在 pi 中执行 `/reload` 或重启 pi 才会生效。
 
 ### Codex Gateway 接入第三方模型
 
@@ -459,6 +487,8 @@ CONFIGBOX_DATA_DIR/codex-gateway/logs/
 /config/codex/auth.json
 /config/codex/config.toml
 /config/opencode/config.json
+/config/pi/models.json
+/config/pi/settings.json
 /data
 /data/codex-gateway/config.json
 /data/codex-gateway/logs/
@@ -470,6 +500,7 @@ CONFIGBOX_DATA_DIR/codex-gateway/logs/
 CLAUDE_DIR         -> /config/claude
 CODEX_DIR          -> /config/codex
 OPENCODE_DIR       -> /config/opencode
+PI_DIR             -> /config/pi
 CONFIGBOX_DATA_DIR -> /data
 ```
 
@@ -494,6 +525,7 @@ curl -u admin:你的密码 http://127.0.0.1:8787/api/profiles/codex
 CLAUDE_DIR=C:/Users/yourname/.claude
 CODEX_DIR=C:/Users/yourname/.codex
 OPENCODE_DIR=C:/Users/yourname/.config/opencode
+PI_DIR=C:/Users/yourname/.pi/agent
 CONFIGBOX_DATA_DIR=C:/Users/yourname/.configbox
 ```
 
@@ -531,7 +563,8 @@ ConfigBox 能查看和编辑敏感配置文件，请把它当作管理员工具�
 - 使用强随机 `SESSION_SECRET`
 - 公网部署时使用 HTTPS
 - 尽量通过防火墙、安全组限制访问来源
-- 不要把 `.env`、`.claude`、`.codex`、`.config/opencode`、`.configbox` 提交到公开仓库
+- 不要把 `.env`、`.claude`、`.codex`、`.config/opencode`、`.pi`、`.configbox` 提交到公开仓库
+- pi 的 `apiKey` 支持 `!command` 写法，会在宿主机上执行该命令。能登录 ConfigBox 的人即可写入这类命令，务必保护好 Web 登录凭据
 
 ## 致谢与社区支持 :golf:
 

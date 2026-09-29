@@ -536,6 +536,38 @@ textarea {
   font-size: 12px;
 }
 
+.assistant-note {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.pi-default-select {
+  min-height: 32px;
+  max-width: 280px;
+}
+
+.pi-default-toggle {
+  align-self: end;
+  min-height: 38px;
+}
+
+.gateway-custom-mapping-row.pi-model-row {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 120px auto auto;
+  align-items: end;
+}
+
+.pi-model-row .gateway-inline-toggle {
+  min-height: 38px;
+}
+
+.pi-model-row input:not([type="checkbox"]) {
+  width: 100%;
+  min-width: 0;
+}
+
 .editor-loading {
   height: 100%;
   display: grid;
@@ -1001,6 +1033,7 @@ textarea {
   .gateway-preset-grid,
   .gateway-mapping-grid,
   .gateway-custom-mapping-row,
+  .gateway-custom-mapping-row.pi-model-row,
   .opencode-helper {
     grid-template-columns: 1fr;
   }
