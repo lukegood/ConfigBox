@@ -1,6 +1,6 @@
 services:
   configbox:
-    image: cloudcollector/configbox:1.0.0
+    image: cloudcollector/configbox:1.1.0
     container_name: configbox
     restart: unless-stopped
     env_file:
